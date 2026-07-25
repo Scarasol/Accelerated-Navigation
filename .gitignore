@@ -1,0 +1,37 @@
+# IDE
+/.idea/
+/.settings/
+/.metadata/
+/bin/
+/out/
+*.iml
+*.ipr
+*.iws
+*.launch
+.classpath
+.project
+
+# Gradle and generated output
+/.gradle/
+/.gradle-user/
+/build/
+/eclipse/
+/mcmodsrepo/
+/src/generated/
+
+# Minecraft development runs and local evidence
+/run/
+/run-data/
+/run-terrain-benchmark/
+/run-terrain-probe/*
+/logs/
+*.log
+*.log.gz
+*.jfr
+*.csv
+
+# Local design and planning documents
+/docs/
+
+# Local Codex migration context. Never commit or publish this directory.
+/.codex-handoff/

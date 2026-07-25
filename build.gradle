@@ -1,0 +1,352 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    id 'org.spongepowered.mixin' version '0.7.+'
+}
+
+def acceleratedNavigationMod = [
+        id         : 'accelerated_navigation',
+        name       : 'Accelerated Navigation',
+        license    : 'AGPLv3',
+        version    : '0.1.0',
+        group      : 'com.scarasol.acceleratednavigation',
+        authors    : 'Scarasol',
+        description: 'Server-side hierarchical navigation scheduling infrastructure.'
+]
+
+version = acceleratedNavigationMod.version
+group = acceleratedNavigationMod.group
+
+base {
+    archivesName = acceleratedNavigationMod.id
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+// Keep test fixtures available to GameTest without packaging them in the mod jar.
+sourceSets {
+    main {
+        java.exclude 'com/scarasol/acceleratednavigation/gametest/**'
+    }
+    gameTest {
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath + sourceSets.main.runtimeClasspath
+    }
+    test {
+        compileClasspath += sourceSets.gameTest.output
+        runtimeClasspath += sourceSets.gameTest.output
+    }
+}
+
+minecraft {
+    mappings channel: mapping_channel, version: mapping_version
+    copyIdeResources = true
+
+    runs {
+        configureEach {
+            jvmArgs = [
+                    '-XX:+IgnoreUnrecognizedVMOptions',
+                    '-XX:+AllowEnhancedClassRedefinition',
+                    '-XX:HotswapAgent=fatjar'
+            ]
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+
+            mods {
+                "${acceleratedNavigationMod.id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        client {
+            property 'forge.enabledGameTestNamespaces', acceleratedNavigationMod.id
+        }
+
+        server {
+            property 'forge.enabledGameTestNamespaces', acceleratedNavigationMod.id
+            args '--nogui'
+        }
+
+        terrainBenchmarkServer {
+            parent minecraft.runs.server
+            taskName 'runTerrainBenchmarkServer'
+            workingDirectory project.file('run-terrain-benchmark')
+            property 'acceleratedNavigation.terrainBenchmark', 'true'
+            property 'acceleratedNavigation.terrainReport',
+                    layout.buildDirectory.file('reports/real-terrain-topology.json').get().asFile.absolutePath
+            mods {
+                "${acceleratedNavigationMod.id}" {
+                    source sourceSets.gameTest
+                }
+            }
+        }
+
+        gameTestServer {
+            property 'forge.enabledGameTestNamespaces', "${acceleratedNavigationMod.id},minecraft"
+            mods {
+                "${acceleratedNavigationMod.id}" {
+                    source sourceSets.gameTest
+                }
+            }
+        }
+
+        data {
+            workingDirectory project.file('run-data')
+            args '--mod', acceleratedNavigationMod.id,
+                    '--all',
+                    '--output', file('src/generated/resources/'),
+                    '--existing', file('src/main/resources/')
+        }
+    }
+}
+
+sourceSets.main.resources { srcDir 'src/generated/resources' }
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+
+    compileOnly(annotationProcessor('io.github.llamalad7:mixinextras-common:0.3.6'))
+    implementation(jarJar('io.github.llamalad7:mixinextras-forge:0.3.6')) {
+        jarJar.ranged(it, '[0.3.6,)')
+    }
+
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+mixin {
+    add sourceSets.main, 'accelerated_navigation.refmap.json'
+    config 'accelerated_navigation.mixins.json'
+    debug.export = true
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    def replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            forge_version          : forge_version,
+            forge_version_range    : forge_version_range,
+            loader_version_range   : loader_version_range,
+            mod_id                 : acceleratedNavigationMod.id,
+            mod_name               : acceleratedNavigationMod.name,
+            mod_license            : acceleratedNavigationMod.license,
+            mod_version            : acceleratedNavigationMod.version,
+            mod_authors            : acceleratedNavigationMod.authors,
+            mod_description        : acceleratedNavigationMod.description
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    exclude 'com/scarasol/acceleratednavigation/gametest/**'
+
+    manifest {
+        attributes([
+                'Specification-Title'     : acceleratedNavigationMod.id,
+                'Specification-Vendor'    : acceleratedNavigationMod.authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'Implementation-Vendor'   : acceleratedNavigationMod.authors,
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+    finalizedBy 'reobfJar'
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            artifact jar
+        }
+    }
+    repositories {
+        maven {
+            url "file://${project.projectDir}/mcmodsrepo"
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
+    systemProperty 'accelerated.navigation.performanceReport',
+            layout.buildDirectory.file('reports/macro-topology-synthetic-microbenchmark.json').get().asFile.absolutePath
+}
+
+tasks.register('verifyGameTestSourceSetIsolation') {
+    doLast {
+        def leaked = sourceSets.main.allJava.files.findAll {
+            it.toPath().toString().replace('\\', '/').contains(
+                    '/com/scarasol/acceleratednavigation/gametest/'
+            )
+        }
+        if (!leaked.isEmpty()) {
+            throw new GradleException("GameTest sources leaked into main: ${leaked}")
+        }
+    }
+}
+
+tasks.named('check').configure {
+    dependsOn tasks.named('verifyGameTestSourceSetIsolation')
+}
+
+tasks.register('prepareTerrainBenchmarkServer') {
+    def runDirectory = layout.projectDirectory.dir('run-terrain-benchmark')
+    def eulaFile = runDirectory.file('eula.txt')
+    def propertiesFile = runDirectory.file('server.properties')
+    def reportFile = layout.buildDirectory.file('reports/real-terrain-topology.json')
+    outputs.files(eulaFile, propertiesFile)
+    outputs.upToDateWhen { false }
+    doLast {
+        reportFile.get().asFile.delete()
+        runDirectory.asFile.mkdirs()
+        eulaFile.asFile.setText('eula=true\n', 'UTF-8')
+        propertiesFile.asFile.setText('''\
+allow-flight=true
+difficulty=normal
+enable-command-block=false
+enable-rcon=false
+enable-status=false
+generate-structures=true
+level-name=terrain-benchmark-world-v3
+level-seed=73939133
+level-type=minecraft:normal
+max-tick-time=-1
+motd=Accelerated Navigation Terrain Benchmark
+online-mode=false
+server-ip=127.0.0.1
+server-port=0
+simulation-distance=4
+spawn-protection=0
+sync-chunk-writes=true
+view-distance=4
+''', 'UTF-8')
+    }
+}
+
+tasks.register('verifyTerrainBenchmarkReport') {
+    doLast {
+        def report = layout.buildDirectory.file('reports/real-terrain-topology.json').get().asFile
+        if (!report.isFile()) {
+            throw new GradleException('Real terrain benchmark did not produce a report')
+        }
+        def parsed = new groovy.json.JsonSlurper().parse(report)
+        if (parsed.benchmarkKind != 'real_generated_terrain') {
+            throw new GradleException('Real terrain benchmark report has the wrong kind')
+        }
+        if (parsed.worldPreset != 'minecraft:normal' || parsed.loadedChunks <= 0) {
+            throw new GradleException('Real terrain benchmark did not use a loaded normal world')
+        }
+        def buildNames = parsed.topologyBuilds.collect { it.name } as Set
+        def expectedBuilds = ['overworld_surface', 'overworld_caves', 'nether'] as Set
+        if (!buildNames.containsAll(expectedBuilds)) {
+            throw new GradleException("Real terrain benchmark is missing topology groups: ${expectedBuilds - buildNames}")
+        }
+        def routeNames = parsed.routes.collect { it.name } as Set
+        def expectedRoutes = [
+                'surface_8', 'surface_96', 'surface_512',
+                'cave_8', 'cave_96', 'nether_8', 'nether_96'
+        ] as Set
+        if (!routeNames.containsAll(expectedRoutes)) {
+            throw new GradleException("Real terrain benchmark is missing route cases: ${expectedRoutes - routeNames}")
+        }
+        def unknownRoutes = parsed.routes.findAll { it.unknownBoundarySections != 0 }
+        if (!unknownRoutes.isEmpty()) {
+            throw new GradleException("Real terrain benchmark contains unknown boundaries: ${unknownRoutes*.name}")
+        }
+        def longRoutes = parsed.routes.findAll {
+            it.name in ['surface_96', 'surface_512', 'cave_96', 'nether_96']
+        }
+        def nonHierarchicalLongRoutes = longRoutes.findAll { it.hierarchicalRuns != it.runs }
+        if (!nonHierarchicalLongRoutes.isEmpty()) {
+            throw new GradleException("Long routes did not use the super graph: ${nonHierarchicalLongRoutes*.name}")
+        }
+        def failedSuperRoutes = longRoutes.findAll { it.failedSuperClusters != 0 }
+        if (!failedSuperRoutes.isEmpty()) {
+            throw new GradleException("Super-cluster builds failed: ${failedSuperRoutes*.name}")
+        }
+        if (parsed.superTopology == null || parsed.superTopology.published <= 0) {
+            throw new GradleException('Real terrain benchmark did not publish any super topology')
+        }
+        if (parsed.answerValidationProtocol == null) {
+            throw new GradleException('Real terrain benchmark omitted its answer-validation protocol')
+        }
+        if (parsed.connectivityReferences == null || parsed.connectivityReferences.size() < 2) {
+            throw new GradleException('Real terrain benchmark omitted its precomputed connectivity references')
+        }
+        def invalidConnectivityReferences = parsed.connectivityReferences.findAll {
+            !it.proofScope || it.timingExcludedFromMacroTiming != true
+        }
+        if (!invalidConnectivityReferences.isEmpty()) {
+            throw new GradleException('Connectivity references have an invalid scope or timing boundary')
+        }
+        if (parsed.topologyWorkers == null
+                || parsed.topologyWorkers.build?.managed != true
+                || parsed.topologyWorkers.persistence?.managed != true) {
+            throw new GradleException('Real terrain benchmark omitted managed worker queue metrics')
+        }
+        def missingAnswerAudits = parsed.routes.findAll {
+            it.answerValidation == null
+                    || it.answerValidation.assessment == 'NOT_AUDITED'
+                    || it.answerValidation.referenceTimingExcludedFromMacroTiming != true
+        }
+        if (!missingAnswerAudits.isEmpty()) {
+            throw new GradleException("Routes are missing isolated answer audits: ${missingAnswerAudits*.name}")
+        }
+        def missingSelectionReferences = parsed.routes.findAll {
+            it.answerValidation.selectionReference == null
+                    || !it.answerValidation.selectionReference.method
+                    || it.answerValidation.selectionReference.timingExcludedFromMacroTiming != true
+                    || it.answerValidation.selectionReference.physicalExecutabilityClaimed != false
+        }
+        if (!missingSelectionReferences.isEmpty()) {
+            throw new GradleException("Routes are missing bounded selection references: ${missingSelectionReferences*.name}")
+        }
+        def budgetMisclassified = parsed.routes.findAll {
+            it.succeededRuns == 0
+                    && (it.failureCounts.SEARCH_LIMIT_REACHED ?: 0) > 0
+                    && it.answerValidation.answerCheck != 'INCONCLUSIVE'
+        }
+        if (!budgetMisclassified.isEmpty()) {
+            throw new GradleException("Search-limit results were treated as answers: ${budgetMisclassified*.name}")
+        }
+        def unsupportedNegativeAnswers = parsed.routes.findAll {
+            it.succeededRuns == 0
+                    && it.answerValidation.reachabilityConclusion == 'PHYSICALLY_UNREACHABLE'
+        }
+        if (!unsupportedNegativeAnswers.isEmpty()) {
+            throw new GradleException("Bounded references claimed physical unreachability: ${unsupportedNegativeAnswers*.name}")
+        }
+        def contradictedAnswers = parsed.routes.findAll {
+            it.answerValidation.answerCheck == 'FAIL'
+        }
+        if (!contradictedAnswers.isEmpty()) {
+            throw new GradleException("Macro answers contradicted structural audit: ${contradictedAnswers*.name}")
+        }
+    }
+}
+
+tasks.matching { it.name == 'runTerrainBenchmarkServer' }.configureEach {
+    dependsOn tasks.named('prepareTerrainBenchmarkServer')
+    finalizedBy tasks.named('verifyTerrainBenchmarkReport')
+}
+
+idea {
+    module {
+        downloadSources = true
+        downloadJavadoc = true
+    }
+}

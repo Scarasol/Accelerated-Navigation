@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "package": "com.scarasol.acceleratednavigation.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "accelerated_navigation.refmap.json",
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "minVersion": "0.8",
+  "mixins": [
+    "LevelChunkTopologyMixin"
+  ],
+  "client": []
+}
