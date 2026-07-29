@@ -63,6 +63,14 @@ public final class TopologyGraphAudit {
     private double nearestDistance = Double.POSITIVE_INFINITY;
     private boolean initialized;
 
+    public static CompletableFuture<BaseClusterTopology> requestClusterDependency(
+            TopologyService service,
+            ServerLevel level,
+            SectionPos section,
+            NavigationScheduler.Priority priority) {
+        return service.subscribeClusterDependency(level, section, priority).future();
+    }
+
     public TopologyGraphAudit(TopologyService service,
                               ServerLevel level,
                               BlockPos start,
@@ -455,21 +463,8 @@ public final class TopologyGraphAudit {
                 throw new IllegalArgumentException("desiredDistance must be positive");
             }
             long started = System.nanoTime();
-            List<BoundCandidate> boundCandidates = new ArrayList<>();
-            Set<BlockPos> unique = new LinkedHashSet<>();
-            int unbound = 0;
-            for (BlockPos candidate : candidates) {
-                BlockPos immutable = Objects.requireNonNull(candidate, "candidate").immutable();
-                if (!unique.add(immutable)) {
-                    continue;
-                }
-                BoundCandidate bound = bindCandidate(immutable);
-                if (bound == null) {
-                    unbound++;
-                    continue;
-                }
-                boundCandidates.add(bound);
-            }
+            CandidatePool pool = bindCandidates(candidates);
+            List<BoundCandidate> boundCandidates = pool.boundCandidates();
 
             BoundCandidate bestStart = null;
             BoundCandidate bestGoal = null;
@@ -526,9 +521,9 @@ public final class TopologyGraphAudit {
                     bestGoal.position(),
                     desiredDistance,
                     bestDistance,
-                    unique.size(),
-                    unique.size() - unbound,
-                    unbound,
+                    pool.candidateCount(),
+                    boundCandidates.size(),
+                    pool.unboundCandidates(),
                     sourceComponent,
                     targetComponent,
                     componentSizes.get(sourceComponent),
@@ -538,6 +533,120 @@ public final class TopologyGraphAudit {
                     reachablePairs,
                     System.nanoTime() - started
             );
+        }
+
+        public List<PairSelection> selectDistinctStartPairs(
+                Collection<BlockPos> candidates,
+                double desiredDistance,
+                int count) {
+            Objects.requireNonNull(candidates, "candidates");
+            if (desiredDistance <= 0.0D || count <= 0) {
+                throw new IllegalArgumentException("distance and count must be positive");
+            }
+            long started = System.nanoTime();
+            CandidatePool pool = bindCandidates(candidates);
+            List<BoundCandidate> bound = pool.boundCandidates();
+            Map<SectionPos, PairCandidate> bestByStart = new LinkedHashMap<>();
+            long examinedPairs = 0L;
+            long reachablePairs = 0L;
+            for (int first = 0; first < bound.size(); first++) {
+                BoundCandidate firstCandidate = bound.get(first);
+                for (int second = first + 1; second < bound.size(); second++) {
+                    BoundCandidate secondCandidate = bound.get(second);
+                    examinedPairs++;
+                    double directDistance = distance(
+                            firstCandidate.position(),
+                            secondCandidate.position()
+                    );
+                    double difference = Math.abs(directDistance - desiredDistance);
+                    if (offerPair(bestByStart, firstCandidate, secondCandidate,
+                            directDistance, difference)) {
+                        reachablePairs++;
+                    }
+                    if (offerPair(bestByStart, secondCandidate, firstCandidate,
+                            directDistance, difference)) {
+                        reachablePairs++;
+                    }
+                }
+            }
+            List<PairCandidate> selected = bestByStart.values().stream()
+                    .sorted(Comparator.comparingDouble(PairCandidate::difference)
+                            .thenComparingInt(pair -> SectionPos.of(pair.start().position()).x())
+                            .thenComparingInt(pair -> SectionPos.of(pair.start().position()).y())
+                            .thenComparingInt(pair -> SectionPos.of(pair.start().position()).z()))
+                    .limit(count)
+                    .toList();
+            if (selected.size() != count) {
+                throw new IllegalStateException(
+                        "only " + selected.size() + " distinct reachable start sections for "
+                                + dimension.location() + "; required " + count
+                );
+            }
+            long selectionNanos = System.nanoTime() - started;
+            long finalExaminedPairs = examinedPairs;
+            long finalReachablePairs = reachablePairs;
+            return selected.stream().map(pair -> {
+                int source = pair.start().strongComponent();
+                int target = pair.goal().strongComponent();
+                return new PairSelection(
+                        pair.start().position(),
+                        pair.goal().position(),
+                        desiredDistance,
+                        pair.directDistance(),
+                        pool.candidateCount(),
+                        bound.size(),
+                        pool.unboundCandidates(),
+                        source,
+                        target,
+                        componentSizes.get(source),
+                        componentSizes.get(target),
+                        reachableFrom(source).cardinality(),
+                        finalExaminedPairs,
+                        finalReachablePairs,
+                        selectionNanos
+                );
+            }).toList();
+        }
+
+        private boolean offerPair(Map<SectionPos, PairCandidate> bestByStart,
+                                  BoundCandidate start,
+                                  BoundCandidate goal,
+                                  double directDistance,
+                                  double difference) {
+            SectionPos section = SectionPos.of(start.position());
+            PairCandidate previous = bestByStart.get(section);
+            if (previous != null && difference >= previous.difference()) {
+                return false;
+            }
+            if (!canReach(start.strongComponent(), goal.strongComponent())) {
+                return false;
+            }
+            bestByStart.put(section, new PairCandidate(
+                    start,
+                    goal,
+                    directDistance,
+                    difference
+            ));
+            return true;
+        }
+
+        private CandidatePool bindCandidates(Collection<BlockPos> candidates) {
+            List<BoundCandidate> bound = new ArrayList<>();
+            Set<BlockPos> unique = new LinkedHashSet<>();
+            int unbound = 0;
+            for (BlockPos candidate : candidates) {
+                BlockPos immutable = Objects.requireNonNull(candidate, "candidate").immutable();
+                if (!unique.add(immutable)) {
+                    continue;
+                }
+                BoundCandidate candidateBinding = bindCandidate(immutable);
+                if (candidateBinding == null) {
+                    unbound++;
+                } else {
+                    bound.add(candidateBinding);
+                }
+            }
+            return new CandidatePool(List.copyOf(bound), unique.size(), unbound);
         }
 
         private boolean canReach(int sourceComponent, int targetComponent) {
@@ -657,6 +766,17 @@ public final class TopologyGraphAudit {
     }
 
     private record BoundCandidate(BlockPos position, int strongComponent) {
+    }
+
+    private record CandidatePool(List<BoundCandidate> boundCandidates,
+                                 int candidateCount,
+                                 int unboundCandidates) {
+    }
+
+    private record PairCandidate(BoundCandidate start,
+                                 BoundCandidate goal,
+                                 double directDistance,
+                                 double difference) {
     }
 
     private boolean initialize() {
@@ -825,7 +945,8 @@ public final class TopologyGraphAudit {
             return;
         }
         TopologyService.ClusterKey key = new TopologyService.ClusterKey(level.dimension(), section);
-        requests.put(key, service.requestCluster(
+        requests.put(key, requestClusterDependency(
+                service,
                 level,
                 section,
                 NavigationScheduler.Priority.BACKGROUND

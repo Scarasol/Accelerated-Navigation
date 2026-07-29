@@ -28,6 +28,8 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -47,7 +49,9 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /** Owns topology revisions and is the sole publisher of immutable cluster data. */
 public final class TopologyService {
@@ -60,13 +64,22 @@ public final class TopologyService {
     private static final int MAX_BASE_BOUNDARY_LINK_ENTRIES = 4_096;
     private static final int MAX_SUPER_BOUNDARY_LINK_ENTRIES = 1_024;
     private static final int MIN_QUERY_VISITED_NODES = 1_024;
+    private static final int MIN_HIERARCHICAL_QUERY_VISITED_NODES = 2_048;
     private static final int MAX_QUERY_VISITED_NODES = 8_192;
     private static final float QUERY_VISITED_NODES_PER_BLOCK = 8.0F;
+    private static final int MAX_DEPENDENCY_DEMANDS = 64;
+    private static final int MAX_MACRO_QUERY_WAITERS = 1_024;
+    private static final int MAX_COMPLETED_CORRIDORS = 1_024;
+    private static final long MAX_COMPLETED_CORRIDOR_BYTES = 16L * 1024L * 1024L;
 
     private static final TopologyTaskExecutor.TaskHandle UNTRACKED_TASK =
             new TopologyTaskExecutor.TaskHandle() {
                 @Override
                 public void promote(NavigationScheduler.Priority priority) {
+                }
+
+                @Override
+                public void reprioritize(NavigationScheduler.Priority priority) {
                 }
 
                 @Override
@@ -76,11 +89,9 @@ public final class TopologyService {
             };
 
     private final WorkDispatcher buildWorker;
-    private final WorkDispatcher persistenceWorker;
     private final Executor publisher;
     private final BooleanSupplier ownerThread;
     private final TopologyTaskExecutor ownedBuildWorker;
-    private final TopologyTaskExecutor ownedPersistenceWorker;
     private final TopologyStore store;
     private final MinecraftServer server;
     private final Map<ClusterKey, ClusterEntry> clusters = new HashMap<>();
@@ -90,15 +101,21 @@ public final class TopologyService {
             baseBoundaryLinks = new LinkedHashMap<>(64, 0.75F, true);
     private final LinkedHashMap<SuperBoundaryCacheKey, LinkEntry<SuperClusterTopology.CrossingIndex>>
             superBoundaryLinks = new LinkedHashMap<>(32, 0.75F, true);
-    private final ArrayDeque<ClusterKey> requestedBuilds = new ArrayDeque<>();
-    private final Set<ClusterKey> queuedBuilds = new HashSet<>();
+    private final Map<MacroOwnerKey, MacroRequest> macroRequests = new HashMap<>();
+    private final Map<MacroQueryKey, MacroFlight> macroFlights = new HashMap<>();
+    private final LinkedHashMap<MacroQueryKey, CachedCorridor> completedCorridors =
+            new LinkedHashMap<>(32, 0.75F, true);
+    private final DemandQueue requestedBuilds = new DemandQueue();
     private final LongAdder snapshotCells = new LongAdder();
     private final LongAdder snapshotNanos = new LongAdder();
     private final LongAdder buildRequests = new LongAdder();
     private final LongAdder buildNanos = new LongAdder();
     private final LongAdder publishedClusters = new LongAdder();
+    private final LongAdder freshBuilds = new LongAdder();
+    private final LongAdder persistenceHits = new LongAdder();
     private final LongAdder staleBuilds = new LongAdder();
     private final LongAdder coalescedInvalidations = new LongAdder();
+    private final LongAdder dependencyStartsAtFullOrdinaryAdmission = new LongAdder();
     private final LongAdder superBuildRequests = new LongAdder();
     private final LongAdder superBuildNanos = new LongAdder();
     private final LongAdder publishedSuperClusters = new LongAdder();
@@ -121,18 +138,29 @@ public final class TopologyService {
 
     private boolean closed;
     private long topologyEpoch;
+    private long demandSequence;
+    private int dependencyPermits;
+    private int dependencyPermitHighWatermark;
+    private long macroFlightSequence;
+    private long macroLogicalRequests;
+    private long macroPhysicalSearches;
+    private long macroInFlightJoins;
+    private long macroCompletedHits;
+    private long macroCompletedMisses;
+    private long macroStaleEvictions;
+    private long macroCacheEvictions;
+    private long completedCorridorBytes;
+    private int macroMaximumGroupSize;
 
     TopologyService(Executor worker, Executor publisher, BooleanSupplier ownerThread) {
         Executor injectedWorker = Objects.requireNonNull(worker, "worker");
-        this.buildWorker = (priority, command) -> {
+        this.buildWorker = (dimension, priority, command) -> {
             injectedWorker.execute(command);
             return UNTRACKED_TASK;
         };
-        this.persistenceWorker = this.buildWorker;
         this.publisher = Objects.requireNonNull(publisher, "publisher");
         this.ownerThread = Objects.requireNonNull(ownerThread, "ownerThread");
         this.ownedBuildWorker = null;
-        this.ownedPersistenceWorker = null;
         this.store = null;
         this.server = null;
     }
@@ -143,12 +171,7 @@ public final class TopologyService {
                 "accelerated-navigation-topology",
                 Math.max(Thread.MIN_PRIORITY, Thread.NORM_PRIORITY - 1)
         );
-        this.ownedPersistenceWorker = new TopologyTaskExecutor(
-                "accelerated-navigation-topology-io",
-                Thread.MIN_PRIORITY
-        );
         this.buildWorker = ownedBuildWorker::submit;
-        this.persistenceWorker = ownedPersistenceWorker::submit;
         this.publisher = server::execute;
         this.ownerThread = server::isSameThread;
         TopologyStore openedStore;
@@ -269,6 +292,21 @@ public final class TopologyService {
         }
     }
 
+    public static void onLevelSave(ServerLevel level) {
+        Objects.requireNonNull(level, "level");
+        if (!level.getServer().isSameThread()) {
+            level.getServer().execute(() -> onLevelSave(level));
+            return;
+        }
+        TopologyService service;
+        synchronized (SERVICES) {
+            service = SERVICES.get(level.getServer());
+        }
+        if (service != null && service.store != null && !service.closed) {
+            service.store.save(level.dimension()).join();
+        }
+    }
+
     static boolean navigationGeometryChanged(VoxelShape oldShape,
                                              boolean oldContainsFluid,
                                              VoxelShape newShape,
@@ -300,9 +338,10 @@ public final class TopologyService {
         return flags;
     }
 
-    public CompletableFuture<BaseClusterTopology> requestCluster(ServerLevel level,
-                                                                  SectionPos section,
-                                                                  NavigationScheduler.Priority priority) {
+    TopologySubscription<BaseClusterTopology> subscribeClusterDependency(
+            ServerLevel level,
+            SectionPos section,
+            NavigationScheduler.Priority priority) {
         requireOwnerThread();
         ensureOpen();
         Objects.requireNonNull(level, "level");
@@ -313,7 +352,8 @@ public final class TopologyService {
         }
         LevelChunk chunk = level.getChunkSource().getChunkNow(section.x(), section.z());
         if (chunk == null) {
-            return CompletableFuture.failedFuture(
+            return failedSubscription(
+                    priority,
                     new IllegalStateException("topology request cannot load an unavailable chunk")
             );
         }
@@ -321,27 +361,50 @@ public final class TopologyService {
         ClusterKey key = new ClusterKey(level.dimension(), section);
         ClusterEntry entry = clusters.computeIfAbsent(key, ignored -> new ClusterEntry());
         if (entry.topology != null && entry.topology.revision() == entry.revision) {
-            return CompletableFuture.completedFuture(entry.topology);
+            return completedSubscription(entry.topology, priority);
         }
-        if (entry.request == null) {
-            entry.request = new CompletableFuture<>();
+        TopologyDemand demand = entry.demand;
+        if (demand == null) {
+            demand = new TopologyDemand(
+                    key,
+                    entry.revision,
+                    ++demandSequence,
+                    System.nanoTime()
+            );
+            entry.demand = demand;
         }
-        entry.requestPriority = higherPriority(entry.requestPriority, priority);
-        if (entry.snapshotFuture != null) {
+        TopologySubscription<BaseClusterTopology> subscription =
+                new TopologySubscription<>(priority);
+        subscription.demand = demand;
+        subscription.cancellation = () -> cancelClusterSubscription(subscription);
+        subscription.reprioritization = requested -> reconcileClusterSubscription(
+                subscription,
+                requested
+        );
+        demand.waiters.add(subscription);
+        NavigationScheduler.Priority previous = demand.priority;
+        demand.priority = higherPriority(previous, priority);
+        if (demand.queued && previous != demand.priority) {
+            requestedBuilds.reprioritize(demand, previous);
+        }
+        if (demand.snapshotFuture != null && previous != demand.priority) {
             NavigationScheduler.forServer(level.getServer()).promote(
                     level.dimension(),
                     snapshotOwner(key),
-                    entry.requestPriority
+                    demand.priority
             );
         }
-        if (entry.pending != null) {
-            entry.pending.promote(entry.requestPriority);
+        if (demand.buildTask != UNTRACKED_TASK && previous != demand.priority) {
+            demand.buildTask.promote(demand.priority);
         }
-        enqueueRequestedBuild(key, entry);
-        return entry.request;
+        if (!demand.queued && !demand.dependencyPermit) {
+            acquireDependencyPermit(demand);
+        }
+        enqueueRequestedBuild(demand);
+        return subscription;
     }
 
-    private CompletableFuture<SuperClusterTopology> requestSuperCluster(
+    private TopologySubscription<SuperClusterTopology> requestSuperCluster(
             ServerLevel level,
             SectionPos origin,
             BaseClusterTopology.Channel channel,
@@ -359,7 +422,8 @@ public final class TopologyService {
         }
         SuperCacheKey key = new SuperCacheKey(level.dimension(), origin, channel, profile);
         if (!superClusterAvailable(level, origin)) {
-            return CompletableFuture.failedFuture(
+            return failedSubscription(
+                    priority,
                     new IllegalStateException("super topology cannot use unavailable sections")
             );
         }
@@ -367,47 +431,59 @@ public final class TopologyService {
         SuperEntry entry = superClusters.computeIfAbsent(key, ignored -> new SuperEntry());
         SuperClusterTopology ready = currentSuperTopology(key, entry);
         if (ready != null) {
-            return CompletableFuture.completedFuture(ready);
+            return completedSubscription(ready, priority);
         }
-        if (entry.request == null) {
-            entry.request = new CompletableFuture<>();
-        }
+        TopologySubscription<SuperClusterTopology> subscription =
+                new TopologySubscription<>(priority);
+        subscription.cancellation = () -> cancelSuperSubscription(key, entry, subscription);
+        subscription.reprioritization = requested -> reconcileSuperSubscription(
+                entry,
+                subscription,
+                requested
+        );
+        entry.waiters.add(subscription);
         NavigationScheduler.Priority previousPriority = entry.requestPriority;
         entry.requestPriority = higherPriority(previousPriority, priority);
-        if (entry.buildTask != null) {
-            entry.buildTask.promote(entry.requestPriority);
+        if (entry.buildTask != null && previousPriority != entry.requestPriority) {
+            entry.buildTask.reprioritize(entry.requestPriority);
         }
-        if (entry.attemptRunning && previousPriority != entry.requestPriority) {
-            for (SectionPos child : SuperClusterTopology.childSections(key.origin())) {
-                requestCluster(level, child, entry.requestPriority);
-            }
+        if (entry.attemptRunning) {
+            reconcileSuperChildren(entry);
         }
         if (!entry.attemptRunning) {
             beginSuperRequest(level, key, entry);
         }
-        return entry.request;
+        return subscription;
     }
 
     private void beginSuperRequest(ServerLevel level,
                                    SuperCacheKey key,
                                    SuperEntry entry) {
         requireOwnerThread();
-        if (closed || entry.request == null || entry.request.isDone()) {
+        if (closed || entry.waiters.isEmpty()) {
             return;
         }
         entry.attemptRunning = true;
         long attempt = ++entry.attempt;
-        List<CompletableFuture<BaseClusterTopology>> children = new ArrayList<>(8);
+        List<TopologySubscription<BaseClusterTopology>> children = new ArrayList<>(8);
         try {
             for (SectionPos child : SuperClusterTopology.childSections(key.origin())) {
-                children.add(requestCluster(level, child, entry.requestPriority));
+                children.add(subscribeClusterDependency(
+                        level,
+                        child,
+                        entry.requestPriority
+                ));
             }
+            entry.children = List.copyOf(children);
         } catch (RuntimeException failure) {
+            children.forEach(TopologySubscription::cancel);
             entry.attemptRunning = false;
             failSuperRequest(key, entry, failure);
             return;
         }
-        CompletableFuture.allOf(children.toArray(CompletableFuture[]::new))
+        CompletableFuture.allOf(children.stream()
+                        .map(TopologySubscription::future)
+                        .toArray(CompletableFuture[]::new))
                 .whenComplete((ignored, failure) -> publisher.execute(
                         () -> completeSuperChildren(level, key, entry, attempt, failure)
                 ));
@@ -421,9 +497,10 @@ public final class TopologyService {
         requireOwnerThread();
         SuperEntry entry = superClusters.get(key);
         if (entry != expected || entry.attempt != attempt || closed
-                || entry.request == null || entry.request.isDone()) {
+                || entry.waiters.isEmpty()) {
             return;
         }
+        entry.children = List.of();
         if (failure != null) {
             entry.attemptRunning = false;
             if (retryableAttemptFailure(failure) && superClusterAvailable(level, key.origin())) {
@@ -443,6 +520,7 @@ public final class TopologyService {
         superBuildRequests.increment();
         try {
             entry.buildTask = buildWorker.submit(
+                    key.dimension(),
                     entry.requestPriority,
                     () -> buildSuperCluster(key, entry, attempt, childSnapshot)
             );
@@ -490,7 +568,7 @@ public final class TopologyService {
         requireOwnerThread();
         SuperEntry entry = superClusters.get(key);
         if (entry != expected || entry.attempt != attempt || closed
-                || entry.request == null || entry.request.isDone()) {
+                || entry.waiters.isEmpty()) {
             staleSuperBuilds.increment();
             return;
         }
@@ -519,10 +597,13 @@ public final class TopologyService {
         superRetainedBytes.addAndGet(topology.retainedBytes());
         publishedSuperClusters.increment();
         topologyChanged();
-        CompletableFuture<SuperClusterTopology> request = entry.request;
-        entry.request = null;
+        List<TopologySubscription<SuperClusterTopology>> waiters = List.copyOf(entry.waiters);
+        entry.waiters.clear();
         entry.requestPriority = null;
-        request.complete(topology);
+        for (TopologySubscription<SuperClusterTopology> waiter : waiters) {
+            waiter.active = false;
+            waiter.future().complete(topology);
+        }
         evictSuperCache();
     }
 
@@ -542,16 +623,18 @@ public final class TopologyService {
     private void failSuperRequest(SuperCacheKey key,
                                   SuperEntry entry,
                                   Throwable failure) {
-        CompletableFuture<SuperClusterTopology> request = entry.request;
-        entry.request = null;
+        List<TopologySubscription<SuperClusterTopology>> waiters = List.copyOf(entry.waiters);
+        entry.waiters.clear();
         entry.requestPriority = null;
         if (entry.buildTask != null) {
             entry.buildTask.cancel();
             entry.buildTask = null;
         }
+        cancelSuperChildren(entry);
         entry.attemptRunning = false;
-        if (request != null) {
-            request.completeExceptionally(failure);
+        for (TopologySubscription<SuperClusterTopology> waiter : waiters) {
+            waiter.active = false;
+            waiter.future().completeExceptionally(failure);
         }
         if (entry.topology == null) {
             superClusters.remove(key, entry);
@@ -586,7 +669,11 @@ public final class TopologyService {
         baseBoundaryLinks.put(key, entry);
         baseBoundaryBuildRequests.increment();
         try {
-            entry.track(buildWorker.submit(priority, () -> buildBaseBoundaryLinks(key, entry)));
+            entry.track(buildWorker.submit(
+                    key.dimension(),
+                    priority,
+                    () -> buildBaseBoundaryLinks(key, entry)
+            ));
         } catch (RejectedExecutionException failure) {
             baseBoundaryLinks.remove(key, entry);
             entry.future.completeExceptionally(failure);
@@ -668,7 +755,11 @@ public final class TopologyService {
         superBoundaryLinks.put(key, entry);
         superBoundaryBuildRequests.increment();
         try {
-            entry.track(buildWorker.submit(priority, () -> buildSuperBoundaryLinks(key, entry)));
+            entry.track(buildWorker.submit(
+                    key.dimension(),
+                    priority,
+                    () -> buildSuperBoundaryLinks(key, entry)
+            ));
         } catch (RejectedExecutionException failure) {
             superBoundaryLinks.remove(key, entry);
             entry.future.completeExceptionally(failure);
@@ -803,31 +894,31 @@ public final class TopologyService {
         requireOwnerThread();
         ensureOpen();
         NavigationScheduler scheduler = NavigationScheduler.forServer(server);
-        NavigationScheduler.AdmissionCapacity capacity = scheduler.admissionCapacity();
-        int freeSlots = capacity.freeSlots();
-        int evictableBackgroundSlots = capacity.evictableBackgroundSlots();
         int queuedAtTickEnd = requestedBuilds.size();
         for (int index = 0; index < queuedAtTickEnd; index++) {
-            ClusterKey key = requestedBuilds.removeFirst();
-            queuedBuilds.remove(key);
+            TopologyDemand demand = requestedBuilds.poll(
+                    System.nanoTime(),
+                    candidate -> candidate.dependencyPermit
+                            || dependencyPermits < MAX_DEPENDENCY_DEMANDS
+            );
+            if (demand == null) {
+                break;
+            }
+            ClusterKey key = demand.key;
             ClusterEntry entry = clusters.get(key);
-            if (entry == null || entry.request == null || entry.request.isDone()) {
+            if (entry == null || entry.demand != demand || demand.waiters.isEmpty()) {
                 continue;
             }
             if (entry.topology != null && entry.topology.revision() == entry.revision) {
-                completeRequest(key, entry, entry.topology);
+                completeDemand(entry, demand, entry.topology);
                 continue;
             }
-            if (entry.snapshotFuture != null || entry.pending != null) {
+            if (demand.snapshotFuture != null || demand.buildTask != UNTRACKED_TASK) {
                 continue;
             }
-            boolean useFreeSlot = freeSlots > 0;
-            boolean replaceBackground = !useFreeSlot
-                    && entry.requestPriority != NavigationScheduler.Priority.BACKGROUND
-                    && evictableBackgroundSlots > 0;
-            if (!useFreeSlot && !replaceBackground) {
-                enqueueRequestedBuild(key, entry);
-                continue;
+            if (!demand.dependencyPermit && !acquireDependencyPermit(demand)) {
+                enqueueRequestedBuild(demand);
+                break;
             }
             ServerLevel level = server.getLevel(key.dimension());
             LevelChunk chunk = level == null ? null : level.getChunkSource().getChunkNow(
@@ -835,38 +926,32 @@ public final class TopologyService {
                     key.section().z()
             );
             if (level == null || chunk == null) {
-                failRequest(key, entry, new IllegalStateException(
+                failDemand(entry, demand, new IllegalStateException(
                         "topology request cannot use an unavailable chunk"
                 ));
                 continue;
             }
-            startSnapshotAttempt(level, key, entry, chunk);
-            if (useFreeSlot) {
-                freeSlots--;
-            } else {
-                evictableBackgroundSlots--;
+            startSnapshotAttempt(level, entry, demand, chunk);
+            if (scheduler.admissionCapacity().freeSlots() == 0) {
+                dependencyStartsAtFullOrdinaryAdmission.increment();
             }
         }
     }
 
     private void startSnapshotAttempt(ServerLevel level,
-                                      ClusterKey key,
                                       ClusterEntry entry,
+                                      TopologyDemand demand,
                                       LevelChunk chunk) {
-        long expectedRevision = entry.revision;
         entry.dirty = false;
+        ClusterKey key = demand.key;
         SnapshotSearch snapshotSearch = worldSnapshot(level, key.section(), chunk);
-        CompletableFuture<BaseClusterTopology.Snapshot> snapshotFuture =
-                NavigationScheduler.forServer(level.getServer()).submitStrict(
-                        level.dimension(),
-                        snapshotOwner(key),
-                        entry.requestPriority,
-                        snapshotSearch
-                );
-        entry.snapshotFuture = snapshotFuture;
+        NavigationScheduler scheduler = NavigationScheduler.forServer(level.getServer());
+        CompletableFuture<BaseClusterTopology.Snapshot> snapshotFuture = scheduler.submitDependency(
+                level.dimension(), snapshotOwner(key), demand.priority, snapshotSearch);
+        demand.snapshotFuture = snapshotFuture;
         snapshotFuture.whenComplete((snapshot, failure) -> publisher.execute(() -> completeSnapshotAttempt(
-                key,
-                expectedRevision,
+                entry,
+                demand,
                 snapshotSearch,
                 snapshotFuture,
                 snapshot,
@@ -874,8 +959,8 @@ public final class TopologyService {
         )));
     }
 
-    private void completeSnapshotAttempt(ClusterKey key,
-                                         long expectedRevision,
+    private void completeSnapshotAttempt(ClusterEntry entry,
+                                         TopologyDemand demand,
                                          SnapshotSearch snapshotSearch,
                                          CompletableFuture<BaseClusterTopology.Snapshot> snapshotFuture,
                                          @Nullable BaseClusterTopology.Snapshot snapshot,
@@ -883,189 +968,92 @@ public final class TopologyService {
         requireOwnerThread();
         snapshotCells.add(snapshotSearch.sampledCells());
         snapshotNanos.add(snapshotSearch.spentNanos());
-        ClusterEntry entry = clusters.get(key);
-        if (entry == null || entry.snapshotFuture != snapshotFuture) {
+        if (clusters.get(demand.key) != entry || entry.demand != demand
+                || demand.snapshotFuture != snapshotFuture) {
             return;
         }
-        entry.snapshotFuture = null;
-        if (closed || entry.request == null) {
+        demand.snapshotFuture = null;
+        if (closed || demand.waiters.isEmpty()) {
             return;
         }
-        if (failure != null || snapshot == null || entry.revision != expectedRevision) {
-            if (entry.revision != expectedRevision || retryableAttemptFailure(failure)) {
+        if (failure != null || snapshot == null || entry.revision != demand.generation) {
+            if (entry.revision != demand.generation || retryableAttemptFailure(failure)) {
                 entry.dirty = true;
-                enqueueRequestedBuild(key, entry);
+                enqueueRequestedBuild(demand);
             } else {
-                failRequest(key, entry, failure != null
+                failDemand(entry, demand, failure != null
                         ? failure
                         : new IllegalStateException("snapshot search failed"));
             }
             return;
         }
-
-        CompletableFuture<BaseClusterTopology> buildFuture;
-        try {
-            buildFuture = submitSnapshot(key, snapshot, entry.requestPriority);
-        } catch (RuntimeException exception) {
-            failRequest(key, entry, exception);
-            return;
-        }
-        buildFuture.whenComplete((topology, buildFailure) -> publisher.execute(
-                () -> completeBuildRequest(key, expectedRevision, topology, buildFailure)
-        ));
-    }
-
-    private void completeBuildRequest(ClusterKey key,
-                                      long expectedRevision,
-                                      @Nullable BaseClusterTopology topology,
-                                      @Nullable Throwable failure) {
-        requireOwnerThread();
-        ClusterEntry entry = clusters.get(key);
-        if (entry == null || entry.request == null || closed) {
-            return;
-        }
-        if (failure != null || topology == null || entry.revision != expectedRevision
-                || entry.topology != topology) {
-            if (entry.revision != expectedRevision || retryableAttemptFailure(failure)) {
-                entry.dirty = true;
-                enqueueRequestedBuild(key, entry);
-            } else {
-                failRequest(key, entry, failure != null
-                        ? failure
-                        : new IllegalStateException("topology build did not publish its result"));
-            }
-            return;
-        }
-        completeRequest(key, entry, topology);
-    }
-
-    public CompletableFuture<BaseClusterTopology> submitSnapshot(ClusterKey key,
-                                                                   BaseClusterTopology.Snapshot snapshot) {
-        return submitSnapshot(key, snapshot, NavigationScheduler.Priority.BACKGROUND);
-    }
-
-    private CompletableFuture<BaseClusterTopology> submitSnapshot(
-            ClusterKey key,
-            BaseClusterTopology.Snapshot snapshot,
-            NavigationScheduler.Priority priority) {
-        requireOwnerThread();
-        ensureOpen();
-        Objects.requireNonNull(key, "key");
-        Objects.requireNonNull(snapshot, "snapshot");
-        Objects.requireNonNull(priority, "priority");
-
-        ClusterEntry entry = clusters.computeIfAbsent(key, ignored -> new ClusterEntry());
-        if (entry.topology != null
-                && entry.topology.revision() == entry.revision
-                && entry.topology.sourceFingerprint() == snapshot.fingerprint()) {
-            return CompletableFuture.completedFuture(entry.topology);
-        }
-        if (entry.topology != null
-                && entry.topology.sourceFingerprint() != snapshot.fingerprint()) {
-            BaseClusterTopology stale = entry.topology;
-            entry.revision++;
-            entry.topology = null;
-            entry.dirty = true;
-            invalidateBaseBoundaryLinks(stale);
-            retainedBytes.addAndGet(-stale.retainedBytes());
-            topologyChanged();
-            invalidateSuperParent(key, false);
-        }
-        if (entry.pending != null) {
-            if (entry.pending.revision != entry.revision
-                    || entry.pending.fingerprint != snapshot.fingerprint()) {
-                throw new IllegalStateException("different snapshots submitted for one topology revision");
-            }
-            entry.pending.promote(priority);
-            return entry.pending.future;
-        }
-
-        PendingBuild pending = new PendingBuild(
-                entry.revision,
-                snapshot.fingerprint(),
-                new CompletableFuture<>(),
-                priority
-        );
-        entry.pending = pending;
-        entry.dirty = false;
+        demand.fingerprint = snapshot.fingerprint();
         buildRequests.increment();
-        startPendingBuild(key, snapshot, pending);
-        return pending.future;
-    }
-
-    private void startPendingBuild(ClusterKey key,
-                                   BaseClusterTopology.Snapshot snapshot,
-                                   PendingBuild pending) {
         try {
             if (store == null) {
-                pending.track(buildWorker.submit(
-                        pending.priority,
-                        () -> build(key, snapshot, pending)
-                ));
+                submitDemandBuild(demand, snapshot, null, BuildOrigin.FRESH_BUILD);
             } else {
-                pending.track(persistenceWorker.submit(
-                        pending.priority,
-                        () -> readStoredTopology(key, snapshot, pending)
-                ));
+                demand.loadPending = true;
+                store.read(demand.key.dimension(), demand.key.section())
+                        .whenComplete((stored, readFailure) -> publisher.execute(
+                                () -> completeStoredTopologyRead(
+                                        entry,
+                                        demand,
+                                        snapshot,
+                                        stored == null ? null : stored.orElse(null),
+                                        readFailure
+                                )
+                        ));
             }
-        } catch (RejectedExecutionException exception) {
-            ClusterEntry entry = clusters.get(key);
-            if (entry != null && entry.pending == pending) {
-                entry.pending = null;
-            }
-            pending.future.completeExceptionally(exception);
+        } catch (RuntimeException exception) {
+            failDemand(entry, demand, exception);
         }
     }
 
-    private void readStoredTopology(ClusterKey key,
-                                    BaseClusterTopology.Snapshot snapshot,
-                                    PendingBuild pending) {
-        BaseClusterTopology stored = null;
-        Throwable readFailure = null;
-        try {
-            stored = store.read(key.dimension(), key.section())
-                    .filter(value -> value.sourceFingerprint() == snapshot.fingerprint())
-                    .orElse(null);
-        } catch (IOException | RuntimeException exception) {
-            readFailure = exception;
-        }
-        BaseClusterTopology result = stored;
-        Throwable failure = readFailure;
-        publisher.execute(() -> completeStoredTopologyRead(
-                key,
-                snapshot,
-                pending,
-                result,
-                failure
-        ));
-    }
-
-    private void completeStoredTopologyRead(ClusterKey key,
+    private void completeStoredTopologyRead(ClusterEntry entry,
+                                            TopologyDemand demand,
                                             BaseClusterTopology.Snapshot snapshot,
-                                            PendingBuild pending,
-                                            @Nullable BaseClusterTopology stored,
+                                            @Nullable BaseClusterTopology.PackedFacts stored,
                                             @Nullable Throwable readFailure) {
         requireOwnerThread();
-        ClusterEntry entry = clusters.get(key);
-        if (closed || entry == null || entry.pending != pending
-                || entry.revision != pending.revision) {
+        if (closed || clusters.get(demand.key) != entry || entry.demand != demand
+                || entry.revision != demand.generation) {
             return;
         }
+        demand.loadPending = false;
         if (readFailure != null) {
-            AcceleratedNavigation.LOGGER.warn("Could not read macro topology for {}", key, readFailure);
+            AcceleratedNavigation.LOGGER.warn(
+                    "Could not read macro topology for {}",
+                    demand.key,
+                    readFailure
+            );
         }
-        if (stored != null) {
-            publish(key, pending, stored.withRevision(pending.revision));
-            return;
-        }
+        boolean persistenceHit = stored != null
+                && stored.fingerprint() == snapshot.fingerprint();
+        submitDemandBuild(
+                demand,
+                snapshot,
+                persistenceHit ? stored : null,
+                persistenceHit ? BuildOrigin.PERSISTENCE_HIT : BuildOrigin.FRESH_BUILD
+        );
+    }
+
+    private void submitDemandBuild(TopologyDemand demand,
+                                   BaseClusterTopology.Snapshot snapshot,
+                                   @Nullable BaseClusterTopology.PackedFacts stored,
+                                   BuildOrigin origin) {
+        demand.loadPending = false;
         try {
-            pending.track(buildWorker.submit(
-                    pending.priority,
-                    () -> build(key, snapshot, pending)
-            ));
+            demand.buildTask = buildWorker.submit(
+                    demand.key.dimension(),
+                    demand.priority,
+                    () -> build(demand, snapshot, stored, origin)
+            );
         } catch (RejectedExecutionException exception) {
-            entry.pending = null;
-            pending.future.completeExceptionally(exception);
+            ClusterEntry entry = clusters.get(demand.key);
+            if (entry != null && entry.demand == demand) {
+                failDemand(entry, demand, exception);
+            }
         }
     }
 
@@ -1077,7 +1065,7 @@ public final class TopologyService {
             return;
         }
         if (entry.dirty && entry.topology == null
-                && entry.pending == null && entry.snapshotFuture == null) {
+                && (entry.demand == null || entry.demand.queued)) {
             coalescedInvalidations.increment();
             return;
         }
@@ -1089,20 +1077,23 @@ public final class TopologyService {
             entry.topology = null;
             topologyChanged();
         }
-        if (entry.pending != null) {
-            PendingBuild stale = entry.pending;
-            entry.pending = null;
-            stale.cancel();
-            stale.future.completeExceptionally(new StaleTopologyException(key));
-        }
-        if (entry.snapshotFuture != null) {
-            entry.snapshotFuture = null;
-            if (server != null) {
-                NavigationScheduler.forServer(server).cancel(key.dimension(), snapshotOwner(key));
+        if (entry.demand != null) {
+            TopologyDemand stale = entry.demand;
+            cancelDemandWork(stale);
+            TopologyDemand replacement = new TopologyDemand(
+                    key,
+                    entry.revision,
+                    stale.sequence,
+                    stale.enqueuedNanos
+            );
+            replacement.priority = stale.priority;
+            replacement.waiters.addAll(stale.waiters);
+            for (TopologySubscription<BaseClusterTopology> waiter : replacement.waiters) {
+                waiter.demand = replacement;
             }
-        }
-        if (entry.request != null && !entry.request.isDone()) {
-            enqueueRequestedBuild(key, entry);
+            stale.waiters.clear();
+            entry.demand = replacement;
+            enqueueRequestedBuild(replacement);
         }
         invalidateSuperParent(key, false);
     }
@@ -1150,20 +1141,30 @@ public final class TopologyService {
         return true;
     }
 
-    public MacroQuery macroQuery(ServerLevel level,
-                                 BlockPos start,
-                                 BlockPos goal,
-                                 BaseClusterTopology.Channel channel,
-                                 BaseClusterTopology.TraversalProfile profile,
-                                 NavigationScheduler.Priority priority) {
+    public MacroRequest requestMacroQuery(ServerLevel level,
+                                          UUID owner,
+                                          BlockPos start,
+                                          BlockPos goal,
+                                          BaseClusterTopology.Channel channel,
+                                          BaseClusterTopology.TraversalProfile profile,
+                                          NavigationScheduler.Priority priority) {
         requireOwnerThread();
         ensureOpen();
         Objects.requireNonNull(level, "level");
         if (server == null || level.getServer() != server) {
             throw new IllegalArgumentException("level belongs to a different topology service");
         }
-        return new MacroQuery(
+        MacroOwnerKey ownerKey = new MacroOwnerKey(
+                level.dimension(),
+                Objects.requireNonNull(owner, "owner")
+        );
+        MacroRequest replaced = macroRequests.remove(ownerKey);
+        if (replaced != null) {
+            replaced.cancelInternal();
+        }
+        MacroRequest request = new MacroRequest(
                 level,
+                ownerKey,
                 Objects.requireNonNull(start, "start").immutable(),
                 Objects.requireNonNull(goal, "goal").immutable(),
                 Objects.requireNonNull(channel, "channel"),
@@ -1171,6 +1172,16 @@ public final class TopologyService {
                 Objects.requireNonNull(priority, "priority"),
                 MacroSearch.DEFAULT_WEIGHT
         );
+        macroLogicalRequests++;
+        if (macroRequests.size() >= MAX_MACRO_QUERY_WAITERS) {
+            request.reject(new RejectedExecutionException(
+                    "accelerated macro query waiter limit reached"
+            ));
+            return request;
+        }
+        macroRequests.put(ownerKey, request);
+        request.beginResolve();
+        return request;
     }
 
     private static boolean shouldUseSuperGraph(BlockPos start, BlockPos goal) {
@@ -1185,10 +1196,14 @@ public final class TopologyService {
         return Math.max(dx, Math.max(dy, dz)) >= MIN_SUPER_CLUSTER_DISTANCE;
     }
 
-    private static int queryNodeBudget(BlockPos start, BlockPos goal) {
+    private static int queryNodeBudget(BlockPos start,
+                                       BlockPos goal,
+                                       boolean hierarchical) {
         double directDistance = Math.sqrt(start.distSqr(goal));
         return Math.max(
-                MIN_QUERY_VISITED_NODES,
+                hierarchical
+                        ? MIN_HIERARCHICAL_QUERY_VISITED_NODES
+                        : MIN_QUERY_VISITED_NODES,
                 Math.min(
                         MAX_QUERY_VISITED_NODES,
                         (int) Math.ceil(directDistance * QUERY_VISITED_NODES_PER_BLOCK)
@@ -1213,15 +1228,34 @@ public final class TopologyService {
     }
 
     public Metrics metrics() {
+        int dependencyDemands = 0;
+        int queuedDependencyDemands = 0;
+        int topologyWaiters = 0;
+        for (ClusterEntry entry : clusters.values()) {
+            if (entry.demand == null) {
+                continue;
+            }
+            topologyWaiters += entry.demand.waiters.size();
+            dependencyDemands++;
+            if (entry.demand.queued) {
+                queuedDependencyDemands++;
+            }
+        }
+        for (SuperEntry entry : superClusters.values()) {
+            topologyWaiters += entry.waiters.size();
+        }
+        TopologyStore.Metrics persistence = store == null ? null : store.metrics();
         return new Metrics(
                 snapshotCells.sum(),
                 snapshotNanos.sum(),
                 buildRequests.sum(),
                 buildNanos.sum(),
                 publishedClusters.sum(),
+                freshBuilds.sum(),
+                persistenceHits.sum(),
                 staleBuilds.sum(),
                 coalescedInvalidations.sum(),
-                queuedBuilds.size(),
+                requestedBuilds.size(),
                 retainedBytes.get(),
                 superBuildRequests.sum(),
                 superBuildNanos.sum(),
@@ -1231,7 +1265,14 @@ public final class TopologyService {
                 superClusters.size(),
                 superRetainedBytes.get(),
                 workerMetrics(ownedBuildWorker),
-                workerMetrics(ownedPersistenceWorker),
+                persistenceWorkerMetrics(persistence),
+                persistenceMetrics(persistence),
+                dependencyPermits,
+                dependencyPermitHighWatermark,
+                dependencyDemands,
+                queuedDependencyDemands,
+                topologyWaiters,
+                dependencyStartsAtFullOrdinaryAdmission.sum(),
                 topologyEpoch,
                 new LinkCacheMetrics(
                         baseBoundaryBuildRequests.sum(),
@@ -1250,6 +1291,20 @@ public final class TopologyService {
                         superBoundaryEvictions.sum(),
                         superBoundaryLinks.size(),
                         superBoundaryRetainedBytes.get()
+                ),
+                new MacroQueryReuseMetrics(
+                        macroLogicalRequests,
+                        macroPhysicalSearches,
+                        macroInFlightJoins,
+                        macroCompletedHits,
+                        macroCompletedMisses,
+                        macroStaleEvictions,
+                        macroCacheEvictions,
+                        macroRequests.size(),
+                        macroFlights.size(),
+                        macroMaximumGroupSize,
+                        completedCorridors.size(),
+                        completedCorridorBytes
                 )
         );
     }
@@ -1271,6 +1326,42 @@ public final class TopologyService {
         );
     }
 
+    private static WorkerMetrics persistenceWorkerMetrics(@Nullable TopologyStore.Metrics metrics) {
+        if (metrics == null) {
+            return new WorkerMetrics(false, 0, 0L, 0L, 0L, 0L, 0L, 0L);
+        }
+        return new WorkerMetrics(
+                true,
+                metrics.queuedTasks(),
+                metrics.submittedTasks(),
+                metrics.completedTasks(),
+                0L,
+                0L,
+                metrics.totalQueueWaitNanos(),
+                metrics.maximumQueueWaitNanos()
+        );
+    }
+
+    private static PersistenceMetrics persistenceMetrics(@Nullable TopologyStore.Metrics metrics) {
+        if (metrics == null) {
+            return new PersistenceMetrics(0L, 0L, 0L, 0L, 0, 0, 0L, 0L, 0L, 0, 0, 0);
+        }
+        return new PersistenceMetrics(
+                metrics.physicalReads(),
+                metrics.coalescedReads(),
+                metrics.physicalWrites(),
+                metrics.flushes(),
+                metrics.pendingChunks(),
+                metrics.pendingHighWatermark(),
+                metrics.oldestPendingNanos(),
+                metrics.writeFailures(),
+                metrics.droppedChunks(),
+                metrics.decodedChunks(),
+                metrics.inFlightLoads(),
+                metrics.openRegions()
+        );
+    }
+
     public void shutdown() {
         requireOwnerThread();
         if (closed) {
@@ -1278,6 +1369,19 @@ public final class TopologyService {
         }
         closed = true;
         IllegalStateException stopped = new IllegalStateException("topology service stopped");
+        for (MacroRequest request : List.copyOf(macroRequests.values())) {
+            request.cancelInternal();
+        }
+        for (MacroFlight flight : List.copyOf(macroFlights.values())) {
+            NavigationScheduler.forServer(server).cancel(
+                    flight.key.dimension,
+                    flight.schedulerOwner
+            );
+        }
+        macroRequests.clear();
+        macroFlights.clear();
+        completedCorridors.clear();
+        completedCorridorBytes = 0L;
         for (LinkEntry<SuperClusterTopology.BoundaryLinks> entry : baseBoundaryLinks.values()) {
             entry.task.cancel();
             entry.future.completeExceptionally(stopped);
@@ -1290,25 +1394,8 @@ public final class TopologyService {
         superBoundaryLinks.clear();
         for (Map.Entry<ClusterKey, ClusterEntry> cluster : clusters.entrySet()) {
             ClusterEntry entry = cluster.getValue();
-            if (entry.pending != null) {
-                entry.pending.cancel();
-                entry.pending.future.completeExceptionally(
-                        new IllegalStateException("topology service stopped")
-                );
-                entry.pending = null;
-            }
-            if (entry.snapshotFuture != null && server != null) {
-                entry.snapshotFuture = null;
-                NavigationScheduler.forServer(server).cancel(
-                        cluster.getKey().dimension(),
-                        snapshotOwner(cluster.getKey())
-                );
-            }
-            if (entry.request != null) {
-                entry.request.completeExceptionally(
-                        new IllegalStateException("topology service stopped")
-                );
-                entry.request = null;
+            if (entry.demand != null) {
+                failDemand(entry, entry.demand, stopped);
             }
             entry.topology = null;
         }
@@ -1317,17 +1404,18 @@ public final class TopologyService {
                 entry.buildTask.cancel();
                 entry.buildTask = null;
             }
-            if (entry.request != null) {
-                entry.request.completeExceptionally(
-                        new IllegalStateException("topology service stopped")
-                );
+            cancelSuperChildren(entry);
+            for (TopologySubscription<SuperClusterTopology> waiter : List.copyOf(entry.waiters)) {
+                waiter.active = false;
+                waiter.future().completeExceptionally(stopped);
             }
+            entry.waiters.clear();
+            entry.requestPriority = null;
             entry.topology = null;
-            entry.request = null;
         }
         superClusters.clear();
         requestedBuilds.clear();
-        queuedBuilds.clear();
+        dependencyPermits = 0;
         retainedBytes.set(0L);
         superRetainedBytes.set(0L);
         baseBoundaryRetainedBytes.set(0L);
@@ -1335,47 +1423,46 @@ public final class TopologyService {
         if (ownedBuildWorker != null) {
             ownedBuildWorker.shutdown();
         }
-        if (ownedPersistenceWorker != null) {
-            if (store == null) {
-                ownedPersistenceWorker.shutdown();
-            } else {
-                ownedPersistenceWorker.shutdown(() -> {
-                    try {
-                        store.close();
-                    } catch (IOException exception) {
-                        AcceleratedNavigation.LOGGER.error("Could not close macro topology store", exception);
-                    }
-                });
-            }
+        if (store != null) {
+            store.close();
         }
     }
 
-    private void build(ClusterKey key,
-                       BaseClusterTopology.Snapshot snapshot,
-                       PendingBuild pending) {
+    private void build(TopologyDemand demand,
+                       BaseClusterTopology.Snapshot freshSnapshot,
+                       @Nullable BaseClusterTopology.PackedFacts stored,
+                       BuildOrigin origin) {
         long started = System.nanoTime();
         BaseClusterTopology topology;
+        BaseClusterTopology.Snapshot snapshot;
         try {
-            topology = BaseClusterTopology.build(key.section(), pending.revision, snapshot);
+            snapshot = stored == null ? freshSnapshot : stored.snapshot();
+            topology = BaseClusterTopology.build(
+                    demand.key.section(),
+                    demand.generation,
+                    snapshot
+            );
         } catch (RuntimeException exception) {
             buildNanos.add(System.nanoTime() - started);
-            publisher.execute(() -> failBuild(key, pending, exception));
+            publisher.execute(() -> failBuild(demand, exception));
             return;
         }
         buildNanos.add(System.nanoTime() - started);
-        publisher.execute(() -> publish(key, pending, topology));
+        publisher.execute(() -> publish(demand, topology, freshSnapshot, origin));
     }
 
-    private void publish(ClusterKey key,
-                         PendingBuild pending,
-                         BaseClusterTopology topology) {
+    private void publish(TopologyDemand demand,
+                         BaseClusterTopology topology,
+                         BaseClusterTopology.Snapshot freshSnapshot,
+                         BuildOrigin origin) {
         requireOwnerThread();
+        ClusterKey key = demand.key;
         ClusterEntry entry = clusters.get(key);
-        if (closed || entry == null || entry.revision != pending.revision
-                || entry.pending != pending
-                || topology.sourceFingerprint() != pending.fingerprint) {
+        demand.buildTask = UNTRACKED_TASK;
+        if (closed || entry == null || entry.revision != demand.generation
+                || entry.demand != demand
+                || topology.sourceFingerprint() != demand.fingerprint) {
             staleBuilds.increment();
-            pending.future.completeExceptionally(new StaleTopologyException(key));
             return;
         }
 
@@ -1385,34 +1472,31 @@ public final class TopologyService {
             retainedBytes.addAndGet(-replaced.retainedBytes());
         }
         entry.topology = topology;
-        entry.pending = null;
         entry.dirty = false;
         retainedBytes.addAndGet(topology.retainedBytes());
         publishedClusters.increment();
+        if (origin == BuildOrigin.PERSISTENCE_HIT) {
+            persistenceHits.increment();
+        } else {
+            freshBuilds.increment();
+        }
         topologyChanged();
         if (replaced != null) {
             invalidateSuperParent(key, false);
         }
-        pending.future.complete(topology);
-        if (store != null && !closed) {
-            try {
-                persistenceWorker.submit(
-                        NavigationScheduler.Priority.BACKGROUND,
-                        () -> persist(key, topology)
-                );
-            } catch (RejectedExecutionException exception) {
-                AcceleratedNavigation.LOGGER.warn("Macro topology persistence queue rejected {}", key);
-            }
+        if (origin == BuildOrigin.FRESH_BUILD && store != null && !closed) {
+            store.markDirty(key.dimension(), key.section(), freshSnapshot.packedFacts());
         }
+        completeDemand(entry, demand, topology);
     }
 
-    private void failBuild(ClusterKey key, PendingBuild pending, RuntimeException exception) {
+    private void failBuild(TopologyDemand demand, RuntimeException exception) {
         requireOwnerThread();
-        ClusterEntry entry = clusters.get(key);
-        if (entry != null && entry.pending == pending) {
-            entry.pending = null;
+        demand.buildTask = UNTRACKED_TASK;
+        ClusterEntry entry = clusters.get(demand.key);
+        if (entry != null && entry.demand == demand) {
+            failDemand(entry, demand, exception);
         }
-        pending.future.completeExceptionally(exception);
     }
 
     private void requireOwnerThread() {
@@ -1421,44 +1505,236 @@ public final class TopologyService {
         }
     }
 
-    private void persist(ClusterKey key, BaseClusterTopology topology) {
-        try {
-            store.write(key.dimension(), topology);
-        } catch (IOException exception) {
-            AcceleratedNavigation.LOGGER.warn("Could not persist macro topology for {}", key, exception);
-        }
-    }
-
-    private void enqueueRequestedBuild(ClusterKey key, ClusterEntry entry) {
-        if (entry.request == null || entry.request.isDone() || entry.snapshotFuture != null
-                || entry.pending != null) {
+    private void enqueueRequestedBuild(TopologyDemand demand) {
+        if (demand.waiters.isEmpty() || demand.queued || demand.snapshotFuture != null
+                || demand.loadPending || demand.buildTask != UNTRACKED_TASK) {
             return;
         }
-        if (queuedBuilds.add(key)) {
-            requestedBuilds.addLast(key);
+        requestedBuilds.add(demand);
+    }
+
+    private void completeDemand(ClusterEntry entry,
+                                TopologyDemand demand,
+                                BaseClusterTopology topology) {
+        entry.demand = null;
+        requestedBuilds.remove(demand);
+        releaseDependencyPermit(demand);
+        for (TopologySubscription<BaseClusterTopology> waiter : List.copyOf(demand.waiters)) {
+            waiter.active = false;
+            waiter.demand = null;
+            waiter.future().complete(topology);
+        }
+        demand.waiters.clear();
+    }
+
+    private void failDemand(ClusterEntry entry, TopologyDemand demand, Throwable failure) {
+        if (entry.demand == demand) {
+            entry.demand = null;
+        }
+        cancelDemandWork(demand);
+        for (TopologySubscription<BaseClusterTopology> waiter : List.copyOf(demand.waiters)) {
+            waiter.active = false;
+            waiter.demand = null;
+            waiter.future().completeExceptionally(failure);
+        }
+        demand.waiters.clear();
+    }
+
+    private <T> TopologySubscription<T> completedSubscription(
+            T value,
+            NavigationScheduler.Priority priority) {
+        TopologySubscription<T> subscription = new TopologySubscription<>(priority);
+        subscription.active = false;
+        subscription.future().complete(value);
+        return subscription;
+    }
+
+    private <T> TopologySubscription<T> failedSubscription(
+            NavigationScheduler.Priority priority,
+            Throwable failure) {
+        TopologySubscription<T> subscription = new TopologySubscription<>(priority);
+        subscription.active = false;
+        subscription.future().completeExceptionally(failure);
+        return subscription;
+    }
+
+    private void cancelClusterSubscription(
+            TopologySubscription<BaseClusterTopology> subscription) {
+        requireOwnerThread();
+        if (!subscription.active) {
+            return;
+        }
+        subscription.active = false;
+        TopologyDemand demand = subscription.demand;
+        subscription.demand = null;
+        if (demand == null || !demand.waiters.remove(subscription)) {
+            return;
+        }
+        if (demand.waiters.isEmpty()) {
+            ClusterEntry entry = clusters.get(demand.key);
+            if (entry != null && entry.demand == demand) {
+                entry.demand = null;
+            }
+            cancelDemandWork(demand);
+            return;
+        }
+        NavigationScheduler.Priority previous = demand.priority;
+        demand.priority = demand.waiters.stream()
+                .map(waiter -> waiter.priority)
+                .reduce(NavigationScheduler.Priority.BACKGROUND, TopologyService::higherPriority);
+        if (demand.queued && demand.priority != previous) {
+            requestedBuilds.reprioritize(demand, previous);
+        }
+        if (previous != demand.priority && demand.snapshotFuture != null && server != null) {
+            NavigationScheduler.forServer(server).reprioritize(
+                    demand.key.dimension(),
+                    snapshotOwner(demand.key),
+                    demand.priority
+            );
+        }
+        demand.buildTask.reprioritize(demand.priority);
+    }
+
+    private void reconcileClusterSubscription(
+            TopologySubscription<BaseClusterTopology> subscription,
+            NavigationScheduler.Priority requested) {
+        if (!subscription.active) {
+            return;
+        }
+        TopologyDemand demand = subscription.demand;
+        subscription.priority = requested;
+        if (demand == null) {
+            return;
+        }
+        NavigationScheduler.Priority previous = demand.priority;
+        demand.priority = demand.waiters.stream()
+                .map(waiter -> waiter.priority)
+                .reduce(NavigationScheduler.Priority.BACKGROUND, TopologyService::higherPriority);
+        if (demand.queued) {
+            requestedBuilds.reprioritize(demand, previous);
+        }
+        if (demand.snapshotFuture != null && server != null && previous != demand.priority) {
+            NavigationScheduler.forServer(server).reprioritize(
+                    demand.key.dimension(),
+                    snapshotOwner(demand.key),
+                    demand.priority
+            );
+        }
+        demand.buildTask.reprioritize(demand.priority);
+    }
+
+    private void cancelSuperSubscription(
+            SuperCacheKey key,
+            SuperEntry entry,
+            TopologySubscription<SuperClusterTopology> subscription) {
+        requireOwnerThread();
+        if (!subscription.active || !entry.waiters.remove(subscription)) {
+            return;
+        }
+        subscription.active = false;
+        if (entry.waiters.isEmpty()) {
+            entry.attempt++;
+            entry.attemptRunning = false;
+            if (entry.buildTask != null) {
+                entry.buildTask.cancel();
+                entry.buildTask = null;
+            }
+            cancelSuperChildren(entry);
+            entry.requestPriority = null;
+            if (entry.topology == null) {
+                superClusters.remove(key, entry);
+            }
+            return;
+        }
+        entry.requestPriority = entry.waiters.stream()
+                .map(waiter -> waiter.priority)
+                .reduce(NavigationScheduler.Priority.BACKGROUND, TopologyService::higherPriority);
+        if (entry.buildTask != null) {
+            entry.buildTask.reprioritize(entry.requestPriority);
+        }
+        reconcileSuperChildren(entry);
+    }
+
+    private void reconcileSuperSubscription(
+            SuperEntry entry,
+            TopologySubscription<SuperClusterTopology> subscription,
+            NavigationScheduler.Priority requested) {
+        requireOwnerThread();
+        if (!subscription.active || !entry.waiters.contains(subscription)) {
+            return;
+        }
+        subscription.priority = requested;
+        NavigationScheduler.Priority previous = entry.requestPriority;
+        entry.requestPriority = entry.waiters.stream()
+                .map(waiter -> waiter.priority)
+                .reduce(NavigationScheduler.Priority.BACKGROUND,
+                        TopologyService::higherPriority);
+        if (entry.buildTask != null && previous != entry.requestPriority) {
+            entry.buildTask.reprioritize(entry.requestPriority);
+        }
+        if (previous != entry.requestPriority) {
+            reconcileSuperChildren(entry);
         }
     }
 
-    private void completeRequest(ClusterKey key,
-                                 ClusterEntry entry,
-                                 BaseClusterTopology topology) {
-        CompletableFuture<BaseClusterTopology> request = entry.request;
-        entry.request = null;
-        entry.requestPriority = null;
-        queuedBuilds.remove(key);
-        if (request != null) {
-            request.complete(topology);
+    private void cancelSuperChildren(SuperEntry entry) {
+        entry.children.forEach(TopologySubscription::cancel);
+        entry.children = List.of();
+    }
+
+    private void reconcileSuperChildren(SuperEntry entry) {
+        entry.children.forEach(child -> reconcileClusterSubscription(
+                child,
+                entry.requestPriority
+        ));
+    }
+
+    private boolean acquireDependencyPermit(TopologyDemand demand) {
+        if (demand.dependencyPermit) {
+            return true;
+        }
+        if (demand.waiters.isEmpty() || dependencyPermits >= MAX_DEPENDENCY_DEMANDS) {
+            return false;
+        }
+        demand.dependencyPermit = true;
+        dependencyPermits++;
+        dependencyPermitHighWatermark = Math.max(dependencyPermitHighWatermark, dependencyPermits);
+        if (demand.snapshotFuture != null && server != null) {
+            NavigationScheduler.forServer(server).qualifyDependency(
+                    demand.key.dimension(),
+                    snapshotOwner(demand.key),
+                    demand.priority
+            );
+        }
+        return true;
+    }
+
+    private void releaseDependencyPermit(TopologyDemand demand) {
+        if (!demand.dependencyPermit) {
+            return;
+        }
+        demand.dependencyPermit = false;
+        dependencyPermits--;
+        if (dependencyPermits < 0) {
+            throw new IllegalStateException("topology dependency permit count became negative");
         }
     }
 
-    private void failRequest(ClusterKey key, ClusterEntry entry, Throwable failure) {
-        CompletableFuture<BaseClusterTopology> request = entry.request;
-        entry.request = null;
-        entry.requestPriority = null;
-        queuedBuilds.remove(key);
-        if (request != null) {
-            request.completeExceptionally(failure);
+    private void cancelDemandWork(TopologyDemand demand) {
+        requestedBuilds.remove(demand);
+        if (demand.snapshotFuture != null && server != null) {
+            CompletableFuture<BaseClusterTopology.Snapshot> snapshot = demand.snapshotFuture;
+            demand.snapshotFuture = null;
+            NavigationScheduler.forServer(server).cancel(
+                    demand.key.dimension(),
+                    snapshotOwner(demand.key)
+            );
+            snapshot.cancel(false);
         }
+        demand.loadPending = false;
+        demand.buildTask.cancel();
+        demand.buildTask = UNTRACKED_TASK;
+        releaseDependencyPermit(demand);
     }
 
     private static boolean retryableAttemptFailure(@Nullable Throwable failure) {
@@ -1542,6 +1818,9 @@ public final class TopologyService {
 
     private void evictChunk(ResourceKey<Level> dimension, ChunkPos chunk) {
         requireOwnerThread();
+        if (store != null && !closed) {
+            store.unload(dimension, chunk);
+        }
         evictSuperChunkParents(dimension, chunk);
         Iterator<Map.Entry<ClusterKey, ClusterEntry>> iterator = clusters.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -1557,18 +1836,9 @@ public final class TopologyService {
                 retainedBytes.addAndGet(-entry.topology.retainedBytes());
                 topologyChanged();
             }
-            if (entry.pending != null) {
-                entry.pending.cancel();
-                entry.pending.future.completeExceptionally(new StaleTopologyException(key));
+            if (entry.demand != null) {
+                failDemand(entry, entry.demand, new StaleTopologyException(key));
             }
-            if (entry.snapshotFuture != null && server != null) {
-                entry.snapshotFuture = null;
-                NavigationScheduler.forServer(server).cancel(key.dimension(), snapshotOwner(key));
-            }
-            if (entry.request != null) {
-                entry.request.completeExceptionally(new StaleTopologyException(key));
-            }
-            queuedBuilds.remove(key);
             iterator.remove();
         }
     }
@@ -1652,14 +1922,18 @@ public final class TopologyService {
             }
             entry.attempt++;
             entry.attemptRunning = false;
+            cancelSuperChildren(entry);
             if (unavailable) {
-                if (entry.request != null) {
-                    entry.request.completeExceptionally(new StaleTopologyException(child));
+                StaleTopologyException failure = new StaleTopologyException(child);
+                for (TopologySubscription<SuperClusterTopology> waiter
+                        : List.copyOf(entry.waiters)) {
+                    waiter.active = false;
+                    waiter.future().completeExceptionally(failure);
                 }
-                entry.request = null;
+                entry.waiters.clear();
                 entry.requestPriority = null;
                 iterator.remove();
-            } else if (entry.request != null && !entry.request.isDone()) {
+            } else if (!entry.waiters.isEmpty()) {
                 restart.add(Map.entry(key, entry));
             } else {
                 iterator.remove();
@@ -1702,11 +1976,16 @@ public final class TopologyService {
             }
             entry.attempt++;
             entry.attemptRunning = false;
-            if (entry.request != null) {
-                entry.request.completeExceptionally(new IllegalStateException(
-                        "super topology lost a loaded child chunk"
-                ));
+            cancelSuperChildren(entry);
+            IllegalStateException failure = new IllegalStateException(
+                    "super topology lost a loaded child chunk"
+            );
+            for (TopologySubscription<SuperClusterTopology> waiter : List.copyOf(entry.waiters)) {
+                waiter.active = false;
+                waiter.future().completeExceptionally(failure);
             }
+            entry.waiters.clear();
+            entry.requestPriority = null;
             iterator.remove();
         }
     }
@@ -1718,7 +1997,7 @@ public final class TopologyService {
         Iterator<Map.Entry<SuperCacheKey, SuperEntry>> iterator = superClusters.entrySet().iterator();
         while (superClusters.size() > MAX_SUPER_CACHE_ENTRIES && iterator.hasNext()) {
             SuperEntry entry = iterator.next().getValue();
-            if (entry.request != null || entry.attemptRunning) {
+            if (!entry.waiters.isEmpty() || entry.attemptRunning) {
                 continue;
             }
             removeSuperTopology(entry);
@@ -1806,6 +2085,8 @@ public final class TopologyService {
                           long buildRequests,
                           long buildNanos,
                           long publishedClusters,
+                          long freshBuilds,
+                          long persistenceHits,
                           long staleBuilds,
                           long coalescedInvalidations,
                           int queuedBuilds,
@@ -1819,9 +2100,31 @@ public final class TopologyService {
                            long superRetainedBytes,
                            WorkerMetrics buildWorker,
                            WorkerMetrics persistenceWorker,
+                           PersistenceMetrics persistence,
+                           int dependencyPermits,
+                           int dependencyPermitHighWatermark,
+                           int dependencyDemands,
+                           int queuedDependencyDemands,
+                           int topologyWaiters,
+                           long dependencyStartsAtFullOrdinaryAdmission,
                            long topologyEpoch,
                            LinkCacheMetrics baseBoundaryLinks,
-                           LinkCacheMetrics superBoundaryLinks) {
+                           LinkCacheMetrics superBoundaryLinks,
+                           MacroQueryReuseMetrics macroQueries) {
+    }
+
+    public record MacroQueryReuseMetrics(long logicalRequests,
+                                         long physicalSearches,
+                                         long inFlightJoins,
+                                         long completedHits,
+                                         long completedMisses,
+                                         long staleEvictions,
+                                         long cacheEvictions,
+                                         int activeWaiters,
+                                         int activeFlights,
+                                         int maximumGroupSize,
+                                         int cachedEntries,
+                                         long cachedBytes) {
     }
 
     public record LinkCacheMetrics(long buildRequests,
@@ -1843,21 +2146,247 @@ public final class TopologyService {
                                 long maximumQueueWaitNanos) {
     }
 
-    private static final class ClusterEntry {
+    private final class ClusterEntry {
         private long revision;
         private boolean dirty;
         private BaseClusterTopology topology;
-        private PendingBuild pending;
-        private CompletableFuture<BaseClusterTopology.Snapshot> snapshotFuture;
-        private CompletableFuture<BaseClusterTopology> request;
-        private NavigationScheduler.Priority requestPriority;
+        private TopologyDemand demand;
     }
 
-    private static final class SuperEntry {
+    public record PersistenceMetrics(long physicalReads,
+                                     long coalescedReads,
+                                     long physicalWrites,
+                                     long flushes,
+                                     int pendingChunks,
+                                     int pendingHighWatermark,
+                                     long oldestPendingNanos,
+                                     long writeFailures,
+                                     long droppedChunks,
+                                     int decodedChunks,
+                                     int inFlightLoads,
+                                     int openRegions) {
+    }
+
+    private final class TopologyDemand {
+        private final ClusterKey key;
+        private final long generation;
+        private final long sequence;
+        private final long enqueuedNanos;
+        private final Set<TopologySubscription<BaseClusterTopology>> waiters =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        private NavigationScheduler.Priority priority = NavigationScheduler.Priority.BACKGROUND;
+        private CompletableFuture<BaseClusterTopology.Snapshot> snapshotFuture;
+        private TopologyTaskExecutor.TaskHandle buildTask = UNTRACKED_TASK;
+        private long fingerprint;
+        private boolean dependencyPermit;
+        private boolean loadPending;
+        private boolean queued;
+
+        private TopologyDemand(ClusterKey key,
+                               long generation,
+                               long sequence,
+                               long enqueuedNanos) {
+            this.key = key;
+            this.generation = generation;
+            this.sequence = sequence;
+            this.enqueuedNanos = enqueuedNanos;
+        }
+
+    }
+
+    final class TopologySubscription<T> {
+        private final CompletableFuture<T> future = new CompletableFuture<>();
+        private NavigationScheduler.Priority priority;
+        private TopologyDemand demand;
+        private Runnable cancellation = () -> {
+        };
+        private Consumer<NavigationScheduler.Priority> reprioritization = ignored -> {
+        };
+        private boolean active = true;
+
+        private TopologySubscription(NavigationScheduler.Priority priority) {
+            this.priority = Objects.requireNonNull(priority, "priority");
+            future.whenComplete((ignored, failure) -> {
+                if (!future.isCancelled() || !active) {
+                    return;
+                }
+                if (ownerThread.getAsBoolean()) {
+                    cancellation.run();
+                } else {
+                    publisher.execute(cancellation);
+                }
+            });
+        }
+
+        private void cancel() {
+            if (!active) {
+                return;
+            }
+            cancellation.run();
+            future.cancel(false);
+        }
+
+        private void reprioritize(NavigationScheduler.Priority requested) {
+            if (active && priority != requested) {
+                reprioritization.accept(requested);
+            }
+        }
+
+        CompletableFuture<T> future() {
+            return future;
+        }
+    }
+
+    private final class DemandQueue {
+        private static final long AGING_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
+
+        private final EnumMap<NavigationScheduler.Priority,
+                LinkedHashMap<ResourceKey<Level>, ArrayDeque<TopologyDemand>>> bands =
+                new EnumMap<>(NavigationScheduler.Priority.class);
+        private final List<ResourceKey<Level>> dimensions = new ArrayList<>();
+        private final int[] cursors = new int[NavigationScheduler.Priority.values().length];
+        private int size;
+
+        private DemandQueue() {
+            for (NavigationScheduler.Priority priority : NavigationScheduler.Priority.values()) {
+                bands.put(priority, new LinkedHashMap<>());
+            }
+        }
+
+        private void add(TopologyDemand demand) {
+            if (demand.queued) {
+                return;
+            }
+            if (!dimensions.contains(demand.key.dimension())) {
+                dimensions.add(demand.key.dimension());
+            }
+            insertStable(queue(demand.priority, demand.key.dimension()), demand);
+            demand.queued = true;
+            size++;
+        }
+
+        private void reprioritize(TopologyDemand demand,
+                                  NavigationScheduler.Priority previous) {
+            if (!demand.queued || previous == demand.priority) {
+                return;
+            }
+            removeFromBand(demand, previous);
+            insertStable(queue(demand.priority, demand.key.dimension()), demand);
+        }
+
+        private TopologyDemand poll(long now,
+                                    java.util.function.Predicate<TopologyDemand> eligible) {
+            int rank = Integer.MAX_VALUE;
+            for (NavigationScheduler.Priority priority : NavigationScheduler.Priority.values()) {
+                for (ArrayDeque<TopologyDemand> dimension : bands.get(priority).values()) {
+                    TopologyDemand candidate = dimension.peekFirst();
+                    if (candidate == null || !eligible.test(candidate)) {
+                        continue;
+                    }
+                    rank = Math.min(rank, effectiveRank(candidate, now));
+                }
+            }
+            if (rank == Integer.MAX_VALUE || dimensions.isEmpty()) {
+                return null;
+            }
+            int cursor = cursors[rank];
+            for (int offset = 0; offset < dimensions.size(); offset++) {
+                int index = (cursor + offset) % dimensions.size();
+                ResourceKey<Level> dimension = dimensions.get(index);
+                TopologyDemand selected = null;
+                for (NavigationScheduler.Priority priority : NavigationScheduler.Priority.values()) {
+                    ArrayDeque<TopologyDemand> queue = bands.get(priority).get(dimension);
+                    TopologyDemand candidate = queue == null ? null : queue.peekFirst();
+                    if (candidate != null && eligible.test(candidate)
+                            && effectiveRank(candidate, now) == rank
+                            && (selected == null || candidate.sequence < selected.sequence)) {
+                        selected = candidate;
+                    }
+                }
+                if (selected != null) {
+                    cursors[rank] = (index + 1) % dimensions.size();
+                    remove(selected);
+                    return selected;
+                }
+            }
+            throw new IllegalStateException("topology demand queue is inconsistent");
+        }
+
+        private void remove(TopologyDemand demand) {
+            if (!demand.queued) {
+                return;
+            }
+            removeFromBand(demand, demand.priority);
+            demand.queued = false;
+            size--;
+        }
+
+        private void clear() {
+            for (LinkedHashMap<ResourceKey<Level>, ArrayDeque<TopologyDemand>> band : bands.values()) {
+                for (ArrayDeque<TopologyDemand> queue : band.values()) {
+                    queue.forEach(demand -> demand.queued = false);
+                }
+                band.clear();
+            }
+            size = 0;
+        }
+
+        private int size() {
+            return size;
+        }
+
+        private ArrayDeque<TopologyDemand> queue(NavigationScheduler.Priority priority,
+                                                 ResourceKey<Level> dimension) {
+            return bands.get(priority).computeIfAbsent(dimension, ignored -> new ArrayDeque<>());
+        }
+
+        private void removeFromBand(TopologyDemand demand,
+                                    NavigationScheduler.Priority priority) {
+            LinkedHashMap<ResourceKey<Level>, ArrayDeque<TopologyDemand>> band = bands.get(priority);
+            ArrayDeque<TopologyDemand> queue = band.get(demand.key.dimension());
+            if (queue == null || !queue.remove(demand)) {
+                throw new IllegalStateException("queued topology demand is missing from its band");
+            }
+            if (queue.isEmpty()) {
+                band.remove(demand.key.dimension());
+            }
+        }
+
+        private int effectiveRank(TopologyDemand demand, long now) {
+            int rank = demand.priority.ordinal();
+            long waited = Math.max(0L, now - demand.enqueuedNanos);
+            return rank - (int) Math.min(rank, waited / AGING_NANOS);
+        }
+
+        private void insertStable(ArrayDeque<TopologyDemand> queue, TopologyDemand inserted) {
+            if (queue.isEmpty() || queue.peekLast().sequence < inserted.sequence) {
+                queue.addLast(inserted);
+                return;
+            }
+            ArrayDeque<TopologyDemand> reordered = new ArrayDeque<>(queue.size() + 1);
+            boolean added = false;
+            for (TopologyDemand demand : queue) {
+                if (!added && inserted.sequence < demand.sequence) {
+                    reordered.addLast(inserted);
+                    added = true;
+                }
+                reordered.addLast(demand);
+            }
+            if (!added) {
+                reordered.addLast(inserted);
+            }
+            queue.clear();
+            queue.addAll(reordered);
+        }
+    }
+
+    private final class SuperEntry {
         private long attempt;
         private boolean attemptRunning;
         private SuperClusterTopology topology;
-        private CompletableFuture<SuperClusterTopology> request;
+        private final Set<TopologySubscription<SuperClusterTopology>> waiters =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        private List<TopologySubscription<BaseClusterTopology>> children = List.of();
         private NavigationScheduler.Priority requestPriority;
         private TopologyTaskExecutor.TaskHandle buildTask;
     }
@@ -1935,53 +2464,564 @@ public final class TopologyService {
                 task.promote(requested);
             }
         }
+
     }
 
     @FunctionalInterface
     private interface WorkDispatcher {
-        TopologyTaskExecutor.TaskHandle submit(NavigationScheduler.Priority priority,
-                                               Runnable command);
+        TopologyTaskExecutor.TaskHandle submit(ResourceKey<Level> dimension,
+                                                NavigationScheduler.Priority priority,
+                                                Runnable command);
     }
 
-    private static final class PendingBuild {
-        private final long revision;
-        private final long fingerprint;
-        private final CompletableFuture<BaseClusterTopology> future;
-        private volatile NavigationScheduler.Priority priority;
-        private TopologyTaskExecutor.TaskHandle task = UNTRACKED_TASK;
-        private boolean cancelled;
+    public final class MacroRequest {
+        private final ServerLevel level;
+        private final MacroOwnerKey ownerKey;
+        private final BlockPos startPosition;
+        private final BlockPos goalPosition;
+        private final BaseClusterTopology.Channel channel;
+        private final BaseClusterTopology.TraversalProfile profile;
+        private final NavigationScheduler.Priority priority;
+        private final float weight;
+        private final boolean hierarchical;
+        private final CompletableFuture<MacroSearch.Corridor> future = new CompletableFuture<>();
+        private List<TopologySubscription<BaseClusterTopology>> endpointSubscriptions = List.of();
 
-        private PendingBuild(long revision,
-                             long fingerprint,
-                             CompletableFuture<BaseClusterTopology> future,
-                             NavigationScheduler.Priority priority) {
-            this.revision = revision;
-            this.fingerprint = fingerprint;
-            this.future = future;
+        private boolean active = true;
+        private boolean completedFromCache;
+        private long resolveAttempt;
+        private MacroFlight flight;
+        private MacroSearch.Failure failure = MacroSearch.Failure.NONE;
+        private SectionPos blockedSection;
+        private QueryMetrics metrics;
+
+        private MacroRequest(ServerLevel level,
+                             MacroOwnerKey ownerKey,
+                             BlockPos startPosition,
+                             BlockPos goalPosition,
+                             BaseClusterTopology.Channel channel,
+                             BaseClusterTopology.TraversalProfile profile,
+                             NavigationScheduler.Priority priority,
+                             float weight) {
+            this.level = level;
+            this.ownerKey = ownerKey;
+            this.startPosition = startPosition;
+            this.goalPosition = goalPosition;
+            this.channel = channel;
+            this.profile = profile;
             this.priority = priority;
+            this.weight = weight;
+            this.hierarchical = shouldUseSuperGraph(startPosition, goalPosition)
+                    && superClusterHeightAvailable(
+                            level,
+                            SuperClusterTopology.originOf(SectionPos.of(startPosition))
+                    )
+                    && superClusterHeightAvailable(
+                            level,
+                            SuperClusterTopology.originOf(SectionPos.of(goalPosition))
+                    );
+            future.whenComplete((ignored, requestFailure) -> {
+                if (!future.isCancelled() || !active) {
+                    return;
+                }
+                if (ownerThread.getAsBoolean()) {
+                    cancelInternal();
+                } else {
+                    publisher.execute(this::cancelInternal);
+                }
+            });
         }
 
-        private synchronized void track(TopologyTaskExecutor.TaskHandle handle) {
-            Objects.requireNonNull(handle, "handle");
-            if (cancelled) {
-                handle.cancel();
+        public CompletableFuture<MacroSearch.Corridor> future() {
+            return future;
+        }
+
+        public MacroSearch.Failure failure() {
+            return failure;
+        }
+
+        @Nullable
+        public SectionPos blockedSection() {
+            MacroFlight current = flight;
+            return current == null || current.query == null
+                    ? blockedSection
+                    : current.query.blockedSection();
+        }
+
+        public QueryMetrics metrics() {
+            if (metrics != null) {
+                return metrics;
+            }
+            MacroFlight current = flight;
+            return current == null || current.query == null
+                    ? emptyQueryMetrics(hierarchical)
+                    : current.query.metrics();
+        }
+
+        public boolean completedFromCache() {
+            return completedFromCache;
+        }
+
+        public void cancel() {
+            if (ownerThread.getAsBoolean()) {
+                cancelInternal();
+            } else {
+                publisher.execute(this::cancelInternal);
+            }
+        }
+
+        private void beginResolve() {
+            requireOwnerThread();
+            if (!active) {
                 return;
             }
-            task = handle;
-            task.promote(priority);
+            clearEndpointSubscriptions();
+            long attempt = ++resolveAttempt;
+            SectionPos startSection = SectionPos.of(startPosition);
+            SectionPos goalSection = SectionPos.of(goalPosition);
+            List<SectionPos> sections = startSection.equals(goalSection)
+                    ? List.of(startSection)
+                    : List.of(startSection, goalSection);
+            List<TopologySubscription<BaseClusterTopology>> subscriptions = new ArrayList<>(2);
+            for (SectionPos section : sections) {
+                ClusterKey key = new ClusterKey(level.dimension(), section);
+                if (!clusterLoaded(key)) {
+                    failure = MacroSearch.Failure.UNAVAILABLE_CHUNK;
+                    blockedSection = section;
+                    finish(null, null, emptyQueryMetrics(hierarchical));
+                    return;
+                }
+                subscriptions.add(subscribeClusterDependency(level, section, priority));
+            }
+            endpointSubscriptions = List.copyOf(subscriptions);
+            CompletableFuture.allOf(subscriptions.stream()
+                            .map(TopologySubscription::future)
+                            .toArray(CompletableFuture[]::new))
+                    .whenComplete((ignored, resolveFailure) -> publisher.execute(
+                            () -> completeResolve(attempt, resolveFailure)
+                    ));
         }
 
-        private synchronized void promote(NavigationScheduler.Priority requested) {
-            if (requested.higherThan(priority)) {
-                priority = requested;
-                task.promote(requested);
+        private void completeResolve(long attempt, @Nullable Throwable resolveFailure) {
+            requireOwnerThread();
+            if (!active || attempt != resolveAttempt) {
+                return;
+            }
+            endpointSubscriptions = List.of();
+            if (resolveFailure != null) {
+                if (staleTopologyFailure(resolveFailure)) {
+                    beginResolve();
+                } else {
+                    finishExceptionally(resolveFailure);
+                }
+                return;
+            }
+            ClusterKey startKey = new ClusterKey(level.dimension(), SectionPos.of(startPosition));
+            ClusterKey goalKey = new ClusterKey(level.dimension(), SectionPos.of(goalPosition));
+            BaseClusterTopology startTopology = topology(startKey);
+            BaseClusterTopology goalTopology = topology(goalKey);
+            if (startTopology == null || goalTopology == null) {
+                beginResolve();
+                return;
+            }
+            BaseClusterTopology.Component startComponent = bindComponent(
+                    startTopology,
+                    startPosition,
+                    channel
+            );
+            BaseClusterTopology.Component goalComponent = bindComponent(
+                    goalTopology,
+                    goalPosition,
+                    channel
+            );
+            if (startComponent == null || goalComponent == null) {
+                failure = MacroSearch.Failure.NO_STRUCTURAL_ROUTE;
+                blockedSection = startComponent == null ? startKey.section() : goalKey.section();
+                finish(null, null, emptyQueryMetrics(hierarchical));
+                return;
+            }
+            MacroQueryKey key = new MacroQueryKey(
+                    level.dimension(),
+                    channel,
+                    profile,
+                    hierarchical,
+                    Float.floatToRawIntBits(weight),
+                    queryNodeBudget(startPosition, goalPosition, hierarchical),
+                    new MacroComponentKey(
+                            startKey.section(),
+                            startComponent.id(),
+                            startTopology.revision()
+                    ),
+                    new MacroComponentKey(
+                            goalKey.section(),
+                            goalComponent.id(),
+                            goalTopology.revision()
+                    )
+            );
+            CachedCorridor cached = completedCorridor(key);
+            if (cached != null) {
+                completedFromCache = true;
+                finish(
+                        rematerializeCorridor(cached.corridor, startPosition, goalPosition),
+                        null,
+                        emptyQueryMetrics(hierarchical)
+                );
+                return;
+            }
+            MacroFlight current = macroFlights.get(key);
+            if (current != null) {
+                macroInFlightJoins++;
+                current.add(this);
+                return;
+            }
+            MacroFlight created = new MacroFlight(key, this);
+            macroFlights.put(key, created);
+            created.start();
+        }
+
+        private void finish(@Nullable MacroSearch.Corridor result,
+                            @Nullable MacroSearch.Failure resultFailure,
+                            QueryMetrics resultMetrics) {
+            if (!active) {
+                return;
+            }
+            active = false;
+            clearEndpointSubscriptions();
+            flight = null;
+            metrics = resultMetrics;
+            if (resultFailure != null) {
+                failure = resultFailure;
+            }
+            macroRequests.remove(ownerKey, this);
+            future.complete(result);
+        }
+
+        private void finishExceptionally(Throwable resultFailure) {
+            if (!active) {
+                return;
+            }
+            active = false;
+            clearEndpointSubscriptions();
+            flight = null;
+            macroRequests.remove(ownerKey, this);
+            future.completeExceptionally(resultFailure);
+        }
+
+        private void reject(Throwable rejection) {
+            active = false;
+            future.completeExceptionally(rejection);
+        }
+
+        private void cancelInternal() {
+            requireOwnerThread();
+            if (!active) {
+                return;
+            }
+            active = false;
+            failure = MacroSearch.Failure.CANCELLED;
+            clearEndpointSubscriptions();
+            MacroFlight current = flight;
+            flight = null;
+            if (current != null) {
+                current.remove(this);
+            }
+            macroRequests.remove(ownerKey, this);
+            future.cancel(false);
+        }
+
+        private void clearEndpointSubscriptions() {
+            if (endpointSubscriptions.isEmpty()) {
+                return;
+            }
+            List<TopologySubscription<BaseClusterTopology>> activeSubscriptions =
+                    endpointSubscriptions;
+            endpointSubscriptions = List.of();
+            activeSubscriptions.forEach(TopologySubscription::cancel);
+        }
+    }
+
+    private final class MacroFlight {
+        private final MacroQueryKey key;
+        private final UUID schedulerOwner = new UUID(
+                0x414e41564d414352L,
+                ++macroFlightSequence
+        );
+        private final Set<MacroRequest> waiters =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        private NavigationScheduler.Priority priority;
+        private MacroQuery query;
+
+        private MacroFlight(MacroQueryKey key, MacroRequest first) {
+            this.key = key;
+            add(first);
+        }
+
+        private void start() {
+            MacroRequest representative = waiters.iterator().next();
+            query = new MacroQuery(
+                    representative.level,
+                    representative.startPosition,
+                    representative.goalPosition,
+                    representative.channel,
+                    representative.profile,
+                    priority,
+                    representative.weight
+            );
+            macroPhysicalSearches++;
+            NavigationScheduler.forServer(server).submitStrict(
+                    key.dimension,
+                    schedulerOwner,
+                    priority,
+                    query
+            ).whenComplete((corridor, searchFailure) -> publisher.execute(
+                    () -> complete(corridor, searchFailure)
+            ));
+        }
+
+        private void add(MacroRequest waiter) {
+            waiters.add(waiter);
+            waiter.flight = this;
+            macroMaximumGroupSize = Math.max(macroMaximumGroupSize, waiters.size());
+            updatePriority();
+        }
+
+        private void remove(MacroRequest waiter) {
+            if (!waiters.remove(waiter)) {
+                return;
+            }
+            if (waiters.isEmpty()) {
+                macroFlights.remove(key, this);
+                if (query != null) {
+                    NavigationScheduler.forServer(server).cancel(key.dimension, schedulerOwner);
+                }
+            } else {
+                updatePriority();
             }
         }
 
-        private synchronized void cancel() {
-            cancelled = true;
-            task.cancel();
+        private void updatePriority() {
+            NavigationScheduler.Priority requested = waiters.stream()
+                    .map(waiter -> waiter.priority)
+                    .reduce(NavigationScheduler.Priority.BACKGROUND,
+                            TopologyService::higherPriority);
+            if (requested == priority) {
+                return;
+            }
+            priority = requested;
+            if (query != null) {
+                query.reprioritize(priority);
+                NavigationScheduler.forServer(server).reprioritize(
+                        key.dimension,
+                        schedulerOwner,
+                        priority
+                );
+            }
         }
+
+        private void complete(@Nullable MacroSearch.Corridor corridor,
+                              @Nullable Throwable searchFailure) {
+            requireOwnerThread();
+            if (!macroFlights.remove(key, this)) {
+                return;
+            }
+            QueryMetrics queryMetrics = query.metrics();
+            List<MacroRequest> completing = List.copyOf(waiters);
+            waiters.clear();
+            if (searchFailure == null && corridor != null && !isCurrent(key.dimension, corridor)) {
+                completing.forEach(waiter -> {
+                    waiter.flight = null;
+                    waiter.beginResolve();
+                });
+                return;
+            }
+            if (searchFailure == null && corridor != null
+                    && endpointIdentityMatches(key, corridor)) {
+                cacheCompletedCorridor(key, corridor);
+            }
+            for (MacroRequest waiter : completing) {
+                waiter.flight = null;
+                if (searchFailure != null) {
+                    waiter.metrics = queryMetrics;
+                    waiter.finishExceptionally(searchFailure);
+                } else if (corridor == null) {
+                    waiter.finish(null, query.failure(), queryMetrics);
+                } else {
+                    waiter.finish(
+                            rematerializeCorridor(
+                                    corridor,
+                                    waiter.startPosition,
+                                    waiter.goalPosition
+                            ),
+                            null,
+                            queryMetrics
+                    );
+                }
+            }
+        }
+    }
+
+    @Nullable
+    private CachedCorridor completedCorridor(MacroQueryKey key) {
+        CachedCorridor cached = completedCorridors.get(key);
+        if (cached == null) {
+            macroCompletedMisses++;
+            return null;
+        }
+        if (!isCurrent(key.dimension, cached.corridor)) {
+            completedCorridors.remove(key);
+            completedCorridorBytes -= cached.retainedBytes;
+            macroStaleEvictions++;
+            macroCompletedMisses++;
+            return null;
+        }
+        macroCompletedHits++;
+        return cached;
+    }
+
+    private void cacheCompletedCorridor(MacroQueryKey key, MacroSearch.Corridor corridor) {
+        long bytes = estimateCorridorBytes(corridor);
+        if (bytes > MAX_COMPLETED_CORRIDOR_BYTES) {
+            return;
+        }
+        CachedCorridor previous = completedCorridors.put(
+                key,
+                new CachedCorridor(corridor, bytes)
+        );
+        if (previous != null) {
+            completedCorridorBytes -= previous.retainedBytes;
+        }
+        completedCorridorBytes += bytes;
+        while (completedCorridors.size() > MAX_COMPLETED_CORRIDORS
+                || completedCorridorBytes > MAX_COMPLETED_CORRIDOR_BYTES) {
+            Iterator<Map.Entry<MacroQueryKey, CachedCorridor>> iterator =
+                    completedCorridors.entrySet().iterator();
+            if (!iterator.hasNext()) {
+                break;
+            }
+            CachedCorridor evicted = iterator.next().getValue();
+            iterator.remove();
+            completedCorridorBytes -= evicted.retainedBytes;
+            macroCacheEvictions++;
+        }
+    }
+
+    private static long estimateCorridorBytes(MacroSearch.Corridor corridor) {
+        long bytes = 96L + corridor.endpoints().size() * 56L
+                + corridor.connections().size() * 72L;
+        for (MacroSearch.Connection connection : corridor.connections()) {
+            if (connection.transition() instanceof MacroSearch.BoundaryTransition boundary) {
+                bytes += 32L + boundary.bands().size() * 48L;
+            }
+        }
+        return bytes;
+    }
+
+    private static boolean endpointIdentityMatches(
+            MacroQueryKey key,
+            MacroSearch.Corridor corridor) {
+        List<MacroSearch.Endpoint> endpoints = corridor.endpoints();
+        if (endpoints.isEmpty()) {
+            return false;
+        }
+        MacroSearch.Endpoint start = endpoints.get(0);
+        MacroSearch.Endpoint goal = endpoints.get(endpoints.size() - 1);
+        return start instanceof MacroSearch.ExactEndpoint
+                && goal instanceof MacroSearch.ExactEndpoint
+                && SectionPos.of(start.anchor()).equals(key.start.section)
+                && start.revision() == key.start.revision
+                && SectionPos.of(goal.anchor()).equals(key.goal.section)
+                && goal.revision() == key.goal.revision;
+    }
+
+    private static MacroSearch.Corridor rematerializeCorridor(
+            MacroSearch.Corridor corridor,
+            BlockPos startPosition,
+            BlockPos goalPosition) {
+        List<MacroSearch.Endpoint> endpoints = new ArrayList<>(corridor.endpoints());
+        MacroSearch.ExactEndpoint oldStart = (MacroSearch.ExactEndpoint) endpoints.get(0);
+        MacroSearch.ExactEndpoint oldGoal =
+                (MacroSearch.ExactEndpoint) endpoints.get(endpoints.size() - 1);
+        endpoints.set(0, new MacroSearch.ExactEndpoint(
+                oldStart.id(),
+                startPosition,
+                oldStart.revision()
+        ));
+        endpoints.set(endpoints.size() - 1, new MacroSearch.ExactEndpoint(
+                oldGoal.id(),
+                goalPosition,
+                oldGoal.revision()
+        ));
+        List<MacroSearch.Connection> connections = new ArrayList<>(corridor.connections());
+        for (int index : connections.size() == 1
+                ? new int[]{0}
+                : new int[]{0, connections.size() - 1}) {
+            MacroSearch.Connection connection = connections.get(index);
+            connections.set(index, new MacroSearch.Connection(
+                    connection.id(),
+                    endpoints.get(index),
+                    endpoints.get(index + 1),
+                    connection.lowerBound(),
+                    connection.transition()
+            ));
+        }
+        return new MacroSearch.Corridor(endpoints, connections, corridor.cost());
+    }
+
+    @Nullable
+    private static BaseClusterTopology.Component bindComponent(
+            BaseClusterTopology topology,
+            BlockPos position,
+            BaseClusterTopology.Channel channel) {
+        return topology.nearestComponent(
+                channel,
+                Math.floorMod(position.getX(), BaseClusterTopology.SIDE),
+                Math.floorMod(position.getY(), BaseClusterTopology.SIDE),
+                Math.floorMod(position.getZ(), BaseClusterTopology.SIDE),
+                2
+        );
+    }
+
+    private static boolean staleTopologyFailure(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof StaleTopologyException) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static QueryMetrics emptyQueryMetrics(boolean hierarchical) {
+        return new QueryMetrics(
+                0L, 0L, 0L, 0L,
+                0, 0, 0, 0, 0, 0,
+                null, hierarchical,
+                0, 0, 0, 0, 0, 0, 0, 0, 0,
+                null, null
+        );
+    }
+
+    private record MacroOwnerKey(ResourceKey<Level> dimension, UUID owner) {
+    }
+
+    private record MacroComponentKey(SectionPos section, int componentId, long revision) {
+    }
+
+    private record MacroQueryKey(ResourceKey<Level> dimension,
+                                 BaseClusterTopology.Channel channel,
+                                 BaseClusterTopology.TraversalProfile profile,
+                                 boolean hierarchical,
+                                 int weightBits,
+                                 int nodeBudget,
+                                 MacroComponentKey start,
+                                 MacroComponentKey goal) {
+    }
+
+    private record CachedCorridor(MacroSearch.Corridor corridor, long retainedBytes) {
+    }
+
+    private enum BuildOrigin {
+        FRESH_BUILD,
+        PERSISTENCE_HIT
     }
 
     /** Coordinates section availability around one pure, resumable macro search. */
@@ -1991,10 +3031,10 @@ public final class TopologyService {
         private final BlockPos goalPosition;
         private final BaseClusterTopology.Channel channel;
         private final BaseClusterTopology.TraversalProfile profile;
-        private final NavigationScheduler.Priority priority;
+        private NavigationScheduler.Priority priority;
         private final float weight;
         private final boolean hierarchical;
-        private final Map<MacroSearch.DependencyKey, CompletableFuture<?>> requests = new HashMap<>();
+        private final Map<MacroSearch.DependencyKey, DependencyRequest> requests = new HashMap<>();
 
         private Status status = Status.RUNNING;
         private MacroSearch.Failure failure = MacroSearch.Failure.NONE;
@@ -2065,6 +3105,7 @@ public final class TopologyService {
                 }
                 if (buildFailure != null) {
                     status = Status.FAILED;
+                    clearRequests();
                     throw new IllegalStateException("macro topology build failed", buildFailure);
                 }
                 waitingForBuild = false;
@@ -2072,7 +3113,11 @@ public final class TopologyService {
                     return status;
                 }
                 if (search == null) {
-                    int maxVisitedNodes = queryNodeBudget(startPosition, goalPosition);
+                    int maxVisitedNodes = queryNodeBudget(
+                            startPosition,
+                            goalPosition,
+                            hierarchical
+                    );
                     if (hierarchical && !refining) {
                         superGraph = new SuperTopologyGraph(
                                 level.dimension(),
@@ -2118,13 +3163,18 @@ public final class TopologyService {
                             search = new MacroSearch(
                                     new CorridorTopologyGraph(baseGraph, superGraph, candidate),
                                     weight,
-                                    queryNodeBudget(startPosition, goalPosition)
+                                    queryNodeBudget(
+                                            startPosition,
+                                            goalPosition,
+                                            hierarchical
+                                    )
                             );
                             refining = true;
                         }
                     } else if (candidate != null && isCurrent(level.dimension(), candidate)) {
                         result = candidate;
                         status = Status.SUCCEEDED;
+                        clearRequests();
                     } else {
                         restartStaleSearch();
                     }
@@ -2134,6 +3184,7 @@ public final class TopologyService {
                     } else {
                         failure = search.failure();
                         status = Status.FAILED;
+                        clearRequests();
                     }
                 } else {
                     requestPendingSections();
@@ -2146,6 +3197,7 @@ public final class TopologyService {
         }
 
         private void restartStaleSearch() {
+            clearRequests();
             search = null;
             superSearch = null;
             superGraph = null;
@@ -2179,6 +3231,7 @@ public final class TopologyService {
                         failure = MacroSearch.Failure.UNAVAILABLE_CHUNK;
                         blockedEndpoint = origin;
                         status = Status.FAILED;
+                        clearRequests();
                         return false;
                     }
                     requestDependency(MacroSearch.Dependency.superCluster(
@@ -2204,6 +3257,7 @@ public final class TopologyService {
                     failure = MacroSearch.Failure.UNAVAILABLE_CHUNK;
                     blockedEndpoint = section;
                     status = Status.FAILED;
+                    clearRequests();
                     return false;
                 }
                 requestDependency(new MacroSearch.Dependency(
@@ -2328,19 +3382,36 @@ public final class TopologyService {
             if (requests.containsKey(key)) {
                 return;
             }
-            CompletableFuture<?> request;
+            DependencyRequest request;
             switch (key.kind()) {
                 case BASE_CLUSTER -> {
-                    request = requestCluster(level, key.position(), priority);
+                    TopologySubscription<BaseClusterTopology> subscription =
+                            subscribeClusterDependency(level, key.position(), priority);
+                    request = new DependencyRequest(
+                            subscription.future(),
+                            subscription::cancel,
+                            subscription::reprioritize
+                    );
                     requestedSections++;
                 }
                 case SUPER_CLUSTER -> {
-                    request = requestSuperCluster(level, key.position(), channel, profile, priority);
+                    TopologySubscription<SuperClusterTopology> subscription = requestSuperCluster(
+                            level,
+                            key.position(),
+                            channel,
+                            profile,
+                            priority
+                    );
+                    request = new DependencyRequest(
+                            subscription.future(),
+                            subscription::cancel,
+                            subscription::reprioritize
+                    );
                     requestedSuperClusters++;
                 }
                 case BASE_BOUNDARY -> {
                     BaseBoundaryCacheKey boundary = baseBoundaryKey(key);
-                    request = boundary == null
+                    CompletableFuture<?> future = boundary == null
                             ? CompletableFuture.failedFuture(new StaleTopologyException(
                                     "base boundary dependency lost a topology identity"
                             ))
@@ -2353,11 +3424,19 @@ public final class TopologyService {
                                     boundary.profile(),
                                     priority
                             );
+                    request = new DependencyRequest(future, () -> {
+                    }, requested -> {
+                        LinkEntry<SuperClusterTopology.BoundaryLinks> entry =
+                                boundary == null ? null : baseBoundaryLinks.get(boundary);
+                        if (entry != null) {
+                            entry.promote(requested);
+                        }
+                    });
                     requestedBaseBoundaryLinks++;
                 }
                 case SUPER_BOUNDARY -> {
                     SuperBoundaryCacheKey boundary = superBoundaryKey(key);
-                    request = boundary == null
+                    CompletableFuture<?> future = boundary == null
                             ? CompletableFuture.failedFuture(new StaleTopologyException(
                                     "super boundary dependency lost a topology identity"
                             ))
@@ -2368,18 +3447,26 @@ public final class TopologyService {
                                     boundary.face(),
                                     priority
                             );
+                    request = new DependencyRequest(future, () -> {
+                    }, requested -> {
+                        LinkEntry<SuperClusterTopology.CrossingIndex> entry =
+                                boundary == null ? null : superBoundaryLinks.get(boundary);
+                        if (entry != null) {
+                            entry.promote(requested);
+                        }
+                    });
                     requestedSuperBoundaryLinks++;
                 }
                 default -> throw new IllegalStateException("unknown topology dependency " + key.kind());
             }
             requests.put(key, request);
-            request.whenComplete((topology, requestFailure) -> publisher.execute(
+            request.future.whenComplete((topology, requestFailure) -> publisher.execute(
                     () -> completeDependencyRequest(key, request, requestFailure)
             ));
         }
 
         private void completeDependencyRequest(MacroSearch.DependencyKey dependency,
-                                               CompletableFuture<?> request,
+                                               DependencyRequest request,
                                                @Nullable Throwable requestFailure) {
             requireOwnerThread();
             if (!requests.remove(dependency, request)) {
@@ -2429,6 +3516,16 @@ public final class TopologyService {
             }
             waitingForBuild = false;
             signalWakeup();
+        }
+
+        private void clearRequests() {
+            if (requests.isEmpty()) {
+                return;
+            }
+            List<DependencyRequest> active = List.copyOf(requests.values());
+            requests.clear();
+            active.forEach(DependencyRequest::cancel);
+            waitingForBuild = false;
         }
 
         private boolean isStaleFailure(Throwable failure) {
@@ -2524,10 +3621,20 @@ public final class TopologyService {
             );
         }
 
+        private void reprioritize(NavigationScheduler.Priority requested) {
+            requireOwnerThread();
+            if (status != Status.RUNNING || priority == requested) {
+                return;
+            }
+            priority = requested;
+            requests.values().forEach(request -> request.reprioritize(requested));
+        }
+
         @Override
         public void cancel() {
             requireOwnerThread();
             if (status != Status.RUNNING) {
+                clearRequests();
                 return;
             }
             status = Status.FAILED;
@@ -2536,6 +3643,20 @@ public final class TopologyService {
             wakeup = null;
             if (search != null) {
                 search.cancel();
+            }
+            clearRequests();
+        }
+
+        private record DependencyRequest(
+                CompletableFuture<?> future,
+                Runnable cancellation,
+                Consumer<NavigationScheduler.Priority> reprioritization) {
+            private void cancel() {
+                cancellation.run();
+            }
+
+            private void reprioritize(NavigationScheduler.Priority priority) {
+                reprioritization.accept(priority);
             }
         }
     }

@@ -2,6 +2,9 @@ package com.scarasol.acceleratednavigation.topology;
 
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
+import net.minecraft.util.BitStorage;
+import net.minecraft.util.SimpleBitStorage;
+import net.minecraft.util.ZeroBitStorage;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -17,6 +20,7 @@ public final class BaseClusterTopology {
 
     public static final int SIDE = 16;
     public static final int CELL_COUNT = SIDE * SIDE * SIDE;
+    static final int PACKED_FACT_BYTES = CELL_COUNT / 2;
     public static final int VOLUME_OPEN = 1;
     public static final int GROUND_OPEN = 1 << 1;
     public static final int FLUID = 1 << 2;
@@ -25,6 +29,7 @@ public final class BaseClusterTopology {
     private static final int FACE_CELL_COUNT = SIDE * SIDE;
     private static final int FACE_WORDS = FACE_CELL_COUNT / Long.SIZE;
     private static final int VALID_FLAGS = VOLUME_OPEN | GROUND_OPEN | FLUID | EXACT_REQUIRED;
+    private static final int MAX_STRUCTURAL_STEP = 1;
     private static final int MAX_STRUCTURAL_JUMP = 3;
     private static final int MAX_STRUCTURAL_DROP = 4;
 
@@ -40,7 +45,7 @@ public final class BaseClusterTopology {
     private final int[] localOutgoingOffsets;
     private final LocalConnection[] localOutgoing;
     private final List<LocalConnection>[] localOutgoingViews;
-    private final char[][] componentLabels;
+    private final BitStorage[] componentLabels;
     private final long[][] fluidFaces;
     private final int nonEmptyFluidFaceMask;
     private final int retainedBytes;
@@ -60,9 +65,9 @@ public final class BaseClusterTopology {
         sortedConnections.sort(Comparator.comparingInt(LocalConnection::fromComponent)
                 .thenComparingInt(LocalConnection::toComponent));
         this.localConnections = List.copyOf(sortedConnections);
-        this.componentLabels = copyLabels(componentLabels);
         this.fluidFaces = copyFaces(fluidFaces);
         this.componentIdsByChannel = buildComponentIds(this.components);
+        this.componentLabels = compactLabels(componentLabels, componentIdsByChannel);
         this.boundaryComponentIds = buildBoundaryComponentIds(this.components);
         this.componentViewsByChannel = buildComponentViews(this.components, componentIdsByChannel);
         this.boundaryComponentViews = buildBoundaryComponentViews(this.components, boundaryComponentIds);
@@ -78,7 +83,8 @@ public final class BaseClusterTopology {
         }
         this.nonEmptyFluidFaceMask = fluidFaceMask;
         this.retainedBytes = 96
-                + Channel.values().length * CELL_COUNT * Character.BYTES
+                + Arrays.stream(this.componentLabels).mapToInt(labels -> labels.getRaw().length).sum()
+                * Long.BYTES
                 + Integer.bitCount(fluidFaceMask) * FACE_WORDS * Long.BYTES
                 + this.components.stream().mapToInt(Component::retainedBytes).sum()
                 + this.localConnections.size() * LocalConnection.RETAINED_BYTES
@@ -108,36 +114,6 @@ public final class BaseClusterTopology {
                 connections,
                 labels,
                 buildFluidFaces(snapshot)
-        );
-    }
-
-    static BaseClusterTopology restore(SectionPos section,
-                                       long revision,
-                                       long sourceFingerprint,
-                                       List<Component> components,
-                                       List<LocalConnection> localConnections,
-                                       char[][] componentLabels,
-                                       long[][] fluidFaces) {
-        return new BaseClusterTopology(
-                section,
-                revision,
-                sourceFingerprint,
-                components,
-                localConnections,
-                componentLabels,
-                fluidFaces
-        );
-    }
-
-    BaseClusterTopology withRevision(long newRevision) {
-        return new BaseClusterTopology(
-                section,
-                newRevision,
-                sourceFingerprint,
-                components,
-                localConnections,
-                componentLabels,
-                fluidFaces
         );
     }
 
@@ -177,8 +153,9 @@ public final class BaseClusterTopology {
 
     public Component componentAt(Channel channel, int x, int y, int z) {
         Objects.requireNonNull(channel, "channel");
-        int encoded = componentLabels[channel.ordinal()][cellIndex(x, y, z)];
-        return encoded == 0 ? null : component(encoded - 1);
+        int channelIndex = channel.ordinal();
+        int encoded = componentLabels[channelIndex].get(cellIndex(x, y, z));
+        return encoded == 0 ? null : component(componentIdsByChannel[channelIndex][encoded - 1]);
     }
 
     public Component nearestComponent(Channel channel, int x, int y, int z, int radius) {
@@ -274,10 +251,6 @@ public final class BaseClusterTopology {
         return retainedBytes;
     }
 
-    char[] componentLabels(Channel channel) {
-        return componentLabels[channel.ordinal()].clone();
-    }
-
     private static int[][] buildComponentIds(List<Component> components) {
         int[][] result = new int[Channel.values().length][];
         for (Channel channel : Channel.values()) {
@@ -295,6 +268,47 @@ public final class BaseClusterTopology {
                 }
             }
             result[channel.ordinal()] = ids;
+        }
+        return result;
+    }
+
+    private static BitStorage[] compactLabels(char[][] source, int[][] componentIdsByChannel) {
+        Objects.requireNonNull(source, "componentLabels");
+        if (source.length != Channel.values().length) {
+            throw new IllegalArgumentException("component label channel count is invalid");
+        }
+        BitStorage[] result = new BitStorage[source.length];
+        for (Channel channel : Channel.values()) {
+            int channelIndex = channel.ordinal();
+            char[] labels = Objects.requireNonNull(source[channelIndex], "componentLabels entry");
+            if (labels.length != CELL_COUNT) {
+                throw new IllegalArgumentException("component label array has the wrong size");
+            }
+            int[] componentIds = componentIdsByChannel[channelIndex];
+            if (componentIds.length == 0) {
+                for (char label : labels) {
+                    if (label != 0) {
+                        throw new IllegalArgumentException("empty channel contains a component label");
+                    }
+                }
+                result[channelIndex] = new ZeroBitStorage(CELL_COUNT);
+                continue;
+            }
+            int[] localIds = new int[Arrays.stream(componentIds).max().orElse(-1) + 1];
+            for (int index = 0; index < componentIds.length; index++) {
+                localIds[componentIds[index]] = index + 1;
+            }
+            BitStorage packed = new SimpleBitStorage(
+                    Integer.SIZE - Integer.numberOfLeadingZeros(componentIds.length),
+                    CELL_COUNT
+            );
+            for (int cell = 0; cell < labels.length; cell++) {
+                int encoded = labels[cell];
+                if (encoded != 0) {
+                    packed.set(cell, localIds[encoded - 1]);
+                }
+            }
+            result[channelIndex] = packed;
         }
         return result;
     }
@@ -452,7 +466,7 @@ public final class BaseClusterTopology {
                     if (horizontal > 1 && !structurallyOpen(snapshot, nx - direction[0], y, nz - direction[1])) {
                         break;
                     }
-                    for (int dy = -MAX_STRUCTURAL_DROP; dy <= 1; dy++) {
+                    for (int dy = -MAX_STRUCTURAL_DROP; dy <= MAX_STRUCTURAL_STEP; dy++) {
                         int ny = y + dy;
                         if (!inBounds(nx, ny, nz)) {
                             continue;
@@ -565,24 +579,26 @@ public final class BaseClusterTopology {
     }
 
     private void validate() {
-        if (componentLabels.length != Channel.values().length) {
-            throw new IllegalArgumentException("component label channel count is invalid");
-        }
         for (int id = 0; id < components.size(); id++) {
             if (components.get(id).id() != id) {
                 throw new IllegalArgumentException("component IDs must be dense and ordered");
             }
         }
         for (Channel channel : Channel.values()) {
-            char[] labels = componentLabels[channel.ordinal()];
-            if (labels.length != CELL_COUNT) {
+            int channelIndex = channel.ordinal();
+            BitStorage labels = componentLabels[channelIndex];
+            if (labels.getSize() != CELL_COUNT) {
                 throw new IllegalArgumentException("component label array has the wrong size");
             }
-            for (char encoded : labels) {
+            for (int cell = 0; cell < CELL_COUNT; cell++) {
+                int encoded = labels.get(cell);
                 if (encoded == 0) {
                     continue;
                 }
-                Component component = component(encoded - 1);
+                if (encoded > componentIdsByChannel[channelIndex].length) {
+                    throw new IllegalArgumentException("component label is outside its channel table");
+                }
+                Component component = component(componentIdsByChannel[channelIndex][encoded - 1]);
                 if (component.channel() != channel) {
                     throw new IllegalArgumentException("component label points to the wrong channel");
                 }
@@ -594,15 +610,6 @@ public final class BaseClusterTopology {
                 throw new IllegalArgumentException("local ground connection references another channel");
             }
         }
-    }
-
-    private static char[][] copyLabels(char[][] source) {
-        Objects.requireNonNull(source, "componentLabels");
-        char[][] copy = new char[source.length][];
-        for (int index = 0; index < source.length; index++) {
-            copy[index] = Objects.requireNonNull(source[index], "componentLabels entry").clone();
-        }
-        return copy;
     }
 
     private static long[][] copyFaces(long[][] source) {
@@ -707,7 +714,9 @@ public final class BaseClusterTopology {
         public TraversalProfile {
             if (!Float.isFinite(width) || width <= 0.0F
                     || !Float.isFinite(height) || height <= 0.0F
-                    || maxStep < 0 || maxJump < 0 || maxDrop < 0) {
+                    || maxStep < 0 || maxStep > MAX_STRUCTURAL_STEP
+                    || maxJump < 0 || maxJump > MAX_STRUCTURAL_JUMP
+                    || maxDrop < 0 || maxDrop > MAX_STRUCTURAL_DROP) {
                 throw new IllegalArgumentException("invalid traversal profile");
             }
         }
@@ -887,8 +896,71 @@ public final class BaseClusterTopology {
             return cells.clone();
         }
 
+        PackedFacts packedFacts() {
+            return PackedFacts.fromCells(cells, fingerprint);
+        }
+
         public long fingerprint() {
             return fingerprint;
+        }
+    }
+
+    /** Compact persistent form of the four structural flags for each cell. */
+    static final class PackedFacts {
+        private final byte[] data;
+        private final long fingerprint;
+
+        private PackedFacts(byte[] data, long fingerprint) {
+            this.data = data;
+            this.fingerprint = fingerprint;
+        }
+
+        static PackedFacts fromBytes(byte[] packed) {
+            Objects.requireNonNull(packed, "packed");
+            if (packed.length != PACKED_FACT_BYTES) {
+                throw new IllegalArgumentException("packed facts must contain exactly 2048 bytes");
+            }
+            byte[] copy = packed.clone();
+            return new PackedFacts(copy, fingerprint(copy));
+        }
+
+        private static PackedFacts fromCells(byte[] cells, long fingerprint) {
+            byte[] packed = new byte[PACKED_FACT_BYTES];
+            for (int cell = 0; cell < CELL_COUNT; cell += 2) {
+                packed[cell >>> 1] = (byte) ((cells[cell] & VALID_FLAGS)
+                        | ((cells[cell + 1] & VALID_FLAGS) << 4));
+            }
+            return new PackedFacts(packed, fingerprint);
+        }
+
+        byte[] bytes() {
+            return data.clone();
+        }
+
+        long fingerprint() {
+            return fingerprint;
+        }
+
+        Snapshot snapshot() {
+            byte[] cells = new byte[CELL_COUNT];
+            for (int cell = 0; cell < CELL_COUNT; cell += 2) {
+                int packed = Byte.toUnsignedInt(data[cell >>> 1]);
+                cells[cell] = (byte) (packed & VALID_FLAGS);
+                cells[cell + 1] = (byte) (packed >>> 4);
+            }
+            return new Snapshot(cells);
+        }
+
+        private static long fingerprint(byte[] data) {
+            long hash = 0xcbf29ce484222325L;
+            for (byte packed : data) {
+                int value = Byte.toUnsignedInt(packed);
+                hash ^= value & VALID_FLAGS;
+                hash *= 0x100000001b3L;
+                hash ^= value >>> 4;
+                hash *= 0x100000001b3L;
+            }
+            return hash;
         }
     }
 }

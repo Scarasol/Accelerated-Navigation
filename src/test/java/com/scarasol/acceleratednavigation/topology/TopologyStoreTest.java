@@ -14,6 +14,7 @@ import java.io.DataOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -30,77 +31,74 @@ class TopologyStoreTest {
     }
 
     @Test
-    void roundTripsMultipleSectionsInOneChunkAcrossReopen() throws Exception {
-        BaseClusterTopology lower = topology(SectionPos.of(3, -2, 7), 4L, 1);
-        BaseClusterTopology upper = topology(SectionPos.of(3, 5, 7), 9L, 11);
-
+    void roundTripsChunkCoalescedFactsAcrossReopen() throws Exception {
+        SectionPos lower = SectionPos.of(3, -2, 7);
+        SectionPos upper = SectionPos.of(3, 5, 7);
+        BaseClusterTopology.PackedFacts lowerFacts = facts(1);
+        BaseClusterTopology.PackedFacts upperFacts = facts(11);
         try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
-            store.write(Level.OVERWORLD, lower);
-            store.write(Level.OVERWORLD, upper);
+            store.markDirty(Level.OVERWORLD, lower, lowerFacts);
+            store.markDirty(Level.OVERWORLD, upper, upperFacts);
+            store.save(Level.OVERWORLD).join();
+            assertEquals(1L, store.metrics().physicalWrites());
         }
-
         try (TopologyStore reopened = new TopologyStore(temporaryDirectory)) {
-            assertEquivalent(lower, reopened.read(Level.OVERWORLD, lower.section()).orElseThrow());
-            assertEquivalent(upper, reopened.read(Level.OVERWORLD, upper.section()).orElseThrow());
+            assertFacts(lowerFacts, reopened.read(Level.OVERWORLD, lower).join().orElseThrow());
+            assertFacts(upperFacts, reopened.read(Level.OVERWORLD, upper).join().orElseThrow());
+            assertEquals(1L, reopened.metrics().physicalReads());
         }
     }
 
     @Test
-    void replacingOneSectionPreservesItsChunkSiblings() throws Exception {
-        SectionPos firstSection = SectionPos.of(0, 0, 0);
-        SectionPos siblingSection = SectionPos.of(0, 1, 0);
-        BaseClusterTopology first = topology(firstSection, 1L, 2);
-        BaseClusterTopology sibling = topology(siblingSection, 1L, 4);
-        BaseClusterTopology replacement = topology(firstSection, 2L, 13);
-
+    void pendingOverlayKeepsLatestSectionAndSibling() throws Exception {
+        SectionPos first = SectionPos.of(0, 0, 0);
+        SectionPos sibling = SectionPos.of(0, 1, 0);
+        BaseClusterTopology.PackedFacts replacement = facts(13);
+        BaseClusterTopology.PackedFacts siblingFacts = facts(4);
         try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
-            store.write(Level.OVERWORLD, first);
-            store.write(Level.OVERWORLD, sibling);
-            store.write(Level.OVERWORLD, replacement);
-
-            assertEquivalent(replacement, store.read(Level.OVERWORLD, firstSection).orElseThrow());
-            assertEquivalent(sibling, store.read(Level.OVERWORLD, siblingSection).orElseThrow());
+            store.markDirty(Level.OVERWORLD, first, facts(2));
+            store.markDirty(Level.OVERWORLD, sibling, siblingFacts);
+            store.markDirty(Level.OVERWORLD, first, replacement);
+            assertFacts(replacement, store.read(Level.OVERWORLD, first).join().orElseThrow());
+            assertFacts(siblingFacts, store.read(Level.OVERWORLD, sibling).join().orElseThrow());
+            assertEquals(0L, store.metrics().physicalWrites());
+            store.unload(Level.OVERWORLD, new ChunkPos(0, 0));
         }
     }
 
     @Test
-    void corruptOrUnknownRecordIsRejectedWithoutEscapingDecoder() throws Exception {
-        Path dimensionDirectory = temporaryDirectory
-                .resolve("minecraft")
-                .resolve("overworld");
+    void corruptRecordReadsAsEmptyAndCanBeReplaced() throws Exception {
+        Path dimensionDirectory = temporaryDirectory.resolve("minecraft").resolve("overworld");
         Files.createDirectories(dimensionDirectory);
-        Path regionPath = dimensionDirectory.resolve("r.0.0.mca");
-        try (RegionFile region = new RegionFile(regionPath, dimensionDirectory, false);
-             DataOutputStream output = region.getChunkDataOutputStream(new ChunkPos(0, 0))) {
+        try (RegionFile region = new RegionFile(
+                dimensionDirectory.resolve("r.0.0.mca"),
+                dimensionDirectory,
+                false
+        ); DataOutputStream output = region.getChunkDataOutputStream(new ChunkPos(0, 0))) {
             output.writeInt(0x12345678);
             output.writeInt(Integer.MAX_VALUE);
         }
-
+        SectionPos section = SectionPos.of(0, 0, 0);
         try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
-            assertFalse(store.read(Level.OVERWORLD, SectionPos.of(0, 0, 0)).isPresent());
-            store.write(Level.OVERWORLD, topology(SectionPos.of(0, 0, 0), 1L, 1));
-            assertTrue(store.read(Level.OVERWORLD, SectionPos.of(0, 0, 0)).isPresent());
+            assertFalse(store.read(Level.OVERWORLD, section).join().isPresent());
+            store.markDirty(Level.OVERWORLD, section, facts(1));
+            assertTrue(store.read(Level.OVERWORLD, section).join().isPresent());
         }
     }
 
-    private static BaseClusterTopology topology(SectionPos section, long revision, int z) {
+    private static BaseClusterTopology.PackedFacts facts(int z) {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         cells[BaseClusterTopology.cellIndex(15, 2, z)] =
                 (byte) (BaseClusterTopology.VOLUME_OPEN
                         | BaseClusterTopology.GROUND_OPEN
                         | BaseClusterTopology.FLUID
                         | BaseClusterTopology.EXACT_REQUIRED);
-        return BaseClusterTopology.build(section, revision, new BaseClusterTopology.Snapshot(cells));
+        return new BaseClusterTopology.Snapshot(cells).packedFacts();
     }
 
-    private static void assertEquivalent(BaseClusterTopology expected,
-                                         BaseClusterTopology actual) {
-        assertEquals(expected.section(), actual.section());
-        assertEquals(expected.revision(), actual.revision());
-        assertEquals(expected.sourceFingerprint(), actual.sourceFingerprint());
-        assertEquals(expected.nonEmptyFluidFaceMask(), actual.nonEmptyFluidFaceMask());
-        assertEquals(expected.components().size(), actual.components().size());
-        assertEquals(expected.localConnections().size(), actual.localConnections().size());
-        assertEquals(expected.retainedBytes(), actual.retainedBytes());
+    private static void assertFacts(BaseClusterTopology.PackedFacts expected,
+                                    BaseClusterTopology.PackedFacts actual) {
+        assertEquals(expected.fingerprint(), actual.fingerprint());
+        assertArrayEquals(expected.bytes(), actual.bytes());
     }
 }

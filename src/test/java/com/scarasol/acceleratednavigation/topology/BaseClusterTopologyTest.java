@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BaseClusterTopologyTest {
@@ -80,6 +81,16 @@ class BaseClusterTopologyTest {
         assertFalse(topology.hasFluid(Direction.EAST, 9, 7));
         assertEquals((1 << Direction.WEST.ordinal()) | (1 << Direction.UP.ordinal()),
                 topology.nonEmptyFluidFaceMask());
+    }
+
+    @Test
+    void rejectsMovementCapabilitiesOutsideTheStructuralGraph() {
+        assertThrows(IllegalArgumentException.class, () ->
+                new BaseClusterTopology.TraversalProfile(0.6F, 1.95F, 2, 3, 3, false));
+        assertThrows(IllegalArgumentException.class, () ->
+                new BaseClusterTopology.TraversalProfile(0.6F, 1.95F, 1, 4, 3, false));
+        assertThrows(IllegalArgumentException.class, () ->
+                new BaseClusterTopology.TraversalProfile(0.6F, 1.95F, 1, 3, 5, false));
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.scarasol.acceleratednavigation.gametest;
 import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import com.scarasol.acceleratednavigation.AcceleratedNavigation;
 import com.scarasol.acceleratednavigation.topology.BaseClusterTopology;
+import com.scarasol.acceleratednavigation.topology.TopologyGraphAudit;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -45,7 +46,8 @@ public final class MacroTopologyGameTests {
 
         TopologyService service = TopologyService.forServer(level.getServer());
         TopologyService.Metrics before = service.metrics();
-        CompletableFuture<BaseClusterTopology> future = service.requestCluster(
+        CompletableFuture<BaseClusterTopology> future = TopologyGraphAudit.requestClusterDependency(
+                service,
                 level,
                 section,
                 NavigationScheduler.Priority.ACTIVE
@@ -95,7 +97,8 @@ public final class MacroTopologyGameTests {
         SectionPos section = SectionPos.of(changedPosition);
         TopologyService service = TopologyService.forServer(level.getServer());
         TopologyService.ClusterKey key = new TopologyService.ClusterKey(level.dimension(), section);
-        CompletableFuture<BaseClusterTopology> future = service.requestCluster(
+        CompletableFuture<BaseClusterTopology> future = TopologyGraphAudit.requestClusterDependency(
+                service,
                 level,
                 section,
                 NavigationScheduler.Priority.ACTIVE
@@ -130,7 +133,8 @@ public final class MacroTopologyGameTests {
         SectionPos section = SectionPos.of(changedPosition);
         TopologyService service = TopologyService.forServer(level.getServer());
         TopologyService.ClusterKey key = new TopologyService.ClusterKey(level.dimension(), section);
-        CompletableFuture<BaseClusterTopology> request = service.requestCluster(
+        CompletableFuture<BaseClusterTopology> request = TopologyGraphAudit.requestClusterDependency(
+                service,
                 level,
                 section,
                 NavigationScheduler.Priority.ACTIVE

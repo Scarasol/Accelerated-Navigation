@@ -119,6 +119,65 @@ class SuperClusterTopologyTest {
         assertTrue(source.crossings(0, Direction.EAST, target).isEmpty());
     }
 
+    @Test
+    void groundVerticalBoundariesRequireDirectionalMovementCapability() {
+        BaseClusterTopology.TraversalProfile flatOnly = new BaseClusterTopology.TraversalProfile(
+                0.6F,
+                1.95F,
+                0,
+                3,
+                0,
+                false
+        );
+        SectionPos lowerSection = SectionPos.of(0, 0, 0);
+        SectionPos upperSection = SectionPos.of(0, 1, 0);
+        BaseClusterTopology lower = BaseClusterTopology.build(
+                lowerSection, 1L, groundPlaneSnapshot(15));
+        BaseClusterTopology upper = BaseClusterTopology.build(
+                upperSection, 1L, groundPlaneSnapshot(0));
+        BaseClusterTopology.Component lowerComponent = lower.components(
+                BaseClusterTopology.Channel.GROUND).get(0);
+        BaseClusterTopology.Component upperComponent = upper.components(
+                BaseClusterTopology.Channel.GROUND).get(0);
+
+        assertTrue(SuperClusterTopology.boundaryBands(
+                lower,
+                lowerComponent,
+                upper,
+                upperComponent,
+                Direction.UP,
+                BaseClusterTopology.Channel.GROUND,
+                flatOnly
+        ).isEmpty());
+        assertTrue(SuperClusterTopology.boundaryBands(
+                upper,
+                upperComponent,
+                lower,
+                lowerComponent,
+                Direction.DOWN,
+                BaseClusterTopology.Channel.GROUND,
+                flatOnly
+        ).isEmpty());
+
+        SectionPos lowerOrigin = SectionPos.of(0, 0, 0);
+        SectionPos upperOrigin = SectionPos.of(0, 2, 0);
+        SuperClusterTopology lowerSuper = SuperClusterTopology.build(
+                lowerOrigin,
+                verticalBoundaryChildren(lowerOrigin, Direction.UP),
+                BaseClusterTopology.Channel.GROUND,
+                flatOnly
+        );
+        SuperClusterTopology upperSuper = SuperClusterTopology.build(
+                upperOrigin,
+                verticalBoundaryChildren(upperOrigin, Direction.DOWN),
+                BaseClusterTopology.Channel.GROUND,
+                flatOnly
+        );
+
+        assertTrue(lowerSuper.crossings(0, Direction.UP, upperSuper).isEmpty());
+        assertTrue(upperSuper.crossings(0, Direction.DOWN, lowerSuper).isEmpty());
+    }
+
     private static List<BaseClusterTopology> openLayerChildren(SectionPos origin) {
         return SuperClusterTopology.childSections(origin).stream()
                 .map(section -> BaseClusterTopology.build(
@@ -166,6 +225,23 @@ class SuperClusterTopologyTest {
         cells[BaseClusterTopology.cellIndex(x, 2, 4)] = (byte) flags;
         cells[BaseClusterTopology.cellIndex(x, 3, 4)] = BaseClusterTopology.VOLUME_OPEN;
         return new BaseClusterTopology.Snapshot(cells);
+    }
+
+    private static List<BaseClusterTopology> verticalBoundaryChildren(SectionPos origin,
+                                                                       Direction face) {
+        SectionPos occupied = SectionPos.of(
+                origin.x(),
+                face == Direction.UP ? origin.y() + 1 : origin.y(),
+                origin.z()
+        );
+        int y = face == Direction.UP ? 15 : 0;
+        return SuperClusterTopology.childSections(origin).stream()
+                .map(section -> BaseClusterTopology.build(
+                        section,
+                        1L,
+                        section.equals(occupied) ? groundPlaneSnapshot(y) : emptySnapshot()
+                ))
+                .toList();
     }
 
     private static BaseClusterTopology.Snapshot oneWayDropSnapshot() {

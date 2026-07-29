@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.scarasol.acceleratednavigation.gametest.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "MacroSearchMetricsProbeMixin",
+    "TopologyServiceBudgetProbeMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

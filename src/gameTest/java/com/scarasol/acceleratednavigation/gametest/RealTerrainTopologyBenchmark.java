@@ -71,8 +71,14 @@ public final class RealTerrainTopologyBenchmark {
     private static final int COLD_ROUTE_RUNS = 1;
     private static final int WARMUP_ROUTE_RUNS = 5;
     private static final int MEASURED_ROUTE_RUNS = 100;
-    private static final int TOTAL_ROUTE_RUNS =
+    private static final int COMPLETED_CACHE_WARMUP_RUNS = 5;
+    private static final int MEASURED_COMPLETED_CACHE_RUNS = 100;
+    private static final int READY_TOPOLOGY_ROUTE_RUNS =
             COLD_ROUTE_RUNS + WARMUP_ROUTE_RUNS + MEASURED_ROUTE_RUNS;
+    private static final int TOTAL_ROUTE_RUNS =
+            READY_TOPOLOGY_ROUTE_RUNS
+                    + COMPLETED_CACHE_WARMUP_RUNS
+                    + MEASURED_COMPLETED_CACHE_RUNS;
     private static final int CHUNK_LOAD_BATCH_SIZE = 32;
     private static final long CHUNK_LOAD_TICK_BUDGET_NANOS = 4_000_000L;
     private static final int BUILD_BATCH_SIZE = 256;
@@ -80,7 +86,12 @@ public final class RealTerrainTopologyBenchmark {
     private static final int AUDIT_EXPANSIONS_PER_TICK = 256;
     private static final long AUDIT_TICK_BUDGET_NANOS = 2_000_000L;
     private static final long AUDIT_TIMEOUT_NANOS = 30_000_000_000L;
-
+    private static final int PRESSURE_QUERIES = 1_024;
+    private static final int PRESSURE_STARTS_PER_DIMENSION = 64;
+    private static final int COALESCED_REPETITIONS = 512;
+    private static final int DISTRIBUTED_REPETITIONS = 8;
+    private static final long PRESSURE_TIMEOUT_NANOS = 120_000_000_000L;
+    private static final int[] DIAGNOSTIC_NODE_BUDGETS = {2_048, 4_096, 8_192};
     private static Controller controller;
 
     private RealTerrainTopologyBenchmark() {
@@ -108,7 +119,7 @@ public final class RealTerrainTopologyBenchmark {
         private final MinecraftServer server;
         private final ServerLevel overworld;
         private final ServerLevel nether;
-        private final TopologyService topologyService;
+        private TopologyService topologyService;
         private final ArrayDeque<ChunkLoad> chunksToLoad = new ArrayDeque<>();
         private final List<ChunkLoad> heldChunks = new ArrayList<>();
         private final ArrayDeque<BuildGroup> groupsToBuild = new ArrayDeque<>();
@@ -118,6 +129,10 @@ public final class RealTerrainTopologyBenchmark {
         private final ArrayDeque<RouteCase> routesToRun = new ArrayDeque<>();
         private final List<RouteRun> completedRoutes = new ArrayList<>();
         private final ArrayDeque<RouteRun> routesToAudit = new ArrayDeque<>();
+        private final ArrayDeque<PressureStage> pressureStages = new ArrayDeque<>();
+        private final List<Map<String, Object>> pressureReports = new ArrayList<>();
+        private final List<Map<String, Object>> budgetProbeReports = new ArrayList<>();
+        private final Set<SectionRef> persistenceSections = new LinkedHashSet<>();
         private final long startedNanos = System.nanoTime();
         private final long seed;
         private final boolean reusedWorld;
@@ -133,15 +148,15 @@ public final class RealTerrainTopologyBenchmark {
         private int activeGroupRetries;
         private BlockPos surfaceOrigin;
         private RouteRun activeRoute;
-        private TopologyService.MacroQuery activeQuery;
+        private TopologyService.MacroRequest activeQuery;
         private CompletableFuture<MacroSearch.Corridor> activeQueryFuture;
         private long activeQueryStartedNanos;
         private long activeQueryNextProgressLogNanos;
         private long activeQueryWallNanos;
         private MacroSearch.Corridor activeQueryResult;
         private boolean activeQueryCompleted;
+        private boolean activeQueryCompletedSynchronously;
         private TopologyService.Metrics metricsBeforeQuery;
-        private UUID activeQueryOwner;
         private long activeQueryAllocatedBytes;
         private long activeQueryGcCount;
         private long activeQueryGcMillis;
@@ -151,6 +166,12 @@ public final class RealTerrainTopologyBenchmark {
         private RouteRun activeAuditRoute;
         private TopologyGraphAudit activeGraphAudit;
         private long activeAuditStartedNanos;
+        private StressRun activeStress;
+        private TopologyService.Metrics pressureMetricsBefore;
+        private TopologyService.Metrics preRestartMetrics;
+        private List<CompletableFuture<BaseClusterTopology>> restoreRequests = List.of();
+        private long restoreStartedNanos;
+        private Map<String, Object> persistenceReport = Map.of();
 
         private Controller(MinecraftServer server) {
             this.server = Objects.requireNonNull(server, "server");
@@ -182,6 +203,10 @@ public final class RealTerrainTopologyBenchmark {
                 case WAIT_ROUTE -> waitForRoute();
                 case START_AUDIT -> startAudit();
                 case WAIT_AUDIT -> waitForAudit();
+                case START_PRESSURE -> startPressure();
+                case WAIT_PRESSURE -> waitForPressure();
+                case SAVE_AND_RESTART -> saveAndRestart();
+                case WAIT_RESTORE -> waitForRestore();
                 case WRITE_REPORT -> writeReportAndStop();
                 case COMPLETE -> {
                 }
@@ -308,7 +333,8 @@ public final class RealTerrainTopologyBenchmark {
             activeBuildSections = List.copyOf(sections);
             List<CompletableFuture<BaseClusterTopology>> requests = new ArrayList<>();
             for (SectionRef section : activeBuildSections) {
-                requests.add(topologyService.requestCluster(
+                requests.add(TopologyGraphAudit.requestClusterDependency(
+                        topologyService,
                         section.level,
                         section.section,
                         NavigationScheduler.Priority.BACKGROUND
@@ -335,7 +361,8 @@ public final class RealTerrainTopologyBenchmark {
                         );
                     }
                     SectionRef section = activeBuildSections.get(index);
-                    retried.set(index, topologyService.requestCluster(
+                    retried.set(index, TopologyGraphAudit.requestClusterDependency(
+                            topologyService,
                             section.level,
                             section.section,
                             NavigationScheduler.Priority.BACKGROUND
@@ -520,6 +547,62 @@ public final class RealTerrainTopologyBenchmark {
                     96
             );
 
+            List<TopologyGraphAudit.PairSelection> overworldPressure =
+                    overworldConnectivity.selectDistinctStartPairs(
+                            surfaceCandidates,
+                            96,
+                            PRESSURE_STARTS_PER_DIMENSION
+                    );
+            List<TopologyGraphAudit.PairSelection> netherPressure =
+                    netherConnectivity.selectDistinctStartPairs(
+                            netherCandidates,
+                            96,
+                            PRESSURE_STARTS_PER_DIMENSION
+                    );
+            requirePressureDistance(overworldPressure);
+            requirePressureDistance(netherPressure);
+            pressureStages.addLast(new PressureStage(
+                    "high_coalescing",
+                    List.of(
+                            new PressureRoute(overworld, overworldPressure.get(0)),
+                            new PressureRoute(nether, netherPressure.get(0))
+                    ),
+                    COALESCED_REPETITIONS,
+                    PressureKind.IN_FLIGHT,
+                    0
+            ));
+            pressureStages.addLast(new PressureStage(
+                    "completed_corridor_replay",
+                    List.of(
+                            new PressureRoute(overworld, overworldPressure.get(0)),
+                            new PressureRoute(nether, netherPressure.get(0))
+                    ),
+                    COALESCED_REPETITIONS,
+                    PressureKind.COMPLETED_REUSE,
+                    0
+            ));
+            List<PressureRoute> distributed = new ArrayList<>(
+                    PRESSURE_STARTS_PER_DIMENSION * 2
+            );
+            for (int index = 0; index < PRESSURE_STARTS_PER_DIMENSION; index++) {
+                distributed.add(new PressureRoute(overworld, overworldPressure.get(index)));
+                distributed.add(new PressureRoute(nether, netherPressure.get(index)));
+            }
+            pressureStages.addLast(new PressureStage(
+                    "distributed_64_per_dimension",
+                    distributed,
+                    DISTRIBUTED_REPETITIONS,
+                    PressureKind.DISTRIBUTED,
+                    0
+            ));
+            pressureStages.stream()
+                    .flatMap(stage -> stage.routes().stream())
+                    .map(route -> new SectionRef(
+                            route.level(),
+                            SectionPos.of(route.selection().start())
+                    ))
+                    .forEach(persistenceSections::add);
+
             for (BuildGroup group : completedGroups) {
                 for (SectionRef section : group.sections) {
                     topologyService.invalidate(section.key());
@@ -543,6 +626,18 @@ public final class RealTerrainTopologyBenchmark {
             }
             routesToRun.addAll(cases);
             phase = Phase.START_ROUTE;
+        }
+
+        private static void requirePressureDistance(
+                List<TopologyGraphAudit.PairSelection> selections) {
+            for (TopologyGraphAudit.PairSelection selection : selections) {
+                if (Math.abs(selection.directDistance() - 96.0D) > 9.6D) {
+                    throw new IllegalStateException(
+                            "pressure endpoint is outside the 96 block tolerance: "
+                                    + selection.report()
+                    );
+                }
+            }
         }
 
         private List<SectionPos> indexedSections(ServerLevel level) {
@@ -653,32 +748,34 @@ public final class RealTerrainTopologyBenchmark {
             }
 
             RouteCase routeCase = activeRoute.routeCase;
-            activeQuery = topologyService.macroQuery(
-                    routeCase.level,
-                    routeCase.start,
-                    routeCase.goal,
-                    BaseClusterTopology.Channel.GROUND,
-                    BaseClusterTopology.TraversalProfile.DEFAULT_GROUND,
-                    NavigationScheduler.Priority.ACTIVE
-            );
-            activeQueryOwner = UUID.nameUUIDFromBytes(("terrain-route:" + routeCase.name + ":" + activeRoute.run)
-                    .getBytes(StandardCharsets.UTF_8));
+            if (activeRoute.requiresCompletedCacheBypass()) {
+                clearCompletedCorridorCache(topologyService);
+            }
             metricsBeforeQuery = topologyService.metrics();
             activeQueryAllocatedBytes = allocatedBytes(allocationBean);
             activeQueryGcCount = gcCollectionCount();
             activeQueryGcMillis = gcCollectionMillis();
             activeQueryStartedNanos = System.nanoTime();
             activeQueryNextProgressLogNanos = activeQueryStartedNanos + QUERY_PROGRESS_LOG_NANOS;
+            activeQuery = topologyService.requestMacroQuery(
+                    routeCase.level,
+                    UUID.nameUUIDFromBytes(("terrain-route:" + routeCase.name + ":"
+                            + activeRoute.run).getBytes(StandardCharsets.UTF_8)),
+                    routeCase.start,
+                    routeCase.goal,
+                    BaseClusterTopology.Channel.GROUND,
+                    BaseClusterTopology.TraversalProfile.DEFAULT_GROUND,
+                    NavigationScheduler.Priority.ACTIVE
+            );
             activeQueryWallNanos = 0L;
             activeQueryResult = null;
             activeQueryCompleted = false;
-            activeQueryFuture = NavigationScheduler.forServer(server).submitStrict(
-                    routeCase.level.dimension(),
-                    activeQueryOwner,
-                    NavigationScheduler.Priority.ACTIVE,
-                    activeQuery
-            );
+            activeQueryFuture = activeQuery.future();
+            activeQueryCompletedSynchronously = activeQueryFuture.isDone();
             phase = Phase.WAIT_ROUTE;
+            if (activeQueryCompletedSynchronously) {
+                waitForRoute();
+            }
         }
 
         private void waitForRoute() {
@@ -708,18 +805,6 @@ public final class RealTerrainTopologyBenchmark {
                 activeQueryCompleted = true;
             }
             TopologyService.QueryMetrics queryMetrics = activeQuery.metrics();
-            if (queryMetrics.completedSections() + queryMetrics.failedSections()
-                    < queryMetrics.requestedSections()
-                    || queryMetrics.completedSuperClusters() + queryMetrics.failedSuperClusters()
-                    < queryMetrics.requestedSuperClusters()
-                    || queryMetrics.completedBaseBoundaryLinks()
-                    + queryMetrics.failedBaseBoundaryLinks()
-                    < queryMetrics.requestedBaseBoundaryLinks()
-                    || queryMetrics.completedSuperBoundaryLinks()
-                    + queryMetrics.failedSuperBoundaryLinks()
-                    < queryMetrics.requestedSuperBoundaryLinks()) {
-                return;
-            }
             TopologyService.Metrics after = topologyService.metrics();
             MacroSearch.Metrics searchMetrics = queryMetrics.searchMetrics();
             if (activeQuery.failure() == MacroSearch.Failure.UNAVAILABLE_CHUNK
@@ -746,12 +831,13 @@ public final class RealTerrainTopologyBenchmark {
                     after,
                     metricDelta(activeQueryAllocatedBytes, activeQueryEndAllocatedBytes),
                     metricDelta(activeQueryGcCount, activeQueryEndGcCount),
-                    metricDelta(activeQueryGcMillis, activeQueryEndGcMillis)
+                    metricDelta(activeQueryGcMillis, activeQueryEndGcMillis),
+                    activeQueryCompletedSynchronously
             );
             activeQuery = null;
             activeQueryFuture = null;
-            activeQueryOwner = null;
             activeQueryResult = null;
+            activeQueryCompletedSynchronously = false;
             activeRoute.run++;
             phase = Phase.START_ROUTE;
         }
@@ -762,10 +848,7 @@ public final class RealTerrainTopologyBenchmark {
             long endGcMillis = gcCollectionMillis();
             String state = activeQueryState("timeout", now);
             TopologyService.QueryMetrics queryMetrics = activeQuery.metrics();
-            NavigationScheduler.forServer(server).cancel(
-                    activeRoute.routeCase.level.dimension(),
-                    activeQueryOwner
-            );
+            activeQuery.cancel();
             TopologyService.Metrics after = topologyService.metrics();
             activeRoute.recordTimeout(
                     activeQuery,
@@ -775,21 +858,40 @@ public final class RealTerrainTopologyBenchmark {
                     after,
                     metricDelta(activeQueryAllocatedBytes, endAllocatedBytes),
                     metricDelta(activeQueryGcCount, endGcCount),
-                    metricDelta(activeQueryGcMillis, endGcMillis)
+                    metricDelta(activeQueryGcMillis, endGcMillis),
+                    activeQueryCompletedSynchronously
             );
             AcceleratedNavigation.LOGGER.warn("{}; recorded as an inconclusive harness timeout", state);
             activeQuery = null;
             activeQueryFuture = null;
-            activeQueryOwner = null;
             activeQueryResult = null;
+            activeQueryCompletedSynchronously = false;
             activeRoute.run++;
             phase = Phase.START_ROUTE;
+        }
+
+        private static void clearCompletedCorridorCache(TopologyService service) {
+            try {
+                Field corridorsField = TopologyService.class.getDeclaredField("completedCorridors");
+                corridorsField.setAccessible(true);
+                Object corridors = corridorsField.get(service);
+                if (!(corridors instanceof Map<?, ?> cache)) {
+                    throw new IllegalStateException("completed corridor cache has an unexpected type");
+                }
+                cache.clear();
+                Field bytesField = TopologyService.class.getDeclaredField("completedCorridorBytes");
+                bytesField.setAccessible(true);
+                bytesField.setLong(service, 0L);
+            } catch (ReflectiveOperationException failure) {
+                throw new IllegalStateException("cannot isolate ready-topology search timing", failure);
+            }
         }
 
         private void startAudit() {
             activeAuditRoute = routesToAudit.pollFirst();
             if (activeAuditRoute == null) {
-                phase = Phase.WRITE_REPORT;
+                pressureMetricsBefore = topologyService.metrics();
+                phase = Phase.START_PRESSURE;
                 return;
             }
             activeAuditStartedNanos = System.nanoTime();
@@ -867,6 +969,339 @@ public final class RealTerrainTopologyBenchmark {
             phase = Phase.START_AUDIT;
         }
 
+        private void startPressure() {
+            PressureStage stage = pressureStages.pollFirst();
+            if (stage == null) {
+                MacroSearchMetricsProbe.endStage();
+                phase = Phase.SAVE_AND_RESTART;
+                return;
+            }
+            MacroSearchMetricsProbe.beginStage(stage.nodeBudget());
+            if (stage.kind() != PressureKind.COMPLETED_REUSE
+                    && stage.kind() != PressureKind.BUDGET_PROBE) {
+                stage.routes().stream()
+                        .map(route -> new TopologyService.ClusterKey(
+                                route.level().dimension(),
+                                SectionPos.of(route.selection().start())
+                        ))
+                        .distinct()
+                        .forEach(topologyService::invalidate);
+            }
+            TopologyService.Metrics before = topologyService.metrics();
+            activeStress = new StressRun(stage, before, System.nanoTime());
+            NavigationScheduler scheduler = NavigationScheduler.forServer(server);
+            int index = 0;
+            for (int repetition = 0; repetition < stage.repetitions(); repetition++) {
+                for (PressureRoute route : stage.routes()) {
+                    UUID owner = UUID.nameUUIDFromBytes(("terrain-pressure:" + stage.name()
+                            + ":" + index).getBytes(StandardCharsets.UTF_8));
+                    long submittedNanos = System.nanoTime();
+                    TopologyService.MacroRequest request = topologyService.requestMacroQuery(
+                            route.level(),
+                            owner,
+                            route.selection().start(),
+                            route.selection().goal(),
+                            BaseClusterTopology.Channel.GROUND,
+                            BaseClusterTopology.TraversalProfile.DEFAULT_GROUND,
+                            NavigationScheduler.Priority.ACTIVE
+                    );
+                    activeStress.add(new StressQuery(
+                            route,
+                            request,
+                            request.future(),
+                            submittedNanos
+                    ));
+                    index++;
+                }
+            }
+            if (index != stage.queryCount()) {
+                throw new IllegalStateException(
+                        "pressure fixture submitted " + index + " queries instead of "
+                                + stage.queryCount()
+                );
+            }
+            AcceleratedNavigation.LOGGER.info(
+                    "Started topology pressure stage: name={}, queries={}, starts={}, nodeBudget={}",
+                    stage.name(),
+                    index,
+                    stage.routes().size(),
+                    stage.nodeBudget() == 0 ? "production" : stage.nodeBudget()
+            );
+            phase = Phase.WAIT_PRESSURE;
+        }
+
+        private void waitForPressure() {
+            long now = System.nanoTime();
+            NavigationScheduler scheduler = NavigationScheduler.forServer(server);
+            NavigationScheduler.AdmissionCapacity capacity = scheduler.admissionCapacity();
+            TopologyService.Metrics metrics = topologyService.metrics();
+            activeStress.observe(metrics);
+            if (!activeStress.complete()
+                    && now - activeStress.startedNanos > PRESSURE_TIMEOUT_NANOS) {
+                activeStress.timedOut = activeStress.queries.size() - activeStress.completed;
+                for (StressQuery query : activeStress.queries) {
+                    if (!query.future().isDone()) {
+                        query.request().cancel();
+                    }
+                }
+            }
+            if (!activeStress.complete()) {
+                return;
+            }
+            TopologyService.Metrics after = topologyService.metrics();
+            NavigationScheduler.AdmissionCapacity afterCapacity = scheduler.admissionCapacity();
+            Map<String, Object> stageReport = finishPressure(
+                    activeStress,
+                    after,
+                    afterCapacity
+            );
+            if (activeStress.stage.kind() == PressureKind.BUDGET_PROBE) {
+                budgetProbeReports.add(stageReport);
+            } else {
+                pressureReports.add(stageReport);
+            }
+            enqueueNextBudgetProbe(activeStress);
+            MacroSearchMetricsProbe.endStage();
+            AcceleratedNavigation.LOGGER.info(
+                    "Completed topology pressure stage: name={}, succeeded={}, failed={}, wallMs={}",
+                    activeStress.stage.name(),
+                    activeStress.succeeded,
+                    activeStress.failed,
+                    nanosToMillis(System.nanoTime() - activeStress.startedNanos)
+            );
+            activeStress = null;
+            phase = Phase.START_PRESSURE;
+        }
+
+        private void enqueueNextBudgetProbe(StressRun run) {
+            if (run.stage.kind() != PressureKind.DISTRIBUTED
+                    && run.stage.kind() != PressureKind.BUDGET_PROBE) {
+                return;
+            }
+            List<PressureRoute> failedRoutes = run.searchLimitRoutes();
+            if (failedRoutes.isEmpty()) {
+                return;
+            }
+            int nextBudget = nextDiagnosticBudget(run.stage.nodeBudget());
+            if (nextBudget == 0) {
+                return;
+            }
+            pressureStages.addFirst(new PressureStage(
+                    "search_budget_probe_" + nextBudget,
+                    failedRoutes,
+                    1,
+                    PressureKind.BUDGET_PROBE,
+                    nextBudget
+            ));
+        }
+
+        private static int nextDiagnosticBudget(int currentBudget) {
+            for (int candidate : DIAGNOSTIC_NODE_BUDGETS) {
+                if (candidate > currentBudget) {
+                    return candidate;
+                }
+            }
+            return 0;
+        }
+
+        private Map<String, Object> finishPressure(
+                StressRun run,
+                TopologyService.Metrics after,
+                NavigationScheduler.AdmissionCapacity capacity) {
+            long[] latency = run.latencies.stream().mapToLong(Long::longValue).sorted().toArray();
+            long wallNanos = Math.max(1L, System.nanoTime() - run.startedNanos);
+            long buildNanos = Math.max(0L, after.buildNanos() - run.before.buildNanos());
+            Map<String, Long> completedByDimension = new LinkedHashMap<>();
+            run.completionDimensions.forEach(dimension -> completedByDimension.merge(
+                    dimension,
+                    1L,
+                    Long::sum
+            ));
+            double minimumDistance = run.stage.routes().stream()
+                    .mapToDouble(route -> route.selection().directDistance())
+                    .min().orElse(0.0D);
+            double maximumDistance = run.stage.routes().stream()
+                    .mapToDouble(route -> route.selection().directDistance())
+                    .max().orElse(0.0D);
+            boolean cleanup = after.dependencyPermits() == 0
+                    && after.dependencyDemands() == 0
+                    && after.queuedDependencyDemands() == 0
+                    && after.topologyWaiters() == 0
+                    && after.macroQueries().activeWaiters() == 0
+                    && after.macroQueries().activeFlights() == 0
+                    && capacity.parkedRequests() == 0;
+            TopologyService.MacroQueryReuseMetrics beforeReuse = run.before.macroQueries();
+            TopologyService.MacroQueryReuseMetrics afterReuse = after.macroQueries();
+            long logicalRequests = afterReuse.logicalRequests() - beforeReuse.logicalRequests();
+            long physicalSearches = afterReuse.physicalSearches() - beforeReuse.physicalSearches();
+            long inFlightJoins = afterReuse.inFlightJoins() - beforeReuse.inFlightJoins();
+            long completedHits = afterReuse.completedHits() - beforeReuse.completedHits();
+            long completedMisses = afterReuse.completedMisses() - beforeReuse.completedMisses();
+            long staleEvictions = afterReuse.staleEvictions() - beforeReuse.staleEvictions();
+            long cacheEvictions = afterReuse.cacheEvictions() - beforeReuse.cacheEvictions();
+            boolean expectedReuse = switch (run.stage.kind()) {
+                case IN_FLIGHT -> physicalSearches == run.stage.routes().size()
+                        && inFlightJoins == run.queries.size() - run.stage.routes().size()
+                        && completedHits == 0;
+                case COMPLETED_REUSE -> physicalSearches == 0
+                        && inFlightJoins == 0
+                        && completedHits == run.queries.size();
+                case DISTRIBUTED -> physicalSearches == run.stage.routes().size()
+                        && inFlightJoins == run.queries.size() - run.stage.routes().size();
+                case BUDGET_PROBE -> physicalSearches == run.stage.routes().size()
+                        && inFlightJoins == 0
+                        && completedHits == 0;
+            };
+            boolean expectedFailures = run.failureCounts.keySet().stream()
+                    .allMatch(reason -> (run.stage.kind() == PressureKind.DISTRIBUTED
+                            || run.stage.kind() == PressureKind.BUDGET_PROBE)
+                            && reason.equals(MacroSearch.Failure.SEARCH_LIMIT_REACHED.name()));
+            Map<String, Object> report = new LinkedHashMap<>();
+            report.put("name", run.stage.name());
+            report.put("kind", run.stage.kind().name());
+            report.put("configuredNodeBudget", run.stage.nodeBudget() == 0
+                    ? "production"
+                    : run.stage.nodeBudget());
+            report.put("submitted", run.queries.size());
+            report.put("succeeded", run.succeeded);
+            report.put("failed", run.failed);
+            report.put("timedOut", run.timedOut);
+            report.put("failureCounts", run.failureCounts);
+            report.put("p50WallLatencyMillis", latency.length == 0
+                    ? 0.0D : nanosToMillis(percentile(latency, 0.50D)));
+            report.put("p95WallLatencyMillis", latency.length == 0
+                    ? 0.0D : nanosToMillis(percentile(latency, 0.95D)));
+            report.put("p99WallLatencyMillis", latency.length == 0
+                    ? 0.0D : nanosToMillis(percentile(latency, 0.99D)));
+            report.put("lastCompletionMillis", latency.length == 0
+                    ? 0.0D : nanosToMillis(latency[latency.length - 1]));
+            report.put("completedByDimension", completedByDimension);
+            report.put("dimensionCompletionOrder", runLengthOrder(run.completionDimensions));
+            report.put("minimumStraightLineBlocks", minimumDistance);
+            report.put("maximumStraightLineBlocks", maximumDistance);
+            report.put("averageCorridorConnections", run.succeeded == 0
+                    ? 0.0D : (double) run.corridorConnections / run.succeeded);
+            report.put("ordinaryFreeZeroDependencyProgressObserved",
+                    run.zeroOrdinarySlotsProgress);
+            report.put("maximumDependencyPermits", run.maximumDependencyPermits);
+            report.put("maximumDependencyDemands", run.maximumDependencyDemands);
+            report.put("maximumQueuedDependencyDemands", run.maximumQueuedDependencyDemands);
+            report.put("dependencyPermitHighWatermark", after.dependencyPermitHighWatermark());
+            report.put("endDependencyPermits", after.dependencyPermits());
+            report.put("endDependencyDemands", after.dependencyDemands());
+            report.put("endQueuedDependencyDemands", after.queuedDependencyDemands());
+            report.put("endTopologyWaiters", after.topologyWaiters());
+            report.put("endSchedulerPending", capacity.pendingRequests());
+            report.put("endSchedulerParked", capacity.parkedRequests());
+            report.put("workerBuildMillis", nanosToMillis(buildNanos));
+            report.put("workerUtilizationPercent", buildNanos * 100.0D / wallNanos);
+            report.put("physicalWritesDuringStage",
+                    after.persistence().physicalWrites() - run.before.persistence().physicalWrites());
+            report.put("logicalRequests", logicalRequests);
+            report.put("physicalSearches", physicalSearches);
+            report.put("inFlightJoins", inFlightJoins);
+            report.put("completedHits", completedHits);
+            report.put("completedMisses", completedMisses);
+            report.put("staleEvictions", staleEvictions);
+            report.put("cacheEvictions", cacheEvictions);
+            report.put("maximumGroupSize", afterReuse.maximumGroupSize());
+            report.put("endMacroWaiters", afterReuse.activeWaiters());
+            report.put("endMacroFlights", afterReuse.activeFlights());
+            report.put("cachedCorridors", afterReuse.cachedEntries());
+            report.put("cachedCorridorBytes", afterReuse.cachedBytes());
+            report.put("canonicalQueries", List.copyOf(run.canonicalReports.values()));
+            report.put("searchLimitCanonicalRoutes", run.searchLimitRoutes.size());
+            report.put("reuseExpectationPassed", expectedReuse);
+            report.put("onlyExpectedSearchFailures", expectedFailures);
+            report.put("cleanupPassed", cleanup);
+            report.put("passed", run.queries.size() == run.stage.queryCount()
+                    && run.completed == run.stage.queryCount()
+                    && run.timedOut == 0
+                    && expectedFailures
+                    && logicalRequests == run.stage.queryCount()
+                    && expectedReuse
+                    && run.maximumDependencyPermits <= 64
+                    && cleanup);
+            return report;
+        }
+
+        private void saveAndRestart() {
+            TopologyService.Metrics beforeSave = topologyService.metrics();
+            boolean saved = server.saveEverything(false, true, true);
+            TopologyService.Metrics afterSave = topologyService.metrics();
+            preRestartMetrics = afterSave;
+            Map<String, Object> report = new LinkedHashMap<>();
+            report.put("serverSaveReturned", saved);
+            report.put("ordinaryTickPhysicalWrites",
+                    beforeSave.persistence().physicalWrites()
+                            - pressureMetricsBefore.persistence().physicalWrites());
+            report.put("savePhysicalWrites",
+                    afterSave.persistence().physicalWrites()
+                            - beforeSave.persistence().physicalWrites());
+            report.put("saveFlushes",
+                    afterSave.persistence().flushes() - beforeSave.persistence().flushes());
+            report.put("afterSave", persistenceMetricsMap(afterSave.persistence()));
+            TopologyService.shutdown(server);
+            topologyService = TopologyService.forServer(server);
+            restoreStartedNanos = System.nanoTime();
+            restoreRequests = persistenceSections.stream()
+                    .map(section -> TopologyGraphAudit.requestClusterDependency(
+                            topologyService,
+                            section.level(),
+                            section.section(),
+                            NavigationScheduler.Priority.BACKGROUND
+                    ))
+                    .toList();
+            report.put("requestedRestoreSections", restoreRequests.size());
+            report.put("requestedRestoreChunks", persistenceSections.stream()
+                    .map(section -> new DimensionChunk(
+                            section.level().dimension().location().toString(),
+                            new ChunkPos(section.section().x(), section.section().z()).toLong()
+                    ))
+                    .distinct()
+                    .count());
+            persistenceReport = report;
+            phase = Phase.WAIT_RESTORE;
+        }
+
+        private void waitForRestore() {
+            boolean timedOut = System.nanoTime() - restoreStartedNanos > PRESSURE_TIMEOUT_NANOS;
+            if (!timedOut && restoreRequests.stream().anyMatch(future -> !future.isDone())) {
+                return;
+            }
+            if (timedOut) {
+                restoreRequests.stream()
+                        .filter(future -> !future.isDone())
+                        .forEach(future -> future.cancel(false));
+            }
+            int restored = 0;
+            for (CompletableFuture<BaseClusterTopology> request : restoreRequests) {
+                if (!request.isCompletedExceptionally() && !request.isCancelled()
+                        && request.join() != null) {
+                    restored++;
+                }
+            }
+            TopologyService.Metrics after = topologyService.metrics();
+            Map<String, Object> report = new LinkedHashMap<>(persistenceReport);
+            long requestedChunks = ((Number) report.get("requestedRestoreChunks")).longValue();
+            report.put("restoredSections", restored);
+            report.put("restoreTimedOut", timedOut);
+            report.put("persistenceHits", after.persistenceHits());
+            report.put("freshBuilds", after.freshBuilds());
+            report.put("afterRestore", persistenceMetricsMap(after.persistence()));
+            report.put("passed", !timedOut
+                    && restored == restoreRequests.size()
+                    && after.persistenceHits() == restoreRequests.size()
+                    && after.freshBuilds() == 0
+                    && after.persistence().physicalReads() <= requestedChunks
+                    && after.persistence().physicalWrites() == 0
+                    && after.persistence().pendingChunks() == 0
+                    && after.persistence().inFlightLoads() == 0);
+            persistenceReport = report;
+            restoreRequests = List.of();
+            phase = Phase.WRITE_REPORT;
+        }
+
         private void logActiveQueryState(String reason, long now) {
             AcceleratedNavigation.LOGGER.info(activeQueryState(reason, now));
         }
@@ -892,6 +1327,8 @@ public final class RealTerrainTopologyBenchmark {
             long[] queryCpuNanos = route.queryCpuNanos.clone();
             long[] wallNanos = route.wallNanos.clone();
             long[] allocatedBytes = route.allocatedBytes.clone();
+            long[] completedCacheWallNanos = route.completedCacheWallNanos.clone();
+            long[] completedCacheAllocatedBytes = route.completedCacheAllocatedBytes.clone();
             long[] buildQueueWaitNanos = route.buildQueueWaitNanos.clone();
             long[] persistenceQueueWaitNanos = route.persistenceQueueWaitNanos.clone();
             Arrays.sort(macroNanos);
@@ -900,6 +1337,8 @@ public final class RealTerrainTopologyBenchmark {
             Arrays.sort(queryCpuNanos);
             Arrays.sort(wallNanos);
             Arrays.sort(allocatedBytes);
+            Arrays.sort(completedCacheWallNanos);
+            Arrays.sort(completedCacheAllocatedBytes);
             Arrays.sort(buildQueueWaitNanos);
             Arrays.sort(persistenceQueueWaitNanos);
             RouteCase routeCase = route.routeCase;
@@ -916,9 +1355,14 @@ public final class RealTerrainTopologyBenchmark {
             report.put("warmupRuns", WARMUP_ROUTE_RUNS);
             report.put("measuredWarmRuns", MEASURED_ROUTE_RUNS);
             report.put("runs", MEASURED_ROUTE_RUNS);
+            report.put("completedCacheWarmupRuns", COMPLETED_CACHE_WARMUP_RUNS);
+            report.put("measuredCompletedCacheRuns", MEASURED_COMPLETED_CACHE_RUNS);
             report.put("totalInvocations", TOTAL_ROUTE_RUNS);
             report.put("succeededRuns", route.succeeded);
             report.put("timedOutRuns", route.timedOut);
+            report.put("completedCacheSucceededRuns", route.completedCacheSucceeded);
+            report.put("completedCacheTimedOutRuns", route.completedCacheTimedOut);
+            report.put("completedCacheFailureCounts", route.completedCacheFailureCounts);
             report.put("lastFailure", route.failure);
             report.put("failureCounts", route.failureCounts);
             report.put("firstBlockedSection", route.blockedSection == null
@@ -967,6 +1411,13 @@ public final class RealTerrainTopologyBenchmark {
             report.put("coldBaseRefinementMillis", nanosToMillis(route.coldRefinementNanos));
             report.put("coldQueryCpuMillis", nanosToMillis(route.coldQueryCpuNanos));
             report.put("coldWallLatencyMillis", nanosToMillis(route.coldWallNanos));
+            report.put("coldCompletedCorridorCacheHit", route.coldCompletedCacheHit);
+            report.put("readyTopologyPhysicalSearches", route.readyTopologyPhysicalSearches);
+            report.put("readyTopologyCompletedCorridorCacheHits",
+                    route.readyTopologyCompletedCacheHits);
+            report.put("measuredCompletedCorridorCacheHits", route.measuredCompletedCacheHits);
+            report.put("synchronousCompletedCorridorCacheHits",
+                    route.synchronousCompletedCacheHits);
             report.put("coldObservedServerThreadAllocatedBytes", route.coldAllocatedBytes);
             report.put("coldObservedGcCollectionCountDelta", route.coldGcCount);
             report.put("coldObservedGcPauseMillisDelta", route.coldGcMillis);
@@ -974,6 +1425,15 @@ public final class RealTerrainTopologyBenchmark {
             report.put("p95WallLatencyMillis", nanosToMillis(percentile(wallNanos, 0.95D)));
             report.put("p99WallLatencyMillis", nanosToMillis(percentile(wallNanos, 0.99D)));
             report.put("maxWallLatencyMillis", nanosToMillis(wallNanos[wallNanos.length - 1]));
+            report.put("p50CompletedCacheHitWallMillis",
+                    nanosToMillis(percentile(completedCacheWallNanos, 0.50D)));
+            report.put("p95CompletedCacheHitWallMillis",
+                    nanosToMillis(percentile(completedCacheWallNanos, 0.95D)));
+            report.put("p99CompletedCacheHitWallMillis",
+                    nanosToMillis(percentile(completedCacheWallNanos, 0.99D)));
+            report.put("maxCompletedCacheHitWallMillis",
+                    nanosToMillis(completedCacheWallNanos[completedCacheWallNanos.length - 1]));
+            report.put("completedCachePhysicalSearches", route.completedCachePhysicalSearches);
             report.put("coldSnapshotMillis", nanosToMillis(route.coldSnapshotNanos));
             report.put("coldWorkerBuildMillis", nanosToMillis(route.coldWorkerNanos));
             report.put("coldSuperBuildMillis", nanosToMillis(route.coldSuperWorkerNanos));
@@ -1039,10 +1499,24 @@ public final class RealTerrainTopologyBenchmark {
                     percentile(allocatedBytes, 0.99D));
             report.put("maxObservedServerThreadAllocatedBytes",
                     allocatedBytes[allocatedBytes.length - 1]);
+            report.put("p50CompletedCacheHitAllocatedBytes",
+                    percentile(completedCacheAllocatedBytes, 0.50D));
+            report.put("p95CompletedCacheHitAllocatedBytes",
+                    percentile(completedCacheAllocatedBytes, 0.95D));
+            report.put("p99CompletedCacheHitAllocatedBytes",
+                    percentile(completedCacheAllocatedBytes, 0.99D));
+            report.put("maxCompletedCacheHitAllocatedBytes",
+                    completedCacheAllocatedBytes[completedCacheAllocatedBytes.length - 1]);
             report.put("observedGcCollectionCountDelta", route.gcCount);
             report.put("observedGcPauseMillisDelta", route.gcMillis);
             report.put("allocationAndGcScope",
                     "server-thread/process deltas across the scheduled query wall window");
+            report.put("hotMetricProtocol", Map.of(
+                    "readyTopologySearch",
+                    "completed corridor cache cleared before timing; topology and link caches retained",
+                    "completedCorridorCache",
+                    "normal production path timed before requestMacroQuery with same-tick completion observed"
+            ));
             report.put("baseBoundaryCache", route.baseBoundaryCacheReport());
             report.put("superBoundaryCache", route.superBoundaryCacheReport());
             report.put("unknownBoundarySections", 0);
@@ -1057,9 +1531,12 @@ public final class RealTerrainTopologyBenchmark {
         }
 
         private void writeReportAndStop() {
-            TopologyService.Metrics topologyMetrics = topologyService.metrics();
+            TopologyService.Metrics topologyMetrics = preRestartMetrics == null
+                    ? topologyService.metrics()
+                    : preRestartMetrics;
             Map<String, Object> report = new LinkedHashMap<>();
             report.put("benchmarkKind", "real_generated_terrain");
+            report.put("sourceBaselineCommit", "fc55ced0a6282b44183e802e51c110c4954bb55b");
             report.put("seed", seed);
             report.put("worldPreset", "minecraft:normal");
             report.put("reusedWorld", reusedWorld);
@@ -1099,6 +1576,15 @@ public final class RealTerrainTopologyBenchmark {
             ));
             report.put("topologyBuilds", buildReports);
             report.put("routes", routeReports);
+            report.put("pressureStages", pressureReports);
+            report.put("searchBudgetDiagnostics", Map.of(
+                    "productionBudgetSource", "distributed_64_per_dimension",
+                    "probeBudgets", Arrays.stream(DIAGNOSTIC_NODE_BUDGETS).boxed().toList(),
+                    "probeStages", budgetProbeReports,
+                    "productionDefaultsChanged", false,
+                    "probeScope", "terrain benchmark GameTest mixin only"
+            ));
+            report.put("persistenceLifecycle", persistenceReport);
             report.put("limitations", List.of(
                     "Macro timing performs zero PathNavigation calls.",
                     "Each route reports 100 measured warm samples after one cold run and five warm-up runs.",
@@ -1298,9 +1784,21 @@ public final class RealTerrainTopologyBenchmark {
         }
 
         private static List<Map<String, Object>> unavailableDependencyDiagnostics(
-                TopologyService.MacroQuery query) {
+                TopologyService.MacroRequest request) {
             List<Map<String, Object>> result = new ArrayList<>();
             try {
+                Field flightField = request.getClass().getDeclaredField("flight");
+                flightField.setAccessible(true);
+                Object flight = flightField.get(request);
+                if (flight == null) {
+                    return List.of();
+                }
+                Field queryField = flight.getClass().getDeclaredField("query");
+                queryField.setAccessible(true);
+                Object value = queryField.get(flight);
+                if (!(value instanceof TopologyService.MacroQuery query)) {
+                    return List.of();
+                }
                 Field unavailable = MacroSearch.class.getDeclaredField(
                         "encounteredUnavailableDependencies"
                 );
@@ -1433,6 +1931,95 @@ public final class RealTerrainTopologyBenchmark {
         report.put("totalQueueWaitMillis", nanosToMillis(metrics.totalQueueWaitNanos()));
         report.put("maximumQueueWaitMillis", nanosToMillis(metrics.maximumQueueWaitNanos()));
         return report;
+    }
+
+    @Nullable
+    private static Map<String, Object> searchMetricsReport(
+            @Nullable MacroSearch.Metrics metrics,
+            @Nullable MacroSearchMetricsProbe.Snapshot snapshot) {
+        if (metrics == null) {
+            return null;
+        }
+        if (snapshot == null) {
+            throw new IllegalStateException("GameTest macro-search metrics snapshot is missing");
+        }
+        Map<String, Object> report = new LinkedHashMap<>();
+        report.put("visitedNodeLimit", snapshot.visitedNodeLimit());
+        report.put("expandedNodes", metrics.expandedNodes());
+        report.put("discoveredNodes", snapshot.discoveredNodes());
+        report.put("openNodesAtCompletion", snapshot.openNodes());
+        report.put("blockedNodesAtCompletion", snapshot.blockedNodes());
+        report.put("generatedConnections", metrics.generatedConnections());
+        report.put("reopenedNodes", metrics.reopenedNodes());
+        report.put("reexpandedBlockedNodes", metrics.reexpandedBlockedNodes());
+        report.put("maximumDegree", metrics.maximumDegree());
+        report.put("maximumBlockedNodes", metrics.maximumBlockedNodes());
+        report.put("pendingDependencies", metrics.pendingSections());
+        report.put("unavailableDependencies", metrics.unavailableSections());
+        return report;
+    }
+
+    private static String completedSearchPhase(TopologyService.QueryMetrics metrics,
+                                               String outcome,
+                                               @Nullable MacroSearchMetricsProbe.Snapshot superSnapshot,
+                                               @Nullable MacroSearchMetricsProbe.Snapshot refinementSnapshot) {
+        if (!MacroSearch.Failure.SEARCH_LIMIT_REACHED.name().equals(outcome)) {
+            return metrics.hierarchical() ? "COMPLETE" : "DIRECT";
+        }
+        MacroSearch.Metrics refinement = metrics.refinementMetrics();
+        if (atVisitedNodeLimit(refinement, refinementSnapshot)) {
+            return metrics.hierarchical() ? "REFINEMENT" : "DIRECT";
+        }
+        if (atVisitedNodeLimit(metrics.superSearchMetrics(), superSnapshot)) {
+            return "SUPER";
+        }
+        return "UNRESOLVED";
+    }
+
+    private static boolean atVisitedNodeLimit(
+            @Nullable MacroSearch.Metrics metrics,
+            @Nullable MacroSearchMetricsProbe.Snapshot snapshot) {
+        return metrics != null && snapshot != null
+                && metrics.expandedNodes() >= snapshot.visitedNodeLimit();
+    }
+
+    private static Map<String, Object> persistenceMetricsMap(
+            TopologyService.PersistenceMetrics metrics) {
+        Map<String, Object> report = new LinkedHashMap<>();
+        report.put("physicalReads", metrics.physicalReads());
+        report.put("coalescedReads", metrics.coalescedReads());
+        report.put("physicalWrites", metrics.physicalWrites());
+        report.put("flushes", metrics.flushes());
+        report.put("pendingChunks", metrics.pendingChunks());
+        report.put("pendingHighWatermark", metrics.pendingHighWatermark());
+        report.put("oldestPendingMillis", nanosToMillis(metrics.oldestPendingNanos()));
+        report.put("writeFailures", metrics.writeFailures());
+        report.put("droppedChunks", metrics.droppedChunks());
+        report.put("decodedChunks", metrics.decodedChunks());
+        report.put("inFlightLoads", metrics.inFlightLoads());
+        report.put("openRegions", metrics.openRegions());
+        return report;
+    }
+
+    private static List<Map<String, Object>> runLengthOrder(List<String> dimensions) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        String active = null;
+        int count = 0;
+        for (String dimension : dimensions) {
+            if (Objects.equals(active, dimension)) {
+                count++;
+                continue;
+            }
+            if (active != null) {
+                result.add(Map.of("dimension", active, "count", count));
+            }
+            active = dimension;
+            count = 1;
+        }
+        if (active != null) {
+            result.add(Map.of("dimension", active, "count", count));
+        }
+        return result;
     }
 
     private static Map<String, Object> serviceLinkCacheReport(
@@ -1665,6 +2252,142 @@ public final class RealTerrainTopologyBenchmark {
         return sorted[Math.max(0, (int) Math.ceil(sorted.length * percentile) - 1)];
     }
 
+    private static final class StressRun {
+        private final PressureStage stage;
+        private final TopologyService.Metrics before;
+        private final long startedNanos;
+        private final List<StressQuery> queries = new ArrayList<>();
+        private final List<Long> latencies = new ArrayList<>();
+        private final List<String> completionDimensions = new ArrayList<>();
+        private final Map<String, Integer> failureCounts = new LinkedHashMap<>();
+        private final Map<PressureRoute, Map<String, Object>> canonicalReports =
+                new LinkedHashMap<>();
+        private final Set<PressureRoute> searchLimitRoutes = new LinkedHashSet<>();
+        private int completed;
+        private int succeeded;
+        private int failed;
+        private int timedOut;
+        private long corridorConnections;
+        private boolean zeroOrdinarySlotsProgress;
+        private int maximumDependencyPermits;
+        private int maximumDependencyDemands;
+        private int maximumQueuedDependencyDemands;
+
+        private StressRun(PressureStage stage,
+                          TopologyService.Metrics before,
+                          long startedNanos) {
+            this.stage = stage;
+            this.before = before;
+            this.startedNanos = startedNanos;
+        }
+
+        private void add(StressQuery query) {
+            queries.add(query);
+            query.future().whenComplete((corridor, failure) -> {
+                completed++;
+                latencies.add(Math.max(0L, System.nanoTime() - startedNanos));
+                completionDimensions.add(
+                        query.route().level().dimension().location().toString()
+                );
+                String outcome = failure == null
+                        ? query.request().failure().name()
+                        : failure.getClass().getSimpleName();
+                recordCanonical(query, corridor, outcome);
+                if (failure == null && corridor != null) {
+                    succeeded++;
+                    corridorConnections += corridor.connections().size();
+                    return;
+                }
+                failed++;
+                failureCounts.merge(outcome, 1, Integer::sum);
+            });
+        }
+
+        private void recordCanonical(StressQuery query,
+                                     @Nullable MacroSearch.Corridor corridor,
+                                     String outcome) {
+            if (canonicalReports.containsKey(query.route())) {
+                return;
+            }
+            TopologyService.QueryMetrics metrics = query.request().metrics();
+            MacroSearchMetricsProbe.Snapshot superSnapshot =
+                    MacroSearchMetricsProbe.snapshot(metrics.superSearchMetrics());
+            MacroSearchMetricsProbe.Snapshot refinementSnapshot =
+                    MacroSearchMetricsProbe.snapshot(metrics.refinementMetrics());
+            MacroSearchMetricsProbe.Snapshot combinedSnapshot =
+                    MacroSearchMetricsProbe.combine(superSnapshot, refinementSnapshot);
+            Map<String, Object> report = new LinkedHashMap<>();
+            report.put("dimension",
+                    query.route().level().dimension().location().toString());
+            report.put("start", Controller.positionMap(query.route().selection().start()));
+            report.put("goal", Controller.positionMap(query.route().selection().goal()));
+            report.put("straightLineBlocks", query.route().selection().directDistance());
+            report.put("outcome", corridor == null ? outcome : "SUCCEEDED");
+            report.put("failurePhase", completedSearchPhase(
+                    metrics,
+                    outcome,
+                    superSnapshot,
+                    refinementSnapshot
+            ));
+            report.put("completedFromCache", query.request().completedFromCache());
+            report.put("wallMillis", nanosToMillis(
+                    Math.max(0L, System.nanoTime() - query.submittedNanos())
+            ));
+            report.put("queryCpuMillis", nanosToMillis(metrics.queryCpuNanos()));
+            report.put("macroSearchMillis", nanosToMillis(metrics.macroSearchNanos()));
+            report.put("superSearchMillis", nanosToMillis(metrics.superSearchNanos()));
+            report.put("refinementSearchMillis", nanosToMillis(
+                    metrics.refinementSearchNanos()
+            ));
+            report.put("hierarchical", metrics.hierarchical());
+            report.put("combinedSearch", searchMetricsReport(
+                    metrics.searchMetrics(),
+                    combinedSnapshot
+            ));
+            report.put("superSearch", searchMetricsReport(
+                    metrics.superSearchMetrics(),
+                    superSnapshot
+            ));
+            report.put("refinementSearch", searchMetricsReport(
+                    metrics.refinementMetrics(),
+                    refinementSnapshot
+            ));
+            report.put("corridorConnections",
+                    corridor == null ? 0 : corridor.connections().size());
+            canonicalReports.put(query.route(), report);
+            if (MacroSearch.Failure.SEARCH_LIMIT_REACHED.name().equals(outcome)) {
+                searchLimitRoutes.add(query.route());
+            }
+        }
+
+        private List<PressureRoute> searchLimitRoutes() {
+            return List.copyOf(searchLimitRoutes);
+        }
+
+        private void observe(TopologyService.Metrics metrics) {
+            if (metrics.dependencyStartsAtFullOrdinaryAdmission()
+                    > before.dependencyStartsAtFullOrdinaryAdmission()) {
+                zeroOrdinarySlotsProgress = true;
+            }
+            maximumDependencyPermits = Math.max(
+                    maximumDependencyPermits,
+                    metrics.dependencyPermits()
+            );
+            maximumDependencyDemands = Math.max(
+                    maximumDependencyDemands,
+                    metrics.dependencyDemands()
+            );
+            maximumQueuedDependencyDemands = Math.max(
+                    maximumQueuedDependencyDemands,
+                    metrics.queuedDependencyDemands()
+            );
+        }
+
+        private boolean complete() {
+            return completed == queries.size();
+        }
+    }
+
     private static final class RouteRun {
         private final RouteCase routeCase;
         private final long[] macroNanos = new long[MEASURED_ROUTE_RUNS];
@@ -1673,6 +2396,10 @@ public final class RealTerrainTopologyBenchmark {
         private final long[] queryCpuNanos = new long[MEASURED_ROUTE_RUNS];
         private final long[] wallNanos = new long[MEASURED_ROUTE_RUNS];
         private final long[] allocatedBytes = new long[MEASURED_ROUTE_RUNS];
+        private final long[] completedCacheWallNanos =
+                new long[MEASURED_COMPLETED_CACHE_RUNS];
+        private final long[] completedCacheAllocatedBytes =
+                new long[MEASURED_COMPLETED_CACHE_RUNS];
         private final long[] buildQueueWaitNanos = new long[MEASURED_ROUTE_RUNS];
         private final long[] persistenceQueueWaitNanos = new long[MEASURED_ROUTE_RUNS];
         private long coldMacroNanos;
@@ -1690,6 +2417,14 @@ public final class RealTerrainTopologyBenchmark {
         private long coldSuperBoundaryBuildNanos;
         private long coldBuildQueueWaitNanos;
         private long coldPersistenceQueueWaitNanos;
+        private boolean coldCompletedCacheHit;
+        private long readyTopologyPhysicalSearches;
+        private int readyTopologyCompletedCacheHits;
+        private int measuredCompletedCacheHits;
+        private int synchronousCompletedCacheHits;
+        private long completedCachePhysicalSearches;
+        private int completedCacheSucceeded;
+        private int completedCacheTimedOut;
         private int run;
         private int succeeded;
         private int timedOut;
@@ -1741,6 +2476,7 @@ public final class RealTerrainTopologyBenchmark {
         private long superBoundaryMisses;
         private long superBoundaryEvictions;
         private final Map<String, Integer> failureCounts = new LinkedHashMap<>();
+        private final Map<String, Integer> completedCacheFailureCounts = new LinkedHashMap<>();
         private MacroSearch.Corridor sampleCorridor;
         private Map<String, Object> corridorAudit;
         private Map<String, Object> baseGraphAudit;
@@ -1754,7 +2490,7 @@ public final class RealTerrainTopologyBenchmark {
             this.routeCase = routeCase;
         }
 
-        private void record(TopologyService.MacroQuery query,
+        private void record(TopologyService.MacroRequest query,
                             MacroSearch.Corridor corridor,
                             long wall,
                             TopologyService.QueryMetrics queryMetrics,
@@ -1762,7 +2498,20 @@ public final class RealTerrainTopologyBenchmark {
                             TopologyService.Metrics after,
                             long allocatedBytes,
                             long gcCount,
-                            long gcMillis) {
+                            long gcMillis,
+                            boolean completedSynchronously) {
+            if (run == 0) {
+                coldCompletedCacheHit = query.completedFromCache();
+            } else if (isMeasuredReadyTopologyRun() && query.completedFromCache()) {
+                readyTopologyCompletedCacheHits++;
+            } else if (isMeasuredCompletedCacheRun()) {
+                if (query.completedFromCache()) {
+                    measuredCompletedCacheHits++;
+                    if (completedSynchronously) {
+                        synchronousCompletedCacheHits++;
+                    }
+                }
+            }
             recordMetrics(
                     wall,
                     queryMetrics,
@@ -1773,28 +2522,33 @@ public final class RealTerrainTopologyBenchmark {
                     gcMillis
             );
             if (corridor == null) {
-                if (isMeasuredRun()) {
+                if (isMeasuredReadyTopologyRun()) {
                     failure = query.failure().name();
                     failureCounts.merge(failure, 1, Integer::sum);
                     blockedSection = query.blockedSection();
+                } else if (isMeasuredCompletedCacheRun()) {
+                    completedCacheFailureCounts.merge(query.failure().name(), 1, Integer::sum);
                 }
                 return;
             }
-            if (isMeasuredRun()) {
+            if (isMeasuredReadyTopologyRun()) {
                 succeeded++;
+            } else if (isMeasuredCompletedCacheRun()) {
+                completedCacheSucceeded++;
             }
             corridorConnections = corridor.connections().size();
             sampleCorridor = corridor;
         }
 
-        private void recordTimeout(TopologyService.MacroQuery query,
+        private void recordTimeout(TopologyService.MacroRequest query,
                                    long wall,
                                    TopologyService.QueryMetrics queryMetrics,
                                    TopologyService.Metrics before,
                                    TopologyService.Metrics after,
                                    long allocatedBytes,
                                    long gcCount,
-                                   long gcMillis) {
+                                   long gcMillis,
+                                   boolean completedSynchronously) {
             recordMetrics(
                     wall,
                     queryMetrics,
@@ -1804,11 +2558,14 @@ public final class RealTerrainTopologyBenchmark {
                     gcCount,
                     gcMillis
             );
-            if (isMeasuredRun()) {
+            if (isMeasuredReadyTopologyRun()) {
                 timedOut++;
                 failure = "HARNESS_TIMEOUT";
                 failureCounts.merge(failure, 1, Integer::sum);
                 blockedSection = query.blockedSection();
+            } else if (isMeasuredCompletedCacheRun()) {
+                completedCacheTimedOut++;
+                completedCacheFailureCounts.merge("HARNESS_TIMEOUT", 1, Integer::sum);
             }
         }
 
@@ -1852,7 +2609,19 @@ public final class RealTerrainTopologyBenchmark {
                 coldPersistenceQueueWaitNanos = persistenceQueueWait;
                 return;
             }
-            if (!isMeasuredRun()) {
+            if (isMeasuredCompletedCacheRun()) {
+                int measured = run - READY_TOPOLOGY_ROUTE_RUNS
+                        - COMPLETED_CACHE_WARMUP_RUNS;
+                completedCacheWallNanos[measured] = wall;
+                completedCacheAllocatedBytes[measured] = observedAllocatedBytes;
+                completedCachePhysicalSearches += Math.max(
+                        0L,
+                        after.macroQueries().physicalSearches()
+                                - before.macroQueries().physicalSearches()
+                );
+                return;
+            }
+            if (!isMeasuredReadyTopologyRun()) {
                 return;
             }
 
@@ -1863,6 +2632,11 @@ public final class RealTerrainTopologyBenchmark {
             queryCpuNanos[measured] = queryMetrics.queryCpuNanos();
             wallNanos[measured] = wall;
             allocatedBytes[measured] = observedAllocatedBytes;
+            readyTopologyPhysicalSearches += Math.max(
+                    0L,
+                    after.macroQueries().physicalSearches()
+                            - before.macroQueries().physicalSearches()
+            );
             buildQueueWaitNanos[measured] = buildQueueWait;
             persistenceQueueWaitNanos[measured] = persistenceQueueWait;
             gcCount = accumulateMetric(gcCount, observedGcCount);
@@ -1935,8 +2709,17 @@ public final class RealTerrainTopologyBenchmark {
             }
         }
 
-        private boolean isMeasuredRun() {
-            return run >= COLD_ROUTE_RUNS + WARMUP_ROUTE_RUNS;
+        private boolean requiresCompletedCacheBypass() {
+            return run < READY_TOPOLOGY_ROUTE_RUNS;
+        }
+
+        private boolean isMeasuredReadyTopologyRun() {
+            return run >= COLD_ROUTE_RUNS + WARMUP_ROUTE_RUNS
+                    && run < READY_TOPOLOGY_ROUTE_RUNS;
+        }
+
+        private boolean isMeasuredCompletedCacheRun() {
+            return run >= READY_TOPOLOGY_ROUTE_RUNS + COMPLETED_CACHE_WARMUP_RUNS;
         }
 
         private void accumulateCacheMetrics(TopologyService.LinkCacheMetrics before,
@@ -2082,6 +2865,10 @@ public final class RealTerrainTopologyBenchmark {
         WAIT_ROUTE,
         START_AUDIT,
         WAIT_AUDIT,
+        START_PRESSURE,
+        WAIT_PRESSURE,
+        SAVE_AND_RESTART,
+        WAIT_RESTORE,
         WRITE_REPORT,
         COMPLETE
     }
@@ -2107,6 +2894,51 @@ public final class RealTerrainTopologyBenchmark {
                              BlockPos goal,
                              int requestedDistance,
                              TopologyGraphAudit.PairSelection selection) {
+    }
+
+    private record PressureStage(String name,
+                                 List<PressureRoute> routes,
+                                 int repetitions,
+                                 PressureKind kind,
+                                 int nodeBudget) {
+        private PressureStage {
+            routes = List.copyOf(routes);
+            Objects.requireNonNull(kind, "kind");
+            if (routes.isEmpty() || repetitions <= 0 || nodeBudget < 0) {
+                throw new IllegalArgumentException("pressure stage is not executable");
+            }
+            if (kind == PressureKind.BUDGET_PROBE && nodeBudget <= 0) {
+                throw new IllegalArgumentException("budget probe requires an explicit budget");
+            }
+            if (kind != PressureKind.BUDGET_PROBE
+                    && routes.size() * repetitions != PRESSURE_QUERIES) {
+                throw new IllegalArgumentException("pressure stage must contain 1024 queries");
+            }
+        }
+
+        private int queryCount() {
+            return routes.size() * repetitions;
+        }
+    }
+
+    private enum PressureKind {
+        IN_FLIGHT,
+        COMPLETED_REUSE,
+        DISTRIBUTED,
+        BUDGET_PROBE
+    }
+
+    private record PressureRoute(ServerLevel level,
+                                 TopologyGraphAudit.PairSelection selection) {
+    }
+
+    private record StressQuery(PressureRoute route,
+                               TopologyService.MacroRequest request,
+                               CompletableFuture<MacroSearch.Corridor> future,
+                               long submittedNanos) {
+    }
+
+    private record DimensionChunk(String dimension, long chunk) {
     }
 
     private record ProbeResult(String kind,

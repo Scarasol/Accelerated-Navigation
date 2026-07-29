@@ -83,7 +83,14 @@ public final class NavigationScheduler {
                                                   UUID owner,
                                                   Priority priority,
                                                   ResumableSearch<R> search) {
-        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS);
+        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS, false);
+    }
+
+    public <R> CompletableFuture<R> submitDependency(ResourceKey<Level> dimension,
+                                                      UUID owner,
+                                                      Priority priority,
+                                                      ResumableSearch<R> search) {
+        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS, true);
     }
 
     /**
@@ -104,7 +111,7 @@ public final class NavigationScheduler {
                 MIN_SLICE_NANOS,
                 Math.min(MAX_SLICE_NANOS, estimatedCostNanos)
         );
-        return submit(dimension, owner, priority, new AtomicSearch<>(task), startThreshold);
+        return submit(dimension, owner, priority, new AtomicSearch<>(task), startThreshold, false);
     }
 
     public boolean cancel(ResourceKey<Level> dimension, UUID owner) {
@@ -126,6 +133,19 @@ public final class NavigationScheduler {
         if (request == null || !priority.higherThan(request.priority)) {
             return false;
         }
+        return reprioritize(request, priority);
+    }
+
+    public boolean reprioritize(ResourceKey<Level> dimension, UUID owner, Priority priority) {
+        requireServerThread();
+        Objects.requireNonNull(dimension, "dimension");
+        Objects.requireNonNull(owner, "owner");
+        Objects.requireNonNull(priority, "priority");
+        QueuedSearch<?> request = pending.get(new RequestKey(dimension, owner));
+        return request != null && request.priority != priority && reprioritize(request, priority);
+    }
+
+    private boolean reprioritize(QueuedSearch<?> request, Priority priority) {
         if (request.queued) {
             queues.get(request.priority).remove(request);
             request.queued = false;
@@ -137,25 +157,71 @@ public final class NavigationScheduler {
         return true;
     }
 
+    public boolean qualifyDependency(ResourceKey<Level> dimension,
+                                     UUID owner,
+                                     Priority priority) {
+        requireServerThread();
+        Objects.requireNonNull(priority, "priority");
+        QueuedSearch<?> request = pending.get(new RequestKey(
+                Objects.requireNonNull(dimension, "dimension"),
+                Objects.requireNonNull(owner, "owner")
+        ));
+        if (request == null) {
+            return false;
+        }
+        request.dependency = true;
+        promote(dimension, owner, priority);
+        return true;
+    }
+
+    public boolean releaseDependency(ResourceKey<Level> dimension, UUID owner) {
+        requireServerThread();
+        QueuedSearch<?> request = pending.get(new RequestKey(
+                Objects.requireNonNull(dimension, "dimension"),
+                Objects.requireNonNull(owner, "owner")
+        ));
+        if (request == null) {
+            return false;
+        }
+        request.dependency = false;
+        if (!request.started && ordinaryRequestCount() > MAX_PENDING_REQUESTS) {
+            pending.remove(request.key, request);
+            cancelQueued(request);
+            return false;
+        }
+        return true;
+    }
+
     public AdmissionCapacity admissionCapacity() {
         requireServerThread();
         int background = 0;
+        int dependency = 0;
+        int parked = 0;
         for (QueuedSearch<?> request : pending.values()) {
-            if (request.priority == Priority.BACKGROUND) {
+            if (request.dependency) {
+                dependency++;
+            } else if (request.priority == Priority.BACKGROUND) {
                 background++;
+            }
+            if (request.parked) {
+                parked++;
             }
         }
         return new AdmissionCapacity(
-                Math.max(0, MAX_PENDING_REQUESTS - pending.size()),
-                background
+                Math.max(0, MAX_PENDING_REQUESTS - ordinaryRequestCount()),
+                background,
+                dependency,
+                pending.size(),
+                parked
         );
     }
 
     private <R> CompletableFuture<R> submit(ResourceKey<Level> dimension,
                                              UUID owner,
-                                             Priority priority,
-                                             ResumableSearch<R> search,
-                                             long startThresholdNanos) {
+                                              Priority priority,
+                                              ResumableSearch<R> search,
+                                              long startThresholdNanos,
+                                              boolean dependency) {
         requireServerThread();
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(owner, "owner");
@@ -173,7 +239,7 @@ public final class NavigationScheduler {
         if (replaced != null) {
             cancelQueued(replaced);
         }
-        if (pending.size() >= MAX_PENDING_REQUESTS
+        if (!dependency && ordinaryRequestCount() >= MAX_PENDING_REQUESTS
                 && (priority == Priority.BACKGROUND || !evictNewestBackgroundRequest())) {
             cancelSafely(search);
             return CompletableFuture.failedFuture(
@@ -187,7 +253,8 @@ public final class NavigationScheduler {
                 priority,
                 search,
                 startThresholdNanos,
-                new CompletableFuture<>()
+                new CompletableFuture<>(),
+                dependency
         );
         pending.put(key, request);
         enqueue(request);
@@ -251,6 +318,7 @@ public final class NavigationScheduler {
 
             long allowance = Math.min(MAX_SLICE_NANOS, Math.min(deficit, remaining));
             long sliceStarted = System.nanoTime();
+            request.started = true;
             ResumableSearch.Status status;
             try {
                 status = Objects.requireNonNull(
@@ -383,7 +451,7 @@ public final class NavigationScheduler {
     private boolean evictNewestBackgroundRequest() {
         QueuedSearch<?> newest = null;
         for (QueuedSearch<?> request : pending.values()) {
-            if (request.priority == Priority.BACKGROUND
+            if (!request.dependency && request.priority == Priority.BACKGROUND
                     && (newest == null || request.sequence > newest.sequence)) {
                 newest = request;
             }
@@ -394,6 +462,16 @@ public final class NavigationScheduler {
         pending.remove(newest.key, newest);
         cancelQueued(newest);
         return true;
+    }
+
+    private int ordinaryRequestCount() {
+        int count = 0;
+        for (QueuedSearch<?> request : pending.values()) {
+            if (!request.dependency) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private void cancelQueued(QueuedSearch<?> request) {
@@ -454,9 +532,14 @@ public final class NavigationScheduler {
         }
     }
 
-    public record AdmissionCapacity(int freeSlots, int evictableBackgroundSlots) {
+    public record AdmissionCapacity(int freeSlots,
+                                    int evictableBackgroundSlots,
+                                    int dependencyRequests,
+                                    int pendingRequests,
+                                    int parkedRequests) {
         public AdmissionCapacity {
-            if (freeSlots < 0 || evictableBackgroundSlots < 0) {
+            if (freeSlots < 0 || evictableBackgroundSlots < 0 || dependencyRequests < 0
+                    || pendingRequests < 0 || parkedRequests < 0) {
                 throw new IllegalArgumentException("navigation admission capacity cannot be negative");
             }
         }
@@ -472,21 +555,25 @@ public final class NavigationScheduler {
         private final ResumableSearch<R> search;
         private final long startThresholdNanos;
         private final CompletableFuture<R> future;
+        private boolean dependency;
         private boolean queued;
         private boolean parked;
+        private boolean started;
 
         private QueuedSearch(long sequence,
                              RequestKey key,
                              Priority priority,
                              ResumableSearch<R> search,
                              long startThresholdNanos,
-                             CompletableFuture<R> future) {
+                             CompletableFuture<R> future,
+                             boolean dependency) {
             this.sequence = sequence;
             this.key = key;
             this.priority = priority;
             this.search = search;
             this.startThresholdNanos = startThresholdNanos;
             this.future = future;
+            this.dependency = dependency;
         }
     }
 

@@ -75,6 +75,7 @@ minecraft {
             parent minecraft.runs.server
             taskName 'runTerrainBenchmarkServer'
             workingDirectory project.file('run-terrain-benchmark')
+            args '--mixin.config', 'accelerated_navigation.gametest.mixins.json'
             property 'acceleratedNavigation.terrainBenchmark', 'true'
             property 'acceleratedNavigation.terrainReport',
                     layout.buildDirectory.file('reports/real-terrain-topology.json').get().asFile.absolutePath
@@ -263,6 +264,45 @@ tasks.register('verifyTerrainBenchmarkReport') {
         if (!routeNames.containsAll(expectedRoutes)) {
             throw new GradleException("Real terrain benchmark is missing route cases: ${expectedRoutes - routeNames}")
         }
+        def incompleteHotMetrics = parsed.routes.findAll {
+            it.measuredWarmRuns != 100
+                    || it.succeededRuns != 100
+                    || it.timedOutRuns != 0
+                    || it.readyTopologyPhysicalSearches != 100
+                    || it.readyTopologyCompletedCorridorCacheHits != 0
+                    || it.measuredCompletedCacheRuns != 100
+                    || it.completedCacheSucceededRuns != 100
+                    || it.completedCacheTimedOutRuns != 0
+                    || it.measuredCompletedCorridorCacheHits != 100
+                    || it.synchronousCompletedCorridorCacheHits != 100
+                    || it.completedCachePhysicalSearches != 0
+                    || it.completedCacheFailureCounts == null
+                    || !it.completedCacheFailureCounts.isEmpty()
+        }
+        if (!incompleteHotMetrics.isEmpty()) {
+            throw new GradleException("Routes have incomplete hot-query metrics: ${incompleteHotMetrics*.name}")
+        }
+        def hotLimitMillis = { route ->
+            if (route.requestedStraightLineBlocks <= 8) {
+                return 0.5D
+            }
+            if (route.requestedStraightLineBlocks <= 96) {
+                return 1.5D
+            }
+            return 5.0D
+        }
+        def slowReadyTopologyRoutes = parsed.routes.findAll {
+            it.p95MacroMillis > hotLimitMillis(it)
+        }
+        if (!slowReadyTopologyRoutes.isEmpty()) {
+            throw new GradleException("Ready-topology P95 macro search exceeded its limit: ${slowReadyTopologyRoutes*.name}")
+        }
+        def slowCompletedCacheRoutes = parsed.routes.findAll {
+            it.p95CompletedCacheHitWallMillis > hotLimitMillis(it)
+        }
+        if (!slowCompletedCacheRoutes.isEmpty()) {
+            throw new GradleException("Completed-cache P95 wall time exceeded its limit: ${slowCompletedCacheRoutes*.name}")
+        }
         def unknownRoutes = parsed.routes.findAll { it.unknownBoundarySections != 0 }
         if (!unknownRoutes.isEmpty()) {
             throw new GradleException("Real terrain benchmark contains unknown boundaries: ${unknownRoutes*.name}")
@@ -335,6 +375,109 @@ tasks.register('verifyTerrainBenchmarkReport') {
         }
         if (!contradictedAnswers.isEmpty()) {
             throw new GradleException("Macro answers contradicted structural audit: ${contradictedAnswers*.name}")
+        }
+        def pressure = parsed.pressureStages ?: []
+        def expectedPressure = [
+                'high_coalescing',
+                'completed_corridor_replay',
+                'distributed_64_per_dimension'
+        ] as Set
+        if ((pressure*.name as Set) != expectedPressure) {
+            throw new GradleException('Real terrain benchmark omitted a pressure stage')
+        }
+        def failedPressure = pressure.findAll {
+            it.passed != true || it.submitted != 1024 || it.timedOut != 0
+                    || it.logicalRequests != 1024
+                    || it.reuseExpectationPassed != true
+                    || it.onlyExpectedSearchFailures != true
+                    || it.maximumDependencyPermits > 64
+                    || it.endDependencyPermits != 0
+                    || it.endTopologyWaiters != 0
+                    || it.endMacroWaiters != 0
+                    || it.endMacroFlights != 0
+                    || it.endSchedulerParked != 0
+                    || it.physicalWritesDuringStage != 0
+        }
+        if (!failedPressure.isEmpty()) {
+            throw new GradleException("Topology pressure stage failed: ${failedPressure*.name}")
+        }
+        def coalescedPressure = pressure.find { it.name == 'high_coalescing' }
+        if (coalescedPressure.succeeded != 1024 || coalescedPressure.failed != 0
+                || coalescedPressure.physicalSearches != 2
+                || coalescedPressure.inFlightJoins != 1022
+                || coalescedPressure.completedHits != 0) {
+            throw new GradleException('High-coalescing pressure did not single-flight by component pair')
+        }
+        def replayPressure = pressure.find { it.name == 'completed_corridor_replay' }
+        if (replayPressure.succeeded != 1024 || replayPressure.failed != 0
+                || replayPressure.physicalSearches != 0
+                || replayPressure.inFlightJoins != 0
+                || replayPressure.completedHits != 1024) {
+            throw new GradleException('Staggered replay did not use the completed corridor cache')
+        }
+        def distributedPressure = pressure.find { it.name == 'distributed_64_per_dimension' }
+        if (distributedPressure.maximumDependencyPermits != 64
+                || distributedPressure.physicalSearches != 128
+                || distributedPressure.inFlightJoins != 896) {
+            throw new GradleException('Distributed pressure did not exercise the expected bounded groups')
+        }
+        def canonicalQueries = distributedPressure.canonicalQueries ?: []
+        def limitQueries = canonicalQueries.findAll {
+            it.outcome == 'SEARCH_LIMIT_REACHED'
+        }
+        if (canonicalQueries.size() != 128
+                || limitQueries.size() != distributedPressure.searchLimitCanonicalRoutes
+                || limitQueries.size() * 8 != distributedPressure.failed) {
+            throw new GradleException('Distributed pressure omitted canonical search-limit evidence')
+        }
+        def incompleteLimitEvidence = limitQueries.findAll {
+            !(it.failurePhase in ['SUPER', 'REFINEMENT', 'DIRECT'])
+                    || it.combinedSearch == null
+                    || it.queryCpuMillis == null
+                    || !(
+                    it.superSearch?.expandedNodes == it.superSearch?.visitedNodeLimit
+                            || it.refinementSearch?.expandedNodes
+                            == it.refinementSearch?.visitedNodeLimit
+            )
+        }
+        if (!incompleteLimitEvidence.isEmpty()) {
+            throw new GradleException('Search-limit diagnostics did not identify the exhausted phase')
+        }
+        def budgetDiagnostics = parsed.searchBudgetDiagnostics
+        def probes = budgetDiagnostics?.probeStages ?: []
+        if (budgetDiagnostics?.productionDefaultsChanged != false
+                || (limitQueries.size() > 0 && probes.isEmpty())) {
+            throw new GradleException('Search-budget diagnostics are incomplete')
+        }
+        int remainingFailures = limitQueries.size()
+        int expectedProbeBudget = 2048
+        probes.each { probe ->
+            if (probe.kind != 'BUDGET_PROBE'
+                    || probe.configuredNodeBudget != expectedProbeBudget
+                    || probe.submitted != remainingFailures
+                    || probe.logicalRequests != remainingFailures
+                    || probe.physicalSearches != remainingFailures
+                    || probe.inFlightJoins != 0
+                    || probe.completedHits != 0
+                    || probe.timedOut != 0
+                    || probe.onlyExpectedSearchFailures != true
+                    || probe.reuseExpectationPassed != true
+                    || probe.cleanupPassed != true
+                    || (probe.canonicalQueries ?: []).size() != remainingFailures) {
+                throw new GradleException("Invalid search-budget probe at ${expectedProbeBudget} nodes")
+            }
+            remainingFailures = probe.searchLimitCanonicalRoutes as int
+            expectedProbeBudget *= 2
+        }
+        if (remainingFailures > 0 && expectedProbeBudget <= 8192) {
+            throw new GradleException('Search-budget diagnostics stopped before the next probe tier')
+        }
+        def persistence = parsed.persistenceLifecycle
+        if (persistence?.passed != true || persistence.ordinaryTickPhysicalWrites != 0
+                || persistence.savePhysicalWrites < 0 || persistence.saveFlushes <= 0
+                || persistence.persistenceHits != persistence.requestedRestoreSections
+                || persistence.freshBuilds != 0) {
+            throw new GradleException('Topology persistence lifecycle validation failed')
         }
     }
 }

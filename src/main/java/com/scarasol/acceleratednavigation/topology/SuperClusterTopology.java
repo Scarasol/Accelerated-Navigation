@@ -411,6 +411,9 @@ public final class SuperClusterTopology {
         Direction opposite = face.getOpposite();
         int minimumWidth = Math.max(1, (int) Math.ceil(profile.width()));
         if (channel == BaseClusterTopology.Channel.VOLUME || face.getAxis().isVertical()) {
+            if (!allowsVerticalBoundary(face, channel, profile)) {
+                return List.of();
+            }
             BoundaryBand band = overlap(
                     sourceTopology,
                     source,
@@ -727,7 +730,9 @@ public final class SuperClusterTopology {
                                        Map<Integer, Map<Integer, Float>> output) {
         int minimumWidth = Math.max(1, (int) Math.ceil(profile.width()));
         if (channel == BaseClusterTopology.Channel.VOLUME || face.getAxis().isVertical()) {
-            collectPlaneCrossings(source, target, 0, minimumWidth, neighbor, output);
+            if (allowsVerticalBoundary(face, channel, profile)) {
+                collectPlaneCrossings(source, target, 0, minimumWidth, neighbor, output);
+            }
             return;
         }
         int maximum = Math.max(profile.maxStep(), profile.maxDrop());
@@ -775,6 +780,16 @@ public final class SuperClusterTopology {
                 }
             }
         }
+    }
+
+    private static boolean allowsVerticalBoundary(
+            Direction face,
+            BaseClusterTopology.Channel channel,
+            BaseClusterTopology.TraversalProfile profile) {
+        if (channel != BaseClusterTopology.Channel.GROUND || !face.getAxis().isVertical()) {
+            return true;
+        }
+        return face == Direction.UP ? profile.maxStep() >= 1 : profile.maxDrop() >= 1;
     }
 
     private static int[] stronglyConnectedComponents(List<List<NodeEdge>> adjacency) {
