@@ -52,6 +52,13 @@ final class TopologyTaskExecutor {
     TaskHandle submit(ResourceKey<Level> dimension,
                       NavigationScheduler.Priority priority,
                       Runnable command) {
+        return submit(dimension, priority, command, true);
+    }
+
+    TaskHandle submit(ResourceKey<Level> dimension,
+                      NavigationScheduler.Priority priority,
+                      Runnable command,
+                      boolean allowAging) {
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(priority, "priority");
         Objects.requireNonNull(command, "command");
@@ -59,7 +66,8 @@ final class TopologyTaskExecutor {
             if (!accepting) {
                 throw new RejectedExecutionException(thread.getName() + " is stopped");
             }
-            Task task = new Task(++sequence, dimension, priority, command, System.nanoTime());
+            Task task = new Task(++sequence, dimension, priority, command,
+                    System.nanoTime(), allowAging);
             if (!dimensionOrder.contains(dimension)) {
                 dimensionOrder.add(dimension);
             }
@@ -204,6 +212,9 @@ final class TopologyTaskExecutor {
 
     private static int effectiveRank(Task task, long now) {
         int baseRank = task.priority.ordinal();
+        if (!task.allowAging) {
+            return baseRank;
+        }
         long waited = Math.max(0L, now - task.enqueuedNanos);
         int promotions = (int) Math.min(baseRank, waited / AGING_INTERVAL_NANOS);
         return baseRank - promotions;
@@ -213,6 +224,8 @@ final class TopologyTaskExecutor {
         void promote(NavigationScheduler.Priority priority);
 
         void reprioritize(NavigationScheduler.Priority priority);
+
+        void enableAging();
 
         boolean cancel();
     }
@@ -238,6 +251,7 @@ final class TopologyTaskExecutor {
         private final ResourceKey<Level> dimension;
         private final Runnable command;
         private final long enqueuedNanos;
+        private boolean allowAging;
         private NavigationScheduler.Priority priority;
         private TaskState state = TaskState.QUEUED;
 
@@ -245,12 +259,14 @@ final class TopologyTaskExecutor {
                      ResourceKey<Level> dimension,
                      NavigationScheduler.Priority priority,
                      Runnable command,
-                     long enqueuedNanos) {
+                     long enqueuedNanos,
+                     boolean allowAging) {
             this.sequence = sequence;
             this.dimension = dimension;
             this.priority = priority;
             this.command = command;
             this.enqueuedNanos = enqueuedNanos;
+            this.allowAging = allowAging;
         }
 
         @Override
@@ -272,6 +288,13 @@ final class TopologyTaskExecutor {
                     return;
                 }
                 moveTo(requested);
+            }
+        }
+
+        @Override
+        public void enableAging() {
+            synchronized (monitor) {
+                allowAging = true;
             }
         }
 
@@ -335,3 +358,5 @@ final class TopologyTaskExecutor {
         queue.addAll(reordered);
     }
 }
+
+

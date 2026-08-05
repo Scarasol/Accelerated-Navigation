@@ -6,7 +6,6 @@ import com.scarasol.acceleratednavigation.topology.BaseClusterTopology;
 import com.scarasol.acceleratednavigation.topology.TopologyGraphAudit;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestAssertException;
@@ -58,19 +57,10 @@ public final class MacroTopologyGameTests {
                 throw new GameTestAssertException("topology snapshot is still pending");
             }
             BaseClusterTopology topology = future.join();
-            int u = boundary.getZ() & 15;
-            int v = boundary.getY() & 15;
-            if (!topology.hasFluid(Direction.EAST, u, v)) {
-                throw new GameTestAssertException("waterlogged boundary cell was not recorded as fluid");
-            }
-            boolean exactComponent = topology.boundaryComponents(
-                            Direction.EAST,
-                            BaseClusterTopology.Channel.GROUND
-                    ).stream()
-                    .anyMatch(component -> component.requiresExactCheck()
-                            && component.containsFluid());
-            if (!exactComponent) {
-                throw new GameTestAssertException("partial fluid collision did not require exact backend check");
+            if (topology.componentAt(boundary.getX() & 15, boundary.getY() & 15,
+                    boundary.getZ() & 15) >= 0) {
+                throw new GameTestAssertException(
+                        "default dry traversal view accepted a waterlogged anchor");
             }
             TopologyService.Metrics after = service.metrics();
             if (after.snapshotCells() - before.snapshotCells() < BaseClusterTopology.CELL_COUNT) {

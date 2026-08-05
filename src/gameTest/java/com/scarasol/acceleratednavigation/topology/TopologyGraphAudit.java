@@ -9,6 +9,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
 import org.jetbrains.annotations.Nullable;
 
+import java.lang.reflect.Field;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -24,9 +25,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
-/** Test-only, hierarchy-independent reachability and corridor consistency audit. */
+/** Test-only directed reachability and corridor audit over the published primitive base graph. */
 public final class TopologyGraphAudit {
-
     private final TopologyService service;
     private final ServerLevel level;
     private final BlockPos start;
@@ -36,120 +36,151 @@ public final class TopologyGraphAudit {
     private final int nodeLimit;
     private final ArrayDeque<NodeRef> open = new ArrayDeque<>();
     private final Set<NodeRef> discovered = new HashSet<>();
-    private final Set<SectionPos> visitedSections = new HashSet<>();
-    private final Set<SectionPos> unavailableSections = new LinkedHashSet<>();
     private final Map<NodeRef, NodeRef> previous = new HashMap<>();
-    private final Map<TopologyService.ClusterKey, CompletableFuture<BaseClusterTopology>> requests =
-            new LinkedHashMap<>();
-
+    private final Set<NodeRef> goals = new HashSet<>();
+    private final Set<SectionPos> unavailable = new LinkedHashSet<>();
     private Status status = Status.RUNNING;
-    private NodeRef startBinding;
-    private NodeRef goalBinding;
-    private NodeRef nearest;
     private NodeRef reached;
     private String detail = "RUNNING";
     private long cpuNanos;
-    private int expandedComponents;
-    private int generatedConnections;
-    private int requestedSections;
-    private int completedSections;
-    private int failedSections;
-    private int minSectionX = Integer.MAX_VALUE;
-    private int minSectionY = Integer.MAX_VALUE;
-    private int minSectionZ = Integer.MAX_VALUE;
-    private int maxSectionX = Integer.MIN_VALUE;
-    private int maxSectionY = Integer.MIN_VALUE;
-    private int maxSectionZ = Integer.MIN_VALUE;
-    private double nearestDistance = Double.POSITIVE_INFINITY;
+    private int expanded;
+    private int generated;
     private boolean initialized;
 
     public static CompletableFuture<BaseClusterTopology> requestClusterDependency(
-            TopologyService service,
-            ServerLevel level,
-            SectionPos section,
+            TopologyService service, ServerLevel level, SectionPos section,
             NavigationScheduler.Priority priority) {
         return service.subscribeClusterDependency(level, section, priority).future();
     }
 
-    public TopologyGraphAudit(TopologyService service,
-                              ServerLevel level,
-                              BlockPos start,
-                              BlockPos goal,
-                              BaseClusterTopology.Channel channel,
-                              BaseClusterTopology.TraversalProfile profile,
-                              int nodeLimit) {
+    public TopologyGraphAudit(TopologyService service, ServerLevel level, BlockPos start,
+                              BlockPos goal, BaseClusterTopology.Channel channel,
+                              BaseClusterTopology.TraversalProfile profile, int nodeLimit) {
         this.service = Objects.requireNonNull(service, "service");
         this.level = Objects.requireNonNull(level, "level");
-        this.start = Objects.requireNonNull(start, "start").immutable();
-        this.goal = Objects.requireNonNull(goal, "goal").immutable();
+        this.start = start.immutable();
+        this.goal = goal.immutable();
         this.channel = Objects.requireNonNull(channel, "channel");
         this.profile = Objects.requireNonNull(profile, "profile");
-        if (nodeLimit <= 0) {
-            throw new IllegalArgumentException("nodeLimit must be positive");
-        }
+        if (nodeLimit <= 0) throw new IllegalArgumentException("nodeLimit must be positive");
         this.nodeLimit = nodeLimit;
     }
 
+    public static Map<String, Object> diagnoseHierarchyProjection(
+            TopologyService service,
+            ServerLevel level,
+            BlockPos start,
+            BlockPos goal,
+            BaseClusterTopology.Channel channel,
+            BaseClusterTopology.TraversalProfile profile,
+            int nodeLimit) {
+        long began = System.nanoTime();
+        TopologyGraphAudit audit = new TopologyGraphAudit(
+                service, level, start, goal, channel, profile, nodeLimit
+        );
+        while (audit.status() == Status.RUNNING) {
+            audit.step(1_024, Long.MAX_VALUE);
+        }
+        Map<String, Object> report = new LinkedHashMap<>(audit.report());
+        report.put("diagnosticWallMillis", millis(System.nanoTime() - began));
+        report.put("timingExcludedFromMacroQuery", true);
+        report.put("hierarchyInspectionMoment", "POST_QUERY_CURRENT_CACHE");
+        report.put("hierarchyInspectionLimit",
+                "Does not claim that an idle cache entry was captured by the completed query");
+        return report;
+    }
+
+    /**
+     * Verifies every directed edge in a published base graph, rather than only
+     * the witness selected by a route query.
+     */
+    public static Map<String, Object> auditPublishedProjection(
+            TopologyService service,
+            ServerLevel level,
+            PublishedConnectivity connectivity) {
+        Objects.requireNonNull(service, "service");
+        Objects.requireNonNull(level, "level");
+        Objects.requireNonNull(connectivity, "connectivity");
+        TopologyGraphAudit owner = new TopologyGraphAudit(
+                service,
+                level,
+                BlockPos.ZERO,
+                BlockPos.ZERO,
+                connectivity.channel,
+                connectivity.profile,
+                Integer.MAX_VALUE
+        );
+        ProjectionContext context = owner.new ProjectionContext();
+        int checked = 0;
+        int crossParent = 0;
+        int mapped = 0;
+        int inconclusive = 0;
+        List<Map<String, Object>> failures = new ArrayList<>();
+        for (int sourceIndex = 0; sourceIndex < connectivity.nodes.size(); sourceIndex++) {
+            NodeRef source = connectivity.nodes.get(sourceIndex);
+            for (int targetIndex : connectivity.edges.get(sourceIndex)) {
+                NodeRef target = connectivity.nodes.get(targetIndex);
+                checked++;
+                if (!SuperClusterTopology.originOf(source.section)
+                        .equals(SuperClusterTopology.originOf(target.section))) {
+                    crossParent++;
+                }
+                ProjectionResult result = context.edge(source, target);
+                if (result.mapped()) {
+                    mapped++;
+                } else {
+                    if (!result.conclusive()) inconclusive++;
+                    if (failures.size() < 32) {
+                        failures.add(projectionFailure(
+                                checked - 1, "PUBLISHED_BASE_EDGE", source, target, result
+                        ));
+                    }
+                }
+            }
+        }
+        Map<String, Object> report = new LinkedHashMap<>();
+        report.put("scope", "ALL_PUBLISHED_DIRECTED_BASE_EDGES");
+        report.put("checkedBaseEdges", checked);
+        report.put("crossParentEdges", crossParent);
+        report.put("mappedEdges", mapped);
+        report.put("directEdgeOmissions", checked - mapped);
+        report.put("inconclusiveEdges", inconclusive);
+        report.put("passed", checked == mapped && inconclusive == 0);
+        report.put("failures", failures);
+        report.put("context", context.report());
+        report.put("projectionMillis", context.projectionMillis());
+        return report;
+    }
+
     public Status step(int expansionBudget, long deadlineNanos) {
-        if (status != Status.RUNNING) {
-            return status;
-        }
-        if (expansionBudget <= 0) {
-            throw new IllegalArgumentException("expansionBudget must be positive");
-        }
-        long started = System.nanoTime();
+        if (status != Status.RUNNING) return status;
+        long began = System.nanoTime();
         try {
-            if (!completeRequests()) {
-                return status;
-            }
-            if (!initialized && !initialize()) {
-                return status;
-            }
-
-            int expandedThisStep = 0;
-            while (expandedThisStep < expansionBudget && System.nanoTime() < deadlineNanos) {
-                if (open.isEmpty()) {
-                    status = unavailableSections.isEmpty() ? Status.EXHAUSTED : Status.INCOMPLETE;
-                    detail = unavailableSections.isEmpty()
-                            ? "BASE_COMPONENT_GRAPH_EXHAUSTED"
-                            : "UNAVAILABLE_TOPOLOGY_BOUNDARY";
-                    return status;
+            if (!initialized && !initialize()) return status;
+            int budget = expansionBudget;
+            while (budget-- > 0 && System.nanoTime() < deadlineNanos) {
+                if (expanded >= nodeLimit) return finish(Status.INCOMPLETE, "REFERENCE_NODE_LIMIT");
+                NodeRef node = open.pollFirst();
+                if (node == null) return finish(unavailable.isEmpty() ? Status.EXHAUSTED : Status.INCOMPLETE,
+                        unavailable.isEmpty() ? "BASE_COMPONENT_GRAPH_EXHAUSTED"
+                                : "UNAVAILABLE_TOPOLOGY_BOUNDARY");
+                if (goals.contains(node)) {
+                    reached = node;
+                    return finish(Status.FOUND, "BASE_COMPONENT_ROUTE_FOUND");
                 }
-                NodeRef current = open.removeFirst();
-                if (current.equals(goalBinding)) {
-                    reached = current;
-                    status = Status.FOUND;
-                    detail = "BASE_COMPONENT_ROUTE_FOUND";
-                    return status;
-                }
-                if (!requestMissingNeighbors(current)) {
-                    open.addFirst(current);
-                    return status;
-                }
-
-                expandedThisStep++;
-                expandedComponents++;
-                expand(current);
-                if (status != Status.RUNNING) {
-                    return status;
-                }
+                expanded++;
+                expand(node);
             }
             return status;
         } finally {
-            cpuNanos += System.nanoTime() - started;
+            cpuNanos += System.nanoTime() - began;
         }
     }
 
-    public Status status() {
-        return status;
-    }
+    public Status status() { return status; }
 
     public void stop(String reason) {
-        Objects.requireNonNull(reason, "reason");
-        if (status == Status.RUNNING) {
-            status = Status.INCOMPLETE;
-            detail = reason;
-        }
+        if (status == Status.RUNNING) finish(Status.INCOMPLETE, Objects.requireNonNull(reason));
     }
 
     public Map<String, Object> report() {
@@ -158,25 +189,14 @@ public final class TopologyGraphAudit {
         report.put("detail", detail);
         report.put("nodeLimit", nodeLimit);
         report.put("visitedComponents", discovered.size());
-        report.put("expandedComponents", expandedComponents);
-        report.put("generatedConnections", generatedConnections);
-        report.put("visitedSections", visitedSections.size());
-        report.put("requestedSections", requestedSections);
-        report.put("completedSections", completedSections);
-        report.put("failedSections", failedSections);
-        report.put("cpuMillis", nanosToMillis(cpuNanos));
-        report.put("startBinding", bindingReport(startBinding, start));
-        report.put("goalBinding", bindingReport(goalBinding, goal));
-        report.put("nearestGoalDistanceBlocks",
-                Double.isFinite(nearestDistance) ? nearestDistance : null);
-        report.put("nearestReachableComponent", nodeReport(nearest));
-        report.put("reachableSectionBounds", sectionBounds());
-        report.put("unavailableSections", unavailableSections.stream()
-                .limit(32)
-                .map(TopologyGraphAudit::sectionMap)
-                .toList());
+        report.put("expandedComponents", expanded);
+        report.put("generatedConnections", generated);
+        report.put("cpuMillis", millis(cpuNanos));
+        report.put("unavailableSections", unavailable.stream().limit(32).map(TopologyGraphAudit::sectionMap).toList());
         report.put("witnessComponentCount", witness().size());
-        report.put("nearestFrontier", frontierReport(nearest));
+        if (status == Status.FOUND) {
+            report.put("hierarchyProjection", hierarchyProjectionReport());
+        }
         return report;
     }
 
@@ -184,244 +204,660 @@ public final class TopologyGraphAudit {
         return witness().stream().map(this::anchor).toList();
     }
 
+    private boolean initialize() {
+        List<NodeRef> starts = bindCandidates(start);
+        List<NodeRef> targets = bindCandidates(goal);
+        if (starts.isEmpty() || targets.isEmpty()) {
+            finish(Status.EXHAUSTED, "ENDPOINT_HAS_NO_COMPONENT");
+            return false;
+        }
+        for (NodeRef node : starts) if (discovered.add(node)) open.addLast(node);
+        goals.addAll(targets);
+        initialized = true;
+        return true;
+    }
+
+    private void expand(NodeRef source) {
+        BaseClusterTopology topology = topology(source.section);
+        if (topology == null || source.componentId >= topology.componentCount()) return;
+        BaseClusterTopology.MovementKey movement = profile.movement(channel);
+        for (int edge = topology.localEdgeStart(source.componentId);
+             edge < topology.localEdgeEnd(source.componentId); edge++) {
+            if (topology.localEdgeSupports(edge, movement)) {
+                visit(source, new NodeRef(source.section, topology.localEdgeTarget(edge)));
+            }
+        }
+        for (Direction face : Direction.values()) {
+            int minimum = face.getAxis().isVertical() ? 0 : -1;
+            int maximum = face.getAxis().isVertical() ? 0 : 1;
+            for (int yShift = minimum; yShift <= maximum; yShift++) {
+                SectionPos targetSection = neighbor(source.section, face, yShift);
+                BaseClusterTopology target = topology(targetSection);
+                if (target == null) {
+                    if (level.getChunkSource().getChunkNow(targetSection.x(), targetSection.z()) == null) {
+                        unavailable.add(targetSection);
+                    }
+                    continue;
+                }
+                SuperClusterTopology.BoundaryLinks links =
+                        SuperClusterTopology.boundaryLinks(topology, target, face);
+                for (int edge = links.edgeStart(source.componentId);
+                     edge < links.edgeEnd(source.componentId); edge++) {
+                    if (links.supports(edge, movement)) {
+                        visit(source, new NodeRef(targetSection, links.targetComponent(edge)));
+                    }
+                }
+            }
+        }
+    }
+
+    private void visit(NodeRef source, NodeRef target) {
+        generated++;
+        if (discovered.add(target)) {
+            previous.put(target, source);
+            open.addLast(target);
+        }
+    }
+
+    private List<NodeRef> bindCandidates(BlockPos position) {
+        Set<NodeRef> result = new LinkedHashSet<>();
+        for (BlockPos candidate : candidateAnchors(position)) {
+            BaseClusterTopology topology = topology(SectionPos.of(candidate));
+            if (topology == null || topology.geometry().channel() != channel) continue;
+            int component = topology.componentAt(Math.floorMod(candidate.getX(), 16),
+                    Math.floorMod(candidate.getY(), 16), Math.floorMod(candidate.getZ(), 16));
+            if (component >= 0) {
+                result.add(new NodeRef(topology.section(), component));
+                if (candidate.equals(position)) break;
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private List<NodeRef> witness() {
+        if (reached == null) return List.of();
+        List<NodeRef> reverse = new ArrayList<>();
+        for (NodeRef node = reached; node != null; node = previous.get(node)) reverse.add(node);
+        java.util.Collections.reverse(reverse);
+        return List.copyOf(reverse);
+    }
+
+    private Map<String, Object> hierarchyProjectionReport() {
+        long began = System.nanoTime();
+        List<NodeRef> path = witness();
+        ProjectionContext context = new ProjectionContext();
+        int sameAggregate = 0;
+        int internalEdges = 0;
+        int crossingEdges = 0;
+        int mappedEdges = 0;
+        int inconclusiveEdges = 0;
+        Map<String, Object> firstFailure = null;
+
+        ProjectionResult startProjection = context.endpoint(path.get(0));
+        ProjectionResult goalProjection = context.endpoint(path.get(path.size() - 1));
+        if (!startProjection.mapped()) {
+            firstFailure = projectionFailure(0, "START_ENDPOINT", path.get(0), path.get(0),
+                    startProjection);
+        } else if (!goalProjection.mapped()) {
+            firstFailure = projectionFailure(path.size() - 1, "GOAL_ENDPOINT",
+                    path.get(path.size() - 1), path.get(path.size() - 1), goalProjection);
+        }
+
+        for (int index = 0; index + 1 < path.size(); index++) {
+            NodeRef source = path.get(index);
+            NodeRef target = path.get(index + 1);
+            ProjectionResult result = context.edge(source, target);
+            switch (result.kind()) {
+                case "SAME_AGGREGATE" -> sameAggregate++;
+                case "INTERNAL_PARENT_EDGE" -> internalEdges++;
+                case "PARENT_CROSSING_EDGE" -> crossingEdges++;
+                default -> {
+                }
+            }
+            if (result.mapped()) {
+                mappedEdges++;
+            } else {
+                if (!result.conclusive()) {
+                    inconclusiveEdges++;
+                }
+                if (firstFailure == null) {
+                    firstFailure = projectionFailure(index, "BASE_EDGE", source, target, result);
+                }
+            }
+        }
+
+        boolean endpointsMapped = startProjection.mapped() && goalProjection.mapped();
+        int baseEdges = Math.max(0, path.size() - 1);
+        Map<String, Object> report = new LinkedHashMap<>();
+        report.put("scope", "ONE_DIRECTED_BASE_WITNESS_PROJECTED_AFTER_QUERY");
+        report.put("baseWitnessComponents", path.size());
+        report.put("baseWitnessEdges", baseEdges);
+        report.put("startProjection", startProjection.report());
+        report.put("goalProjection", goalProjection.report());
+        report.put("sameAggregateEdges", sameAggregate);
+        report.put("internalParentEdges", internalEdges);
+        report.put("parentCrossingEdges", crossingEdges);
+        report.put("mappedEdges", mappedEdges);
+        report.put("directEdgeOmissions", baseEdges - mappedEdges);
+        report.put("inconclusiveEdges", inconclusiveEdges);
+        report.put("firstFailure", firstFailure == null ? Map.of() : firstFailure);
+        report.put("context", context.report());
+        report.put("alternativeHierarchyRouteChecked", false);
+        report.put("causalityLimit",
+                "A missing direct aggregate edge does not by itself exclude an alternate parent-graph route");
+        report.put("projectionMillis", millis(System.nanoTime() - began));
+        if (endpointsMapped && mappedEdges == baseEdges) {
+            report.put("conclusion", context.usedFallback()
+                    ? "BASE_WITNESS_PRESERVED_BY_CURRENT_HIERARCHY_SEMANTICS"
+                    : "BASE_WITNESS_PRESENT_IN_POST_QUERY_CACHED_HIERARCHY");
+        } else if (firstFailure != null
+                && Boolean.TRUE.equals(firstFailure.get("conclusive"))) {
+            report.put("conclusion", "DIRECT_PARENT_EDGE_OMISSION_OBSERVED");
+        } else {
+            report.put("conclusion", "HIERARCHY_PROJECTION_AUDIT_INCONCLUSIVE");
+        }
+        return report;
+    }
+
+    private static Map<String, Object> projectionFailure(
+            int edgeIndex,
+            String stage,
+            NodeRef source,
+            NodeRef target,
+            ProjectionResult result) {
+        Map<String, Object> failure = new LinkedHashMap<>();
+        failure.put("edgeIndex", edgeIndex);
+        failure.put("stage", stage);
+        failure.put("code", result.code());
+        failure.put("conclusive", result.conclusive());
+        failure.put("source", nodeMap(source));
+        failure.put("target", nodeMap(target));
+        failure.put("detail", result.detail());
+        return failure;
+    }
+
+    private final class ProjectionContext {
+        private final Map<SectionPos, CachedParent> parents = new HashMap<>();
+        private final BaseClusterTopology.BuildScratch scratch =
+                new BaseClusterTopology.BuildScratch();
+        private String cacheInspectionFailure = "NONE";
+        private int cachedParentsScanned;
+        private int cachedParentsUsed;
+        private int rebuiltParents;
+        private int cachedCrossingsUsed;
+        private int recomputedCrossings;
+        private int uninspectableCrossings;
+        private int parentMaskCandidateSlots;
+        private int parentMaskSetSlots;
+        private int parentMaskExcludedSlots;
+        private int generatedParentEdges;
+        private final Set<SectionPos> countedMaskOrigins = new HashSet<>();
+        private final Set<String> countedCrossings = new HashSet<>();
+        private long projectionStartedNanos;
+
+        private ProjectionContext() {
+            projectionStartedNanos = System.nanoTime();
+            inspectCachedParents();
+        }
+
+        private ProjectionResult endpoint(NodeRef node) {
+            CachedParent parent = parent(node);
+            if (parent == null) {
+                return ProjectionResult.missing("ENDPOINT_PARENT_UNAVAILABLE", false,
+                        endpointDetail(node, null, -1, "No cached parent and not all children are published"));
+            }
+            int aggregate = parent.topology().aggregateId(node.section(), node.componentId());
+            if (aggregate < 0) {
+                return ProjectionResult.missing("ENDPOINT_COMPONENT_UNMAPPED", true,
+                        endpointDetail(node, parent, aggregate,
+                                "Parent does not map the base component"));
+            }
+            return ProjectionResult.mapped("ENDPOINT_MEMBERSHIP",
+                    endpointDetail(node, parent, aggregate, "Mapped"));
+        }
+
+        private ProjectionResult edge(NodeRef source, NodeRef target) {
+            CachedParent sourceParent = parent(source);
+            CachedParent targetParent = parent(target);
+            if (sourceParent == null || targetParent == null) {
+                return ProjectionResult.missing("PARENT_UNAVAILABLE", false, Map.of(
+                        "sourceParent", sourceParent == null ? "UNAVAILABLE" : sourceParent.source(),
+                        "targetParent", targetParent == null ? "UNAVAILABLE" : targetParent.source()
+                ));
+            }
+            int sourceAggregate = sourceParent.topology().aggregateId(
+                    source.section(), source.componentId());
+            int targetAggregate = targetParent.topology().aggregateId(
+                    target.section(), target.componentId());
+            Map<String, Object> identity = edgeIdentity(
+                    source, target, sourceParent, targetParent,
+                    sourceAggregate, targetAggregate
+            );
+            if (sourceAggregate < 0 || targetAggregate < 0) {
+                return ProjectionResult.missing("BASE_COMPONENT_UNMAPPED", true, identity);
+            }
+            if (sourceParent.topology().origin().equals(targetParent.topology().origin())) {
+                if (sourceAggregate == targetAggregate) {
+                    return ProjectionResult.mapped("SAME_AGGREGATE", identity);
+                }
+                for (int edge = sourceParent.topology().outgoingStart(sourceAggregate);
+                     edge < sourceParent.topology().outgoingEnd(sourceAggregate); edge++) {
+                    if (sourceParent.topology().outgoingTarget(edge) == targetAggregate) {
+                        return ProjectionResult.mapped("INTERNAL_PARENT_EDGE", identity);
+                    }
+                }
+                return ProjectionResult.missing(
+                        "MISSING_INTERNAL_AGGREGATE_EDGE", true, identity
+                );
+            }
+
+            Direction face = parentFace(sourceParent.topology().origin(),
+                    targetParent.topology().origin());
+            if (face == null) {
+                return ProjectionResult.missing("NON_ADJACENT_PARENT_TRANSITION", true, identity);
+            }
+            boolean potentialExit = sourceParent.topology().hasPotentialExit(
+                    sourceAggregate, targetParent.topology().origin());
+            identity.put("potentialExit", potentialExit);
+            if (!potentialExit) {
+                return ProjectionResult.missing("MISSING_PARENT_EXIT_MASK", true, identity);
+            }
+            LinkResolution resolution = crossing(sourceParent, targetParent, face);
+            identity.put("face", face.getName());
+            identity.put("crossingSource", resolution.source());
+            identity.put("cachedStatus", resolution.cachedStatus());
+            if (resolution.links() == null) {
+                uninspectableCrossings++;
+                return ProjectionResult.missing(
+                        "PARENT_CROSSING_UNAVAILABLE", false, identity
+                );
+            }
+            for (int edge = resolution.links().edgeStart(sourceAggregate);
+                 edge < resolution.links().edgeEnd(sourceAggregate); edge++) {
+                if (resolution.links().targetAggregate(edge) == targetAggregate) {
+                    return ProjectionResult.mapped("PARENT_CROSSING_EDGE", identity);
+                }
+            }
+            return ProjectionResult.missing(
+                    "MISSING_PARENT_CROSSING_EDGE", true, identity
+            );
+        }
+
+        @Nullable
+        private CachedParent parent(NodeRef node) {
+            SectionPos origin = SuperClusterTopology.originOf(node.section());
+            CachedParent cached = parents.get(origin);
+            if (cached != null) {
+                if (!cached.counted()) {
+                    cachedParentsUsed++;
+                    cached = cached.countedCopy();
+                    parents.put(origin, cached);
+                }
+                return cached;
+            }
+            BaseClusterTopology[] children = children(origin);
+            if (children == null) {
+                return null;
+            }
+            SuperClusterTopology rebuilt = SuperClusterTopology.build(
+                    origin,
+                    children,
+                    profile.geometry(channel),
+                    profile.movement(channel),
+                    scratch
+            );
+            CachedParent parent = new CachedParent(rebuilt, null, "REBUILT_FROM_CURRENT_BASE",
+                    true);
+            parents.put(origin, parent);
+            recordExitMask(rebuilt);
+            rebuiltParents++;
+            return parent;
+        }
+
+        private LinkResolution crossing(CachedParent source,
+                                        CachedParent target,
+                                        Direction face) {
+            String cachedStatus = "NO_SOURCE_CACHE_ENTRY";
+            if (source.cacheEntry() != null) {
+                try {
+                    int slot = superLinkSlot(source.topology().origin(),
+                            target.topology().origin(), face);
+                    long[] signatures = (long[]) readField(
+                            source.cacheEntry(), "linkTargetSignatures");
+                    Object[] links = (Object[]) readField(source.cacheEntry(), "links");
+                    if (signatures[slot] != target.topology().signature()) {
+                        cachedStatus = "TARGET_SIGNATURE_MISMATCH";
+                    } else if (links[slot] == null) {
+                        cachedStatus = "CACHE_SLOT_EMPTY";
+                    } else {
+                        Object value = readField(links[slot], "value");
+                        if (value instanceof SuperClusterTopology.CrossingIndex crossing) {
+                            cachedCrossingsUsed++;
+                            countCrossingEdges(source, target, crossing);
+                            return new LinkResolution(crossing, "POST_QUERY_CACHE", "READY");
+                        }
+                        cachedStatus = "CACHE_VALUE_NOT_READY";
+                    }
+                } catch (ReflectiveOperationException | RuntimeException failure) {
+                    cachedStatus = "CACHE_INSPECTION_FAILED:" + failure.getClass().getSimpleName();
+                }
+            }
+
+            BaseClusterTopology[] sourceChildren = children(source.topology().origin());
+            BaseClusterTopology[] targetChildren = children(target.topology().origin());
+            if (sourceChildren != null && targetChildren != null
+                    && source.topology().matchesChildren(sourceChildren)
+                    && target.topology().matchesChildren(targetChildren)) {
+                recomputedCrossings++;
+                SuperClusterTopology.CrossingIndex crossing = source.topology().crossingIndex(
+                        face, target.topology(), sourceChildren, targetChildren);
+                countCrossingEdges(source, target, crossing);
+                return new LinkResolution(crossing, "RECOMPUTED_FROM_CURRENT_BASE", cachedStatus);
+            }
+            return new LinkResolution(null, "UNAVAILABLE", cachedStatus);
+        }
+
+        private void countCrossingEdges(CachedParent source,
+                                        CachedParent target,
+                                        SuperClusterTopology.CrossingIndex crossing) {
+            String key = source.topology().origin() + "->" + target.topology().origin();
+            if (!countedCrossings.add(key)) return;
+            for (int aggregate = 0; aggregate < source.topology().aggregateCount(); aggregate++) {
+                generatedParentEdges += crossing.edgeEnd(aggregate) - crossing.edgeStart(aggregate);
+            }
+        }
+
+        @Nullable
+        private BaseClusterTopology[] children(SectionPos origin) {
+            BaseClusterTopology[] children = new BaseClusterTopology[8];
+            int index = 0;
+            for (SectionPos child : SuperClusterTopology.childSections(origin)) {
+                BaseClusterTopology topology = TopologyGraphAudit.this.topology(child);
+                if (topology == null
+                        || !topology.geometry().equals(profile.geometry(channel))) {
+                    return null;
+                }
+                children[index++] = topology;
+            }
+            return children;
+        }
+
+        private void inspectCachedParents() {
+            try {
+                Object value = readField(service, "superClusters");
+                if (!(value instanceof Map<?, ?> cache)) {
+                    cacheInspectionFailure = "SUPER_CACHE_HAS_UNEXPECTED_TYPE";
+                    return;
+                }
+                for (Map.Entry<?, ?> entry : cache.entrySet()) {
+                    Object key = entry.getKey();
+                    if (!level.dimension().equals(readField(key, "dimension"))
+                            || !profile.geometry(channel).equals(readField(key, "geometry"))
+                            || !profile.movement(channel).equals(readField(key, "movement"))) {
+                        continue;
+                    }
+                    Object topology = readField(entry.getValue(), "topology");
+                    if (topology instanceof SuperClusterTopology parent) {
+                        parents.put(parent.origin(), new CachedParent(
+                                parent, entry.getValue(), "POST_QUERY_CACHE", false
+                        ));
+                        recordExitMask(parent);
+                        cachedParentsScanned++;
+                    }
+                }
+            } catch (ReflectiveOperationException | RuntimeException failure) {
+                cacheInspectionFailure = failure.getClass().getSimpleName()
+                        + ":" + String.valueOf(failure.getMessage());
+            }
+        }
+
+        private boolean usedFallback() {
+            return rebuiltParents != 0 || recomputedCrossings != 0;
+        }
+
+        private Map<String, Object> report() {
+            Map<String, Object> report = new LinkedHashMap<>();
+            report.put("cacheInspectionFailure", cacheInspectionFailure);
+            report.put("cachedParentsScanned", cachedParentsScanned);
+            report.put("cachedParentsUsed", cachedParentsUsed);
+            report.put("rebuiltParents", rebuiltParents);
+            report.put("cachedCrossingsUsed", cachedCrossingsUsed);
+            report.put("recomputedCrossings", recomputedCrossings);
+            report.put("uninspectableCrossings", uninspectableCrossings);
+            report.put("parentMaskCandidateSlots", parentMaskCandidateSlots);
+            report.put("parentMaskSetSlots", parentMaskSetSlots);
+            report.put("parentMaskExcludedSlots", parentMaskExcludedSlots);
+            report.put("generatedParentEdges", generatedParentEdges);
+            return report;
+        }
+
+        private void recordExitMask(SuperClusterTopology parent) {
+            if (!countedMaskOrigins.add(parent.origin())) return;
+            try {
+                int[] metadata = (int[]) readField(parent, "aggregateMetadata");
+                for (int value : metadata) {
+                    int set = Integer.bitCount((value >>> 15) & 0x3fff);
+                    parentMaskCandidateSlots += 14;
+                    parentMaskSetSlots += set;
+                    parentMaskExcludedSlots += 14 - set;
+                }
+            } catch (ReflectiveOperationException | RuntimeException failure) {
+                cacheInspectionFailure = "EXIT_MASK_INSPECTION_FAILED:"
+                        + failure.getClass().getSimpleName();
+            }
+        }
+
+        private double projectionMillis() {
+            return millis(System.nanoTime() - projectionStartedNanos);
+        }
+    }
+
+    private static Object readField(Object target, String name)
+            throws ReflectiveOperationException {
+        for (Class<?> type = target.getClass(); type != null; type = type.getSuperclass()) {
+            try {
+                Field field = type.getDeclaredField(name);
+                field.setAccessible(true);
+                return field.get(target);
+            } catch (NoSuchFieldException ignored) {
+            }
+        }
+        throw new NoSuchFieldException(target.getClass().getName() + "." + name);
+    }
+
+    @Nullable
+    private static Direction parentFace(SectionPos source, SectionPos target) {
+        int dx = target.x() - source.x();
+        int dy = target.y() - source.y();
+        int dz = target.z() - source.z();
+        int stride = SuperClusterTopology.CHILDREN_PER_AXIS;
+        if (Math.abs(dx) == stride && dz == 0 && Math.abs(dy) <= stride) {
+            return dx < 0 ? Direction.WEST : Direction.EAST;
+        }
+        if (Math.abs(dz) == stride && dx == 0 && Math.abs(dy) <= stride) {
+            return dz < 0 ? Direction.NORTH : Direction.SOUTH;
+        }
+        if (dx == 0 && dz == 0 && Math.abs(dy) == stride) {
+            return dy < 0 ? Direction.DOWN : Direction.UP;
+        }
+        return null;
+    }
+
+    private static int superLinkSlot(SectionPos source, SectionPos target, Direction face) {
+        if (face.getAxis().isVertical()) {
+            return face == Direction.DOWN ? 12 : 13;
+        }
+        int direction = switch (face) {
+            case NORTH -> 0;
+            case EAST -> 1;
+            case SOUTH -> 2;
+            case WEST -> 3;
+            default -> throw new IllegalArgumentException("horizontal face required");
+        };
+        int yShift = (target.y() - source.y()) / SuperClusterTopology.CHILDREN_PER_AXIS;
+        if (yShift < -1 || yShift > 1) {
+            throw new IllegalArgumentException("parent Y shift is outside -1..1");
+        }
+        return direction * 3 + yShift + 1;
+    }
+
+    private static Map<String, Object> endpointDetail(
+            NodeRef node,
+            @Nullable CachedParent parent,
+            int aggregate,
+            String result) {
+        Map<String, Object> report = new LinkedHashMap<>();
+        report.put("node", nodeMap(node));
+        report.put("parent", parent == null ? Map.of()
+                : sectionMap(parent.topology().origin()));
+        report.put("parentSource", parent == null ? "UNAVAILABLE" : parent.source());
+        report.put("aggregate", aggregate);
+        report.put("result", result);
+        return report;
+    }
+
+    private static Map<String, Object> edgeIdentity(
+            NodeRef source,
+            NodeRef target,
+            CachedParent sourceParent,
+            CachedParent targetParent,
+            int sourceAggregate,
+            int targetAggregate) {
+        Map<String, Object> report = new LinkedHashMap<>();
+        report.put("source", nodeMap(source));
+        report.put("target", nodeMap(target));
+        report.put("sourceParent", sectionMap(sourceParent.topology().origin()));
+        report.put("targetParent", sectionMap(targetParent.topology().origin()));
+        report.put("sourceParentSource", sourceParent.source());
+        report.put("targetParentSource", targetParent.source());
+        report.put("sourceAggregate", sourceAggregate);
+        report.put("targetAggregate", targetAggregate);
+        return report;
+    }
+
+    private static Map<String, Object> nodeMap(NodeRef node) {
+        return Map.of(
+                "section", sectionMap(node.section()),
+                "component", node.componentId()
+        );
+    }
+
+    private BlockPos anchor(NodeRef node) {
+        BaseClusterTopology topology = topology(node.section);
+        if (topology == null) return BlockPos.ZERO;
+        int cell = topology.componentAnchorCell(node.componentId);
+        return new BlockPos(node.section.minBlockX() + BaseClusterTopology.x(cell),
+                node.section.minBlockY() + BaseClusterTopology.y(cell),
+                node.section.minBlockZ() + BaseClusterTopology.z(cell));
+    }
+
+    @Nullable
+    private BaseClusterTopology topology(SectionPos section) {
+        return service.topology(new TopologyService.ClusterKey(level.dimension(), section));
+    }
+
+    private Status finish(Status result, String resultDetail) {
+        status = result;
+        detail = resultDetail;
+        return result;
+    }
+
     public static Map<String, Object> auditCorridor(TopologyService service,
                                                      ResourceKey<Level> dimension,
                                                      MacroSearch.Corridor corridor,
                                                      BaseClusterTopology.TraversalProfile profile) {
-        Objects.requireNonNull(service, "service");
-        Objects.requireNonNull(dimension, "dimension");
-        Objects.requireNonNull(corridor, "corridor");
-        Objects.requireNonNull(profile, "profile");
         List<String> errors = new ArrayList<>();
-        int checked = 0;
         int aggregateEndpoints = 0;
-        for (MacroSearch.Endpoint endpoint : corridor.endpoints()) {
-            if (endpoint instanceof MacroSearch.AggregateEndpoint) {
-                aggregateEndpoints++;
+        List<MacroSearch.Endpoint> endpoints = corridor.endpoints();
+        if (corridor.connections().size() + 1 != endpoints.size()) {
+            errors.add("connection count does not match endpoint count");
+        }
+        for (MacroSearch.Endpoint endpoint : endpoints) {
+            if (endpoint instanceof MacroSearch.AggregateEndpoint) aggregateEndpoints++;
+            if (endpoint instanceof MacroSearch.ComponentEndpoint component) {
+                BaseClusterTopology topology = service.topology(
+                        new TopologyService.ClusterKey(dimension, component.section()));
+                if (topology == null || topology.signature() != component.revision()
+                        || component.componentId() < 0
+                        || component.componentId() >= topology.componentCount()) {
+                    errors.add("stale or unavailable component endpoint " + component.id());
+                }
             }
         }
-        if (aggregateEndpoints != 0) {
-            errors.add("refined corridor leaked " + aggregateEndpoints + " aggregate endpoints");
-        }
-
+        if (aggregateEndpoints != 0) errors.add("refined corridor leaked aggregate endpoints");
         for (int index = 0; index < corridor.connections().size(); index++) {
-            MacroSearch.Connection connection = corridor.connections().get(index);
-            if (connection.from().id() != corridor.endpoints().get(index).id()
-                    || connection.to().id() != corridor.endpoints().get(index + 1).id()) {
-                errors.add("connection " + index + " does not match corridor endpoint order");
-                continue;
+            MacroSearch.Connection edge = corridor.connections().get(index);
+            if (index + 1 >= endpoints.size() || edge.from().id() != endpoints.get(index).id()
+                    || edge.to().id() != endpoints.get(index + 1).id()) {
+                errors.add("connection " + index + " does not match endpoint order");
             }
-            checked++;
-            verifyConnection(service, dimension, connection, profile, index, errors);
         }
-
         Map<String, Object> report = new LinkedHashMap<>();
         report.put("valid", errors.isEmpty());
-        report.put("referenceCurrent", errors.stream().noneMatch(error ->
-                error.contains("stale") || error.contains("unavailable")));
-        report.put("checkedConnections", checked);
+        report.put("referenceCurrent", errors.stream().noneMatch(error -> error.contains("stale")));
+        report.put("checkedConnections", corridor.connections().size());
         report.put("aggregateEndpoints", aggregateEndpoints);
         report.put("errors", errors);
         return report;
     }
 
-    /**
-     * Builds a test-only directed connectivity index from already published base topology.
-     * It deliberately does not call the hierarchy under test or any concrete Navigation.
-     */
     public static PublishedConnectivity indexPublished(
-            TopologyService service,
-            ResourceKey<Level> dimension,
-            Collection<SectionPos> sections,
-            BaseClusterTopology.Channel channel,
+            TopologyService service, ResourceKey<Level> dimension,
+            Collection<SectionPos> sections, BaseClusterTopology.Channel channel,
             BaseClusterTopology.TraversalProfile profile) {
-        Objects.requireNonNull(service, "service");
-        Objects.requireNonNull(dimension, "dimension");
-        Objects.requireNonNull(sections, "sections");
-        Objects.requireNonNull(channel, "channel");
-        Objects.requireNonNull(profile, "profile");
-        long started = System.nanoTime();
-
+        long began = System.nanoTime();
         Map<SectionPos, BaseClusterTopology> topologies = new LinkedHashMap<>();
         for (SectionPos section : sections) {
-            BaseClusterTopology topology = service.topology(
-                    new TopologyService.ClusterKey(dimension, section)
-            );
-            if (topology == null) {
-                throw new IllegalStateException(
-                        "published connectivity index is missing topology for " + section
-                );
-            }
+            BaseClusterTopology topology = service.topology(new TopologyService.ClusterKey(dimension, section));
+            if (topology == null) throw new IllegalStateException("missing topology for " + section);
             topologies.putIfAbsent(section, topology);
         }
-
-        Map<NodeRef, List<NodeRef>> outgoing = new LinkedHashMap<>();
-        Map<NodeRef, List<NodeRef>> incoming = new LinkedHashMap<>();
+        List<NodeRef> nodes = new ArrayList<>();
+        Map<NodeRef, Integer> indexes = new HashMap<>();
         for (Map.Entry<SectionPos, BaseClusterTopology> entry : topologies.entrySet()) {
-            for (BaseClusterTopology.Component component : entry.getValue().components(channel)) {
-                NodeRef node = new NodeRef(entry.getKey(), component.id());
-                outgoing.put(node, new ArrayList<>());
-                incoming.put(node, new ArrayList<>());
+            for (int component = 0; component < entry.getValue().componentCount(); component++) {
+                NodeRef node = new NodeRef(entry.getKey(), component);
+                indexes.put(node, nodes.size());
+                nodes.add(node);
             }
         }
-
-        int directedEdges = 0;
-        for (Map.Entry<SectionPos, BaseClusterTopology> entry : topologies.entrySet()) {
-            SectionPos section = entry.getKey();
-            BaseClusterTopology topology = entry.getValue();
-            for (BaseClusterTopology.Component component : topology.components(channel)) {
-                NodeRef source = new NodeRef(section, component.id());
-                for (BaseClusterTopology.LocalConnection local
-                        : topology.outgoingConnections(component.id())) {
-                    if (profile.supports(local)) {
-                        directedEdges += addIndexedEdge(
-                                outgoing,
-                                incoming,
-                                source,
-                                new NodeRef(section, local.toComponent())
-                        );
-                    }
-                }
-                for (Direction face : Direction.values()) {
-                    if (!component.touches(face)) {
-                        continue;
-                    }
-                    SectionPos neighborSection = offset(section, face);
-                    BaseClusterTopology neighbor = topologies.get(neighborSection);
-                    if (neighbor == null) {
-                        continue;
-                    }
-                    for (BaseClusterTopology.Component target
-                            : neighbor.boundaryComponents(face.getOpposite(), channel)) {
-                        if (!SuperClusterTopology.boundaryBands(
-                                topology,
-                                component,
-                                neighbor,
-                                target,
-                                face,
-                                channel,
-                                profile
-                        ).isEmpty()) {
-                            directedEdges += addIndexedEdge(
-                                    outgoing,
-                                    incoming,
-                                    source,
-                                    new NodeRef(neighborSection, target.id())
-                            );
-                        }
+        List<Set<Integer>> edges = new ArrayList<>(nodes.size());
+        for (int ignored = 0; ignored < nodes.size(); ignored++) edges.add(new LinkedHashSet<>());
+        BaseClusterTopology.MovementKey movement = profile.movement(channel);
+        for (int sourceIndex = 0; sourceIndex < nodes.size(); sourceIndex++) {
+            NodeRef source = nodes.get(sourceIndex);
+            BaseClusterTopology topology = topologies.get(source.section);
+            for (int edge = topology.localEdgeStart(source.componentId);
+                 edge < topology.localEdgeEnd(source.componentId); edge++) {
+                if (topology.localEdgeSupports(edge, movement)) add(edges, indexes, sourceIndex,
+                        new NodeRef(source.section, topology.localEdgeTarget(edge)));
+            }
+            for (Direction face : Direction.values()) {
+                int minimum = face.getAxis().isVertical() ? 0 : -1;
+                int maximum = face.getAxis().isVertical() ? 0 : 1;
+                for (int yShift = minimum; yShift <= maximum; yShift++) {
+                    SectionPos targetSection = neighbor(source.section, face, yShift);
+                    BaseClusterTopology target = topologies.get(targetSection);
+                    if (target == null) continue;
+                    SuperClusterTopology.BoundaryLinks links =
+                            SuperClusterTopology.boundaryLinks(topology, target, face);
+                    for (int edge = links.edgeStart(source.componentId);
+                         edge < links.edgeEnd(source.componentId); edge++) {
+                        if (links.supports(edge, movement)) add(edges, indexes, sourceIndex,
+                                new NodeRef(targetSection, links.targetComponent(edge)));
                     }
                 }
             }
         }
-
-        List<NodeRef> finishOrder = directedFinishOrder(outgoing);
-        Map<NodeRef, Integer> stronglyConnected = new HashMap<>();
-        List<Integer> componentSizes = new ArrayList<>();
-        ArrayDeque<NodeRef> open = new ArrayDeque<>();
-        for (int index = finishOrder.size() - 1; index >= 0; index--) {
-            NodeRef seed = finishOrder.get(index);
-            if (stronglyConnected.containsKey(seed)) {
-                continue;
-            }
-            int componentId = componentSizes.size();
-            int componentSize = 0;
-            stronglyConnected.put(seed, componentId);
-            open.addLast(seed);
-            while (!open.isEmpty()) {
-                NodeRef current = open.removeFirst();
-                componentSize++;
-                for (NodeRef previous : incoming.getOrDefault(current, List.of())) {
-                    if (stronglyConnected.putIfAbsent(previous, componentId) == null) {
-                        open.addLast(previous);
-                    }
-                }
-            }
-            componentSizes.add(componentSize);
-        }
-
-        List<List<Integer>> componentOutgoing = condensationEdges(
-                outgoing,
-                stronglyConnected,
-                componentSizes.size()
-        );
-        return new PublishedConnectivity(
-                dimension,
-                channel,
-                profile,
-                Map.copyOf(topologies),
-                Map.copyOf(stronglyConnected),
-                List.copyOf(componentSizes),
-                componentOutgoing,
-                directedEdges,
-                System.nanoTime() - started
-        );
+        return new PublishedConnectivity(dimension, channel, profile, Map.copyOf(topologies),
+                List.copyOf(nodes), indexes, edges.stream().map(Set::stream)
+                .map(stream -> stream.sorted().toList()).toList(), System.nanoTime() - began);
     }
 
-    private static List<List<Integer>> condensationEdges(
-            Map<NodeRef, List<NodeRef>> outgoing,
-            Map<NodeRef, Integer> stronglyConnected,
-            int componentCount) {
-        List<Set<Integer>> mutable = new ArrayList<>(componentCount);
-        for (int component = 0; component < componentCount; component++) {
-            mutable.add(new LinkedHashSet<>());
-        }
-        outgoing.forEach((source, targets) -> {
-            int sourceComponent = stronglyConnected.get(source);
-            for (NodeRef target : targets) {
-                int targetComponent = stronglyConnected.get(target);
-                if (sourceComponent != targetComponent) {
-                    mutable.get(sourceComponent).add(targetComponent);
-                }
-            }
-        });
-        return mutable.stream()
-                .map(targets -> targets.stream().sorted().toList())
-                .toList();
-    }
-
-    private static int addIndexedEdge(Map<NodeRef, List<NodeRef>> outgoing,
-                                      Map<NodeRef, List<NodeRef>> incoming,
-                                      NodeRef source,
-                                      NodeRef target) {
-        List<NodeRef> sourceEdges = outgoing.get(source);
-        List<NodeRef> targetEdges = incoming.get(target);
-        if (sourceEdges == null || targetEdges == null) {
-            return 0;
-        }
-        sourceEdges.add(target);
-        targetEdges.add(source);
-        return 1;
-    }
-
-    private static List<NodeRef> directedFinishOrder(Map<NodeRef, List<NodeRef>> outgoing) {
-        List<NodeRef> result = new ArrayList<>(outgoing.size());
-        Set<NodeRef> visited = new HashSet<>();
-        ArrayDeque<NodeRef> nodes = new ArrayDeque<>();
-        ArrayDeque<Integer> neighborIndexes = new ArrayDeque<>();
-        for (NodeRef seed : outgoing.keySet()) {
-            if (!visited.add(seed)) {
-                continue;
-            }
-            nodes.addLast(seed);
-            neighborIndexes.addLast(0);
-            while (!nodes.isEmpty()) {
-                NodeRef current = nodes.peekLast();
-                int neighborIndex = neighborIndexes.removeLast();
-                List<NodeRef> neighbors = outgoing.getOrDefault(current, List.of());
-                if (neighborIndex < neighbors.size()) {
-                    neighborIndexes.addLast(neighborIndex + 1);
-                    NodeRef neighbor = neighbors.get(neighborIndex);
-                    if (visited.add(neighbor)) {
-                        nodes.addLast(neighbor);
-                        neighborIndexes.addLast(0);
-                    }
-                    continue;
-                }
-                nodes.removeLast();
-                result.add(current);
-            }
-        }
-        return result;
+    private static void add(List<Set<Integer>> edges, Map<NodeRef, Integer> indexes,
+                            int source, NodeRef target) {
+        Integer targetIndex = indexes.get(target);
+        if (targetIndex != null) edges.get(source).add(targetIndex);
     }
 
     public static final class PublishedConnectivity {
@@ -429,247 +865,124 @@ public final class TopologyGraphAudit {
         private final BaseClusterTopology.Channel channel;
         private final BaseClusterTopology.TraversalProfile profile;
         private final Map<SectionPos, BaseClusterTopology> topologies;
-        private final Map<NodeRef, Integer> stronglyConnected;
-        private final List<Integer> componentSizes;
-        private final List<List<Integer>> componentOutgoing;
-        private final Map<Integer, BitSet> reachabilityByComponent = new HashMap<>();
-        private final int directedEdges;
+        private final List<NodeRef> nodes;
+        private final Map<NodeRef, Integer> indexes;
+        private final List<List<Integer>> edges;
+        private final Map<Integer, BitSet> reachability = new HashMap<>();
         private final long buildNanos;
 
         private PublishedConnectivity(ResourceKey<Level> dimension,
                                       BaseClusterTopology.Channel channel,
                                       BaseClusterTopology.TraversalProfile profile,
                                       Map<SectionPos, BaseClusterTopology> topologies,
-                                      Map<NodeRef, Integer> stronglyConnected,
-                                      List<Integer> componentSizes,
-                                      List<List<Integer>> componentOutgoing,
-                                      int directedEdges,
-                                      long buildNanos) {
+                                      List<NodeRef> nodes, Map<NodeRef, Integer> indexes,
+                                      List<List<Integer>> edges, long buildNanos) {
             this.dimension = dimension;
             this.channel = channel;
             this.profile = profile;
             this.topologies = topologies;
-            this.stronglyConnected = stronglyConnected;
-            this.componentSizes = componentSizes;
-            this.componentOutgoing = componentOutgoing;
-            this.directedEdges = directedEdges;
+            this.nodes = nodes;
+            this.indexes = Map.copyOf(indexes);
+            this.edges = edges;
             this.buildNanos = buildNanos;
         }
 
-        public PairSelection selectPair(Collection<BlockPos> candidates,
-                                        double desiredDistance) {
-            Objects.requireNonNull(candidates, "candidates");
-            if (desiredDistance <= 0.0D) {
-                throw new IllegalArgumentException("desiredDistance must be positive");
-            }
-            long started = System.nanoTime();
-            CandidatePool pool = bindCandidates(candidates);
-            List<BoundCandidate> boundCandidates = pool.boundCandidates();
-
-            BoundCandidate bestStart = null;
-            BoundCandidate bestGoal = null;
-            double bestDistance = 0.0D;
-            double bestDifference = Double.POSITIVE_INFINITY;
-            long examinedPairs = 0L;
-            long reachablePairs = 0L;
-            search:
-            for (int first = 0; first < boundCandidates.size(); first++) {
-                BoundCandidate firstCandidate = boundCandidates.get(first);
-                for (int second = first + 1; second < boundCandidates.size(); second++) {
-                    BoundCandidate secondCandidate = boundCandidates.get(second);
-                    examinedPairs++;
-                    double directDistance = distance(
-                            firstCandidate.position(),
-                            secondCandidate.position()
-                    );
-                    double difference = Math.abs(directDistance - desiredDistance);
-                    if (difference >= bestDifference) {
-                        continue;
-                    }
-
-                    boolean forward = canReach(
-                            firstCandidate.strongComponent(),
-                            secondCandidate.strongComponent()
-                    );
-                    boolean reverse = canReach(
-                            secondCandidate.strongComponent(),
-                            firstCandidate.strongComponent()
-                    );
-                    if (!forward && !reverse) {
-                        continue;
-                    }
-                    reachablePairs++;
-                    bestStart = forward ? firstCandidate : secondCandidate;
-                    bestGoal = forward ? secondCandidate : firstCandidate;
-                    bestDifference = difference;
-                    bestDistance = directDistance;
-                    if (bestDifference == 0.0D) {
-                        break search;
-                    }
+        public PairSelection selectPair(Collection<BlockPos> candidates, double desiredDistance) {
+            List<BoundCandidate> bound = bind(candidates);
+            PairCandidate best = null;
+            long examined = 0, reachable = 0, began = System.nanoTime();
+            for (int first = 0; first < bound.size(); first++) for (int second = first + 1;
+                 second < bound.size(); second++) {
+                examined++;
+                BoundCandidate a = bound.get(first), b = bound.get(second);
+                double distance = distance(a.position, b.position);
+                double difference = Math.abs(distance - desiredDistance);
+                if (canReach(a.node, b.node)) {
+                    reachable++;
+                    if (best == null || difference < best.difference) best =
+                            new PairCandidate(a, b, distance, difference);
+                }
+                if (canReach(b.node, a.node)) {
+                    reachable++;
+                    if (best == null || difference < best.difference) best =
+                            new PairCandidate(b, a, distance, difference);
                 }
             }
-            if (bestStart == null || bestGoal == null) {
-                throw new IllegalStateException(
-                        "no directionally reachable candidate pair for " + dimension.location()
-                                + " at distance " + desiredDistance
-                );
-            }
-            int sourceComponent = bestStart.strongComponent();
-            int targetComponent = bestGoal.strongComponent();
-            return new PairSelection(
-                    bestStart.position(),
-                    bestGoal.position(),
-                    desiredDistance,
-                    bestDistance,
-                    pool.candidateCount(),
-                    boundCandidates.size(),
-                    pool.unboundCandidates(),
-                    sourceComponent,
-                    targetComponent,
-                    componentSizes.get(sourceComponent),
-                    componentSizes.get(targetComponent),
-                    reachableFrom(sourceComponent).cardinality(),
-                    examinedPairs,
-                    reachablePairs,
-                    System.nanoTime() - started
-            );
+            if (best == null) throw new IllegalStateException("no reachable candidate pair for "
+                    + dimension.location() + " at " + desiredDistance);
+            return selection(best, candidates.size(), bound.size(), desiredDistance,
+                    examined, reachable, System.nanoTime() - began);
         }
 
-        public List<PairSelection> selectDistinctStartPairs(
-                Collection<BlockPos> candidates,
-                double desiredDistance,
-                int count) {
-            Objects.requireNonNull(candidates, "candidates");
-            if (desiredDistance <= 0.0D || count <= 0) {
-                throw new IllegalArgumentException("distance and count must be positive");
+        public List<PairSelection> selectDistinctStartPairs(Collection<BlockPos> candidates,
+                                                            double desiredDistance, int count) {
+            List<BoundCandidate> bound = bind(candidates);
+            Map<SectionPos, PairCandidate> bestBySection = new LinkedHashMap<>();
+            long examined = 0, reachable = 0, began = System.nanoTime();
+            for (BoundCandidate start : bound) for (BoundCandidate goal : bound) {
+                if (start == goal) continue;
+                examined++;
+                if (!canReach(start.node, goal.node)) continue;
+                reachable++;
+                double distance = distance(start.position, goal.position);
+                PairCandidate offered = new PairCandidate(start, goal, distance,
+                        Math.abs(distance - desiredDistance));
+                bestBySection.merge(SectionPos.of(start.position), offered,
+                        (old, next) -> old.difference <= next.difference ? old : next);
             }
-            long started = System.nanoTime();
-            CandidatePool pool = bindCandidates(candidates);
-            List<BoundCandidate> bound = pool.boundCandidates();
-            Map<SectionPos, PairCandidate> bestByStart = new LinkedHashMap<>();
-            long examinedPairs = 0L;
-            long reachablePairs = 0L;
-            for (int first = 0; first < bound.size(); first++) {
-                BoundCandidate firstCandidate = bound.get(first);
-                for (int second = first + 1; second < bound.size(); second++) {
-                    BoundCandidate secondCandidate = bound.get(second);
-                    examinedPairs++;
-                    double directDistance = distance(
-                            firstCandidate.position(),
-                            secondCandidate.position()
-                    );
-                    double difference = Math.abs(directDistance - desiredDistance);
-                    if (offerPair(bestByStart, firstCandidate, secondCandidate,
-                            directDistance, difference)) {
-                        reachablePairs++;
-                    }
-                    if (offerPair(bestByStart, secondCandidate, firstCandidate,
-                            directDistance, difference)) {
-                        reachablePairs++;
-                    }
-                }
-            }
-            List<PairCandidate> selected = bestByStart.values().stream()
-                    .sorted(Comparator.comparingDouble(PairCandidate::difference)
-                            .thenComparingInt(pair -> SectionPos.of(pair.start().position()).x())
-                            .thenComparingInt(pair -> SectionPos.of(pair.start().position()).y())
-                            .thenComparingInt(pair -> SectionPos.of(pair.start().position()).z()))
-                    .limit(count)
-                    .toList();
-            if (selected.size() != count) {
-                throw new IllegalStateException(
-                        "only " + selected.size() + " distinct reachable start sections for "
-                                + dimension.location() + "; required " + count
-                );
-            }
-            long selectionNanos = System.nanoTime() - started;
-            long finalExaminedPairs = examinedPairs;
-            long finalReachablePairs = reachablePairs;
-            return selected.stream().map(pair -> {
-                int source = pair.start().strongComponent();
-                int target = pair.goal().strongComponent();
-                return new PairSelection(
-                        pair.start().position(),
-                        pair.goal().position(),
-                        desiredDistance,
-                        pair.directDistance(),
-                        pool.candidateCount(),
-                        bound.size(),
-                        pool.unboundCandidates(),
-                        source,
-                        target,
-                        componentSizes.get(source),
-                        componentSizes.get(target),
-                        reachableFrom(source).cardinality(),
-                        finalExaminedPairs,
-                        finalReachablePairs,
-                        selectionNanos
-                );
-            }).toList();
+            List<PairCandidate> selected = bestBySection.values().stream()
+                    .sorted(Comparator.comparingDouble(PairCandidate::difference)).limit(count).toList();
+            if (selected.size() != count) throw new IllegalStateException("insufficient distinct starts");
+            long elapsed = System.nanoTime() - began, finalExamined = examined, finalReachable = reachable;
+            return selected.stream().map(pair -> selection(pair, candidates.size(), bound.size(),
+                    desiredDistance, finalExamined, finalReachable, elapsed)).toList();
         }
 
-        private boolean offerPair(Map<SectionPos, PairCandidate> bestByStart,
-                                  BoundCandidate start,
-                                  BoundCandidate goal,
-                                  double directDistance,
-                                  double difference) {
-            SectionPos section = SectionPos.of(start.position());
-            PairCandidate previous = bestByStart.get(section);
-            if (previous != null && difference >= previous.difference()) {
-                return false;
-            }
-            if (!canReach(start.strongComponent(), goal.strongComponent())) {
-                return false;
-            }
-            bestByStart.put(section, new PairCandidate(
-                    start,
-                    goal,
-                    directDistance,
-                    difference
-            ));
-            return true;
-        }
-
-        private CandidatePool bindCandidates(Collection<BlockPos> candidates) {
-            List<BoundCandidate> bound = new ArrayList<>();
+        private List<BoundCandidate> bind(Collection<BlockPos> positions) {
             Set<BlockPos> unique = new LinkedHashSet<>();
-            int unbound = 0;
-            for (BlockPos candidate : candidates) {
-                BlockPos immutable = Objects.requireNonNull(candidate, "candidate").immutable();
-                if (!unique.add(immutable)) {
-                    continue;
-                }
-                BoundCandidate candidateBinding = bindCandidate(immutable);
-                if (candidateBinding == null) {
-                    unbound++;
-                } else {
-                    bound.add(candidateBinding);
-                }
+            List<BoundCandidate> result = new ArrayList<>();
+            for (BlockPos position : positions) if (unique.add(position.immutable())) {
+                BoundCandidate bound = bind(position);
+                if (bound != null) result.add(bound);
             }
-            return new CandidatePool(List.copyOf(bound), unique.size(), unbound);
+            return List.copyOf(result);
         }
 
-        private boolean canReach(int sourceComponent, int targetComponent) {
-            return reachableFrom(sourceComponent).get(targetComponent);
+        @Nullable
+        private BoundCandidate bind(BlockPos position) {
+            for (BlockPos candidate : candidateAnchors(position)) {
+                BaseClusterTopology topology = topologies.get(SectionPos.of(candidate));
+                if (topology == null || topology.geometry().channel() != channel) continue;
+                int component = topology.componentAt(Math.floorMod(candidate.getX(), 16),
+                        Math.floorMod(candidate.getY(), 16), Math.floorMod(candidate.getZ(), 16));
+                Integer node = component < 0 ? null : indexes.get(new NodeRef(topology.section(), component));
+                if (node != null) return new BoundCandidate(position.immutable(), node);
+            }
+            return null;
         }
 
-        private BitSet reachableFrom(int sourceComponent) {
-            return reachabilityByComponent.computeIfAbsent(sourceComponent, source -> {
-                BitSet reached = new BitSet(componentOutgoing.size());
+        private boolean canReach(int source, int target) { return reachable(source).get(target); }
+
+        private BitSet reachable(int source) {
+            return reachability.computeIfAbsent(source, ignored -> {
+                BitSet reached = new BitSet(nodes.size());
                 ArrayDeque<Integer> open = new ArrayDeque<>();
                 reached.set(source);
-                open.addLast(source);
-                while (!open.isEmpty()) {
-                    int current = open.removeFirst();
-                    for (int target : componentOutgoing.get(current)) {
-                        if (!reached.get(target)) {
-                            reached.set(target);
-                            open.addLast(target);
-                        }
-                    }
+                open.add(source);
+                while (!open.isEmpty()) for (int target : edges.get(open.removeFirst())) {
+                    if (!reached.get(target)) { reached.set(target); open.addLast(target); }
                 }
                 return reached;
             });
+        }
+
+        private PairSelection selection(PairCandidate pair, int candidates, int bound,
+                                        double requested, long examined, long reachable,
+                                        long elapsed) {
+            return new PairSelection(pair.start.position, pair.goal.position, requested,
+                    pair.distance, candidates, bound, candidates - bound, pair.start.node,
+                    pair.goal.node, 1, 1, reachable(pair.start.node).cardinality(),
+                    examined, reachable, elapsed);
         }
 
         public Map<String, Object> report() {
@@ -678,730 +991,112 @@ public final class TopologyGraphAudit {
             report.put("channel", channel.name());
             report.put("profile", profile.toString());
             report.put("sections", topologies.size());
-            report.put("directedNodes", stronglyConnected.size());
-            report.put("directedEdges", directedEdges);
-            report.put("stronglyConnectedComponents", componentSizes.size());
-            report.put("condensationEdges", componentOutgoing.stream()
-                    .mapToInt(List::size)
-                    .sum());
-            report.put("largestStrongComponentNodes", componentSizes.stream()
-                    .mapToInt(Integer::intValue)
-                    .max()
-                    .orElse(0));
-            report.put("buildMillis", nanosToMillis(buildNanos));
+            report.put("directedNodes", nodes.size());
+            report.put("directedEdges", edges.stream().mapToInt(List::size).sum());
+            report.put("buildMillis", millis(buildNanos));
             report.put("timingExcludedFromMacroTiming", true);
-            report.put("proofScope", "PUBLISHED_BASE_GRAPH_DIRECTED_REACHABILITY");
+            report.put("proofScope", "PUBLISHED_PRIMITIVE_BASE_GRAPH_REACHABILITY");
             return report;
-        }
-
-        @Nullable
-        private BoundCandidate bindCandidate(BlockPos position) {
-            SectionPos section = SectionPos.of(position);
-            BaseClusterTopology topology = topologies.get(section);
-            if (topology == null) {
-                return null;
-            }
-            BaseClusterTopology.Component component = topology.nearestComponent(
-                    channel,
-                    Math.floorMod(position.getX(), BaseClusterTopology.SIDE),
-                    Math.floorMod(position.getY(), BaseClusterTopology.SIDE),
-                    Math.floorMod(position.getZ(), BaseClusterTopology.SIDE),
-                    2
-            );
-            if (component == null) {
-                return null;
-            }
-            Integer strongComponent = stronglyConnected.get(
-                    new NodeRef(section, component.id())
-            );
-            return strongComponent == null
-                    ? null
-                    : new BoundCandidate(position, strongComponent);
         }
     }
 
-    public record PairSelection(BlockPos start,
-                                BlockPos goal,
-                                double requestedDistance,
-                                double directDistance,
-                                int candidateCount,
-                                int boundCandidateCount,
-                                int unboundCandidateCount,
-                                int sourceStrongComponentId,
-                                int targetStrongComponentId,
-                                int sourceStrongComponentNodes,
-                                int targetStrongComponentNodes,
-                                int reachableStrongComponentsFromSource,
-                                long examinedCandidatePairs,
-                                long reachableCandidatePairs,
+    public record PairSelection(BlockPos start, BlockPos goal, double requestedDistance,
+                                double directDistance, int candidateCount, int boundCandidateCount,
+                                int unboundCandidateCount, int sourceStrongComponentId,
+                                int targetStrongComponentId, int sourceStrongComponentNodes,
+                                int targetStrongComponentNodes, int reachableStrongComponentsFromSource,
+                                long examinedCandidatePairs, long reachableCandidatePairs,
                                 long selectionNanos) {
-
-        public PairSelection {
-            start = start.immutable();
-            goal = goal.immutable();
-        }
+        public PairSelection { start = start.immutable(); goal = goal.immutable(); }
 
         public Map<String, Object> report() {
             Map<String, Object> report = new LinkedHashMap<>();
-            report.put("method", "PUBLISHED_BASE_GRAPH_CONDENSATION_REACHABILITY");
-            report.put("proofScope", "STRUCTURAL_DIRECTED_REACHABILITY");
+            report.put("method", "PUBLISHED_PRIMITIVE_BASE_GRAPH_REACHABILITY");
             report.put("requestedDistance", requestedDistance);
             report.put("directDistance", directDistance);
             report.put("candidateCount", candidateCount);
             report.put("boundCandidateCount", boundCandidateCount);
             report.put("unboundCandidateCount", unboundCandidateCount);
-            report.put("sourceStrongComponentId", sourceStrongComponentId);
-            report.put("targetStrongComponentId", targetStrongComponentId);
-            report.put("sameStrongComponent", sourceStrongComponentId == targetStrongComponentId);
-            report.put("sourceStrongComponentNodes", sourceStrongComponentNodes);
-            report.put("targetStrongComponentNodes", targetStrongComponentNodes);
-            report.put("reachableStrongComponentsFromSource", reachableStrongComponentsFromSource);
+            report.put("sourceNodeId", sourceStrongComponentId);
+            report.put("targetNodeId", targetStrongComponentId);
+            report.put("reachableNodesFromSource", reachableStrongComponentsFromSource);
             report.put("examinedCandidatePairs", examinedCandidatePairs);
             report.put("reachableCandidatePairs", reachableCandidatePairs);
-            report.put("selectionMillis", nanosToMillis(selectionNanos));
-            report.put("timingExcludedFromMacroTiming", true);
-            report.put("physicalExecutabilityClaimed", false);
+            report.put("selectionMillis", millis(selectionNanos));
             return report;
         }
     }
 
-    private record BoundCandidate(BlockPos position, int strongComponent) {
-    }
-
-    private record CandidatePool(List<BoundCandidate> boundCandidates,
-                                 int candidateCount,
-                                 int unboundCandidates) {
-    }
-
-    private record PairCandidate(BoundCandidate start,
-                                 BoundCandidate goal,
-                                 double directDistance,
-                                 double difference) {
-    }
-
-    private boolean initialize() {
-        SectionPos startSection = SectionPos.of(start);
-        SectionPos goalSection = SectionPos.of(goal);
-        BaseClusterTopology startTopology = topology(startSection);
-        BaseClusterTopology goalTopology = topology(goalSection);
-        if (startTopology == null || goalTopology == null) {
-            if (startTopology == null) {
-                request(startSection);
-            }
-            if (goalTopology == null) {
-                request(goalSection);
-            }
-            return false;
-        }
-
-        startBinding = bind(startSection, startTopology, start);
-        goalBinding = bind(goalSection, goalTopology, goal);
-        initialized = true;
-        if (startBinding == null || goalBinding == null) {
-            status = Status.ENDPOINT_UNBOUND;
-            detail = startBinding == null && goalBinding == null
-                    ? "START_AND_GOAL_UNBOUND"
-                    : startBinding == null ? "START_UNBOUND" : "GOAL_UNBOUND";
-            return false;
-        }
-        discover(null, startBinding);
-        return true;
-    }
-
-    private boolean completeRequests() {
-        if (requests.isEmpty()) {
-            return true;
-        }
-        if (requests.values().stream().anyMatch(request -> !request.isDone())) {
-            return false;
-        }
-        for (Map.Entry<TopologyService.ClusterKey, CompletableFuture<BaseClusterTopology>> entry
-                : List.copyOf(requests.entrySet())) {
-            try {
-                entry.getValue().join();
-                completedSections++;
-            } catch (RuntimeException failure) {
-                failedSections++;
-                unavailableSections.add(entry.getKey().section());
-            }
-            requests.remove(entry.getKey());
-        }
-        return true;
-    }
-
-    private boolean requestMissingNeighbors(NodeRef current) {
-        BaseClusterTopology topology = requireTopology(current.section());
-        BaseClusterTopology.Component component = topology.component(current.componentId());
-        boolean ready = true;
-        for (Direction face : Direction.values()) {
-            if (!component.touches(face)) {
-                continue;
-            }
-            SectionPos neighbor = offset(current.section(), face);
-            if (!validHeight(neighbor) || topology(neighbor) != null
-                    || unavailableSections.contains(neighbor)) {
-                continue;
-            }
-            if (!chunkLoaded(neighbor)) {
-                unavailableSections.add(neighbor);
-                continue;
-            }
-            request(neighbor);
-            ready = false;
-        }
-        return ready;
-    }
-
-    private void expand(NodeRef current) {
-        BaseClusterTopology topology = requireTopology(current.section());
-        BaseClusterTopology.Component component = topology.component(current.componentId());
-        visit(current, component);
-
-        for (BaseClusterTopology.LocalConnection local
-                : topology.outgoingConnections(component.id())) {
-            if (profile.supports(local)) {
-                generatedConnections++;
-                discover(current, new NodeRef(current.section(), local.toComponent()));
-                if (status != Status.RUNNING) {
-                    return;
-                }
+    private static List<BlockPos> candidateAnchors(BlockPos center) {
+        List<BlockPos> result = new ArrayList<>(25);
+        for (int distance = 0; distance <= 2; distance++) for (int dy = -distance; dy <= distance; dy++) {
+            for (int dz = -distance; dz <= distance; dz++) {
+                int dx = distance - Math.abs(dy) - Math.abs(dz);
+                if (dx < 0) continue;
+                result.add(center.offset(dx == 0 ? 0 : -dx, dy, dz));
+                if (dx != 0) result.add(center.offset(dx, dy, dz));
             }
         }
-
-        for (Direction face : Direction.values()) {
-            if (!component.touches(face)) {
-                continue;
-            }
-            SectionPos neighborSection = offset(current.section(), face);
-            BaseClusterTopology neighbor = topology(neighborSection);
-            if (neighbor == null) {
-                continue;
-            }
-            for (BaseClusterTopology.Component target
-                    : neighbor.boundaryComponents(face.getOpposite(), channel)) {
-                if (SuperClusterTopology.boundaryBands(
-                        topology,
-                        component,
-                        neighbor,
-                        target,
-                        face,
-                        channel,
-                        profile
-                ).isEmpty()) {
-                    continue;
-                }
-                generatedConnections++;
-                discover(current, new NodeRef(neighborSection, target.id()));
-                if (status != Status.RUNNING) {
-                    return;
-                }
-            }
-        }
+        return List.copyOf(result);
     }
 
-    private void discover(@Nullable NodeRef from, NodeRef target) {
-        if (!discovered.add(target)) {
-            return;
-        }
-        if (discovered.size() > nodeLimit) {
-            status = Status.LIMIT_REACHED;
-            detail = "REFERENCE_NODE_LIMIT_REACHED";
-            return;
-        }
-        if (from != null) {
-            previous.put(target, from);
-        }
-        open.addLast(target);
-        if (target.equals(goalBinding)) {
-            reached = target;
-            status = Status.FOUND;
-            detail = "BASE_COMPONENT_ROUTE_FOUND";
-        }
+    private static SectionPos neighbor(SectionPos source, Direction face, int yShift) {
+        SectionPos direct = SuperClusterTopology.offset(source, face, 1);
+        return face.getAxis().isVertical() ? direct
+                : SectionPos.of(direct.x(), direct.y() + yShift, direct.z());
     }
 
-    private void visit(NodeRef node, BaseClusterTopology.Component component) {
-        SectionPos section = node.section();
-        visitedSections.add(section);
-        minSectionX = Math.min(minSectionX, section.x());
-        minSectionY = Math.min(minSectionY, section.y());
-        minSectionZ = Math.min(minSectionZ, section.z());
-        maxSectionX = Math.max(maxSectionX, section.x());
-        maxSectionY = Math.max(maxSectionY, section.y());
-        maxSectionZ = Math.max(maxSectionZ, section.z());
-        double distance = distance(anchor(section, component), goal);
-        if (distance < nearestDistance) {
-            nearestDistance = distance;
-            nearest = node;
-        }
+    private static double distance(BlockPos first, BlockPos second) {
+        return Math.sqrt(first.distSqr(second));
     }
 
-    private void request(SectionPos section) {
-        if (!validHeight(section) || requests.keySet().stream()
-                .anyMatch(key -> key.section().equals(section))) {
-            return;
-        }
-        if (!chunkLoaded(section)) {
-            unavailableSections.add(section);
-            return;
-        }
-        TopologyService.ClusterKey key = new TopologyService.ClusterKey(level.dimension(), section);
-        requests.put(key, requestClusterDependency(
-                service,
-                level,
-                section,
-                NavigationScheduler.Priority.BACKGROUND
-        ));
-        requestedSections++;
-    }
-
-    private Map<String, Object> bindingReport(@Nullable NodeRef binding, BlockPos requested) {
-        Map<String, Object> report = new LinkedHashMap<>();
-        report.put("requested", positionMap(requested));
-        report.put("section", sectionMap(SectionPos.of(requested)));
-        report.put("bound", binding != null);
-        if (binding != null) {
-            report.putAll(nodeReport(binding));
-            BlockPos matchedCell = matchedBindingCell(binding, requested);
-            report.put("matchedCell", positionMap(matchedCell));
-            report.put("bindingDistanceBlocks", distance(matchedCell, requested));
-            report.put("componentAnchorDistanceBlocks", distance(anchor(binding), requested));
-        }
-        return report;
-    }
-
-    private BlockPos matchedBindingCell(NodeRef binding, BlockPos requested) {
-        BaseClusterTopology topology = requireTopology(binding.section());
-        int x = Math.floorMod(requested.getX(), BaseClusterTopology.SIDE);
-        int y = Math.floorMod(requested.getY(), BaseClusterTopology.SIDE);
-        int z = Math.floorMod(requested.getZ(), BaseClusterTopology.SIDE);
-        for (int distance = 0; distance <= 2; distance++) {
-            for (int dy = -distance; dy <= distance; dy++) {
-                for (int dz = -distance; dz <= distance; dz++) {
-                    int dxMagnitude = distance - Math.abs(dy) - Math.abs(dz);
-                    if (dxMagnitude < 0) {
-                        continue;
-                    }
-                    for (int sign : dxMagnitude == 0 ? new int[]{1} : new int[]{-1, 1}) {
-                        int nx = x + sign * dxMagnitude;
-                        int ny = y + dy;
-                        int nz = z + dz;
-                        if ((nx | ny | nz) < 0 || nx >= BaseClusterTopology.SIDE
-                                || ny >= BaseClusterTopology.SIDE
-                                || nz >= BaseClusterTopology.SIDE) {
-                            continue;
-                        }
-                        BaseClusterTopology.Component candidate = topology.componentAt(
-                                channel,
-                                nx,
-                                ny,
-                                nz
-                        );
-                        if (candidate != null && candidate.id() == binding.componentId()) {
-                            return new BlockPos(
-                                    binding.section().minBlockX() + nx,
-                                    binding.section().minBlockY() + ny,
-                                    binding.section().minBlockZ() + nz
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        throw new IllegalStateException("could not reproduce endpoint binding for " + requested);
-    }
-
-    private Map<String, Object> nodeReport(@Nullable NodeRef node) {
-        if (node == null) {
-            return Map.of();
-        }
-        BaseClusterTopology topology = topology(node.section());
-        if (topology == null) {
-            return Map.of(
-                    "section", sectionMap(node.section()),
-                    "componentId", node.componentId(),
-                    "topologyPresent", false
-            );
-        }
-        BaseClusterTopology.Component component = topology.component(node.componentId());
-        Map<String, Object> report = new LinkedHashMap<>();
-        report.put("section", sectionMap(node.section()));
-        report.put("componentId", node.componentId());
-        report.put("anchor", positionMap(anchor(node.section(), component)));
-        report.put("cells", component.cellCount());
-        report.put("boundaryFaceMask", component.boundaryFaceMask());
-        report.put("requiresExactCheck", component.requiresExactCheck());
-        report.put("topologyRevision", topology.revision());
-        return report;
-    }
-
-    private Map<String, Object> sectionBounds() {
-        if (visitedSections.isEmpty()) {
-            return Map.of();
-        }
-        return Map.of(
-                "min", Map.of("x", minSectionX, "y", minSectionY, "z", minSectionZ),
-                "max", Map.of("x", maxSectionX, "y", maxSectionY, "z", maxSectionZ)
-        );
-    }
-
-    private Map<String, Object> frontierReport(@Nullable NodeRef node) {
-        if (node == null) {
-            return Map.of();
-        }
-        BaseClusterTopology topology = topology(node.section());
-        if (topology == null) {
-            return Map.of("component", nodeReport(node));
-        }
-        BaseClusterTopology.Component source = topology.component(node.componentId());
-        List<Map<String, Object>> boundaries = new ArrayList<>();
-        int allowedLocal = 0;
-        int rejectedLocal = 0;
-        for (BaseClusterTopology.LocalConnection local
-                : topology.outgoingConnections(source.id())) {
-            if (profile.supports(local)) {
-                allowedLocal++;
-            } else {
-                rejectedLocal++;
-            }
-        }
-        for (Direction face : Direction.values()) {
-            Map<String, Object> boundary = boundaryReport(node.section(), topology, source, face);
-            boundaries.add(boundary);
-        }
-        boundaries.sort(Comparator.comparingDouble(boundary ->
-                distance(sectionCenter(sectionFromMap(boundary.get("neighborSection"))), goal)));
-
-        Map<String, Object> report = new LinkedHashMap<>();
-        report.put("component", nodeReport(node));
-        report.put("allowedLocalConnections", allowedLocal);
-        report.put("profileRejectedLocalConnections", rejectedLocal);
-        report.put("boundaries", boundaries);
-        return report;
-    }
-
-    private Map<String, Object> boundaryReport(SectionPos sourceSection,
-                                                BaseClusterTopology sourceTopology,
-                                                BaseClusterTopology.Component source,
-                                                Direction face) {
-        SectionPos neighborSection = offset(sourceSection, face);
-        Map<String, Object> report = new LinkedHashMap<>();
-        report.put("face", face.getName());
-        report.put("neighborSection", sectionMap(neighborSection));
-        report.put("sourceTouchesFace", source.touches(face));
-        report.put("sourceBoundaryCells", bitCount(source.boundaryMask(face)));
-        if (!source.touches(face)) {
-            report.put("result", "SOURCE_NOT_ON_BOUNDARY");
-            return report;
-        }
-        if (!validHeight(neighborSection)) {
-            report.put("result", "OUTSIDE_BUILD_HEIGHT");
-            return report;
-        }
-        BaseClusterTopology neighbor = topology(neighborSection);
-        if (neighbor == null) {
-            report.put("result", chunkLoaded(neighborSection)
-                    ? "TOPOLOGY_NOT_PUBLISHED"
-                    : "CHUNK_NOT_LOADED");
-            return report;
-        }
-
-        int targets = 0;
-        int rawOverlaps = 0;
-        int compatibleTargets = 0;
-        int compatibleBands = 0;
-        for (BaseClusterTopology.Component target
-                : neighbor.boundaryComponents(face.getOpposite(), channel)) {
-            targets++;
-            rawOverlaps += rawOverlapCells(source, target, face, profile);
-            List<SuperClusterTopology.BoundaryBand> bands =
-                    SuperClusterTopology.boundaryBands(
-                            sourceTopology,
-                            source,
-                            neighbor,
-                            target,
-                            face,
-                            channel,
-                            profile
-                    );
-            if (!bands.isEmpty()) {
-                compatibleTargets++;
-                compatibleBands += bands.size();
-            }
-        }
-        report.put("targetBoundaryComponents", targets);
-        report.put("rawOverlapCells", rawOverlaps);
-        report.put("profileCompatibleTargets", compatibleTargets);
-        report.put("profileCompatibleBands", compatibleBands);
-        report.put("result", compatibleTargets > 0
-                ? "CONNECTED"
-                : targets == 0
-                ? "NO_TARGET_BOUNDARY_COMPONENT"
-                : rawOverlaps == 0
-                ? "NO_GEOMETRIC_OVERLAP"
-                : "PROFILE_WIDTH_OR_HEADROOM_REJECTED");
-        return report;
-    }
-
-    private int rawOverlapCells(BaseClusterTopology.Component source,
-                                BaseClusterTopology.Component target,
-                                Direction face,
-                                BaseClusterTopology.TraversalProfile profile) {
-        Direction opposite = face.getOpposite();
-        int maximum = channel == BaseClusterTopology.Channel.VOLUME || face.getAxis().isVertical()
-                ? 0
-                : Math.max(profile.maxStep(), profile.maxDrop());
-        int overlaps = 0;
-        for (int shift = -maximum; shift <= maximum; shift++) {
-            if (shift > profile.maxStep() || -shift > profile.maxDrop()) {
-                continue;
-            }
-            for (int v = 0; v < BaseClusterTopology.SIDE; v++) {
-                int targetV = v + shift;
-                if (targetV < 0 || targetV >= BaseClusterTopology.SIDE) {
-                    continue;
-                }
-                for (int u = 0; u < BaseClusterTopology.SIDE; u++) {
-                    int sourceIndex = (v << 4) | u;
-                    int targetIndex = (targetV << 4) | u;
-                    if (bitSet(source, face, sourceIndex)
-                            && bitSet(target, opposite, targetIndex)) {
-                        overlaps++;
-                    }
-                }
-            }
-        }
-        return overlaps;
-    }
-
-    private List<NodeRef> witness() {
-        NodeRef end = reached != null ? reached : nearest;
-        if (end == null) {
-            return List.of();
-        }
-        ArrayDeque<NodeRef> reversed = new ArrayDeque<>();
-        for (NodeRef current = end; current != null; current = previous.get(current)) {
-            reversed.addFirst(current);
-        }
-        return List.copyOf(reversed);
-    }
-
-    @Nullable
-    private NodeRef bind(SectionPos section,
-                         BaseClusterTopology topology,
-                         BlockPos position) {
-        BaseClusterTopology.Component component = topology.nearestComponent(
-                channel,
-                Math.floorMod(position.getX(), BaseClusterTopology.SIDE),
-                Math.floorMod(position.getY(), BaseClusterTopology.SIDE),
-                Math.floorMod(position.getZ(), BaseClusterTopology.SIDE),
-                2
-        );
-        return component == null ? null : new NodeRef(section, component.id());
-    }
-
-    @Nullable
-    private BaseClusterTopology topology(SectionPos section) {
-        return service.topology(new TopologyService.ClusterKey(level.dimension(), section));
-    }
-
-    private BaseClusterTopology requireTopology(SectionPos section) {
-        BaseClusterTopology topology = topology(section);
-        if (topology == null) {
-            throw new IllegalStateException("audit topology is unavailable for " + section);
-        }
-        return topology;
-    }
-
-    private boolean chunkLoaded(SectionPos section) {
-        return level.getChunkSource().getChunkNow(section.x(), section.z()) != null;
-    }
-
-    private boolean validHeight(SectionPos section) {
-        return section.y() >= level.getMinSection() && section.y() < level.getMaxSection();
-    }
-
-    private BlockPos anchor(NodeRef node) {
-        return anchor(node.section(), requireTopology(node.section()).component(node.componentId()));
-    }
-
-    private static BlockPos anchor(SectionPos section,
-                                   BaseClusterTopology.Component component) {
-        return new BlockPos(
-                section.minBlockX() + component.anchorX(),
-                section.minBlockY() + component.anchorY(),
-                section.minBlockZ() + component.anchorZ()
-        );
-    }
-
-    private static void verifyConnection(TopologyService service,
-                                         ResourceKey<Level> dimension,
-                                         MacroSearch.Connection connection,
-                                         BaseClusterTopology.TraversalProfile profile,
-                                         int index,
-                                         List<String> errors) {
-        if (connection.transition() instanceof MacroSearch.AggregateTransition) {
-            errors.add("connection " + index + " leaked an aggregate transition");
-            return;
-        }
-        if (connection.transition() instanceof MacroSearch.MembershipTransition) {
-            verifyMembership(service, dimension, connection, index, errors);
-            return;
-        }
-        if (!(connection.from() instanceof MacroSearch.ComponentEndpoint from)
-                || !(connection.to() instanceof MacroSearch.ComponentEndpoint to)) {
-            errors.add("connection " + index + " has non-component structural endpoints");
-            return;
-        }
-        BaseClusterTopology source = service.topology(
-                new TopologyService.ClusterKey(dimension, from.section())
-        );
-        BaseClusterTopology target = service.topology(
-                new TopologyService.ClusterKey(dimension, to.section())
-        );
-        if (source == null || target == null) {
-            errors.add("connection " + index + " references unavailable topology");
-            return;
-        }
-        if (source.revision() != from.revision() || target.revision() != to.revision()) {
-            errors.add("connection " + index + " references stale topology");
-            return;
-        }
-        BaseClusterTopology.Component sourceComponent = source.component(from.componentId());
-        BaseClusterTopology.Component targetComponent = target.component(to.componentId());
-        if (connection.transition() instanceof MacroSearch.LocalTransition local) {
-            BaseClusterTopology.LocalConnection requirement = local.requirement();
-            if (!from.section().equals(to.section())
-                    || requirement.fromComponent() != from.componentId()
-                    || requirement.toComponent() != to.componentId()
-                    || !source.outgoingConnections(from.componentId()).contains(requirement)
-                    || !profile.supports(requirement)) {
-                errors.add("connection " + index + " has an invalid local transition");
-            }
-            return;
-        }
-        if (connection.transition() instanceof MacroSearch.BoundaryTransition boundary) {
-            if (!offset(from.section(), boundary.face()).equals(to.section())) {
-                errors.add("connection " + index + " crosses a non-adjacent section boundary");
-                return;
-            }
-            List<SuperClusterTopology.BoundaryBand> recomputed =
-                    SuperClusterTopology.boundaryBands(
-                            source,
-                            sourceComponent,
-                            target,
-                            targetComponent,
-                            boundary.face(),
-                            from.channel(),
-                            profile
-                    );
-            if (recomputed.isEmpty()) {
-                errors.add("connection " + index + " no longer has a compatible boundary band");
-            }
-            return;
-        }
-        errors.add("connection " + index + " has an unknown transition type");
-    }
-
-    private static void verifyMembership(TopologyService service,
-                                         ResourceKey<Level> dimension,
-                                         MacroSearch.Connection connection,
-                                         int index,
-                                         List<String> errors) {
-        MacroSearch.ExactEndpoint exact;
-        MacroSearch.ComponentEndpoint component;
-        if (connection.from() instanceof MacroSearch.ExactEndpoint from
-                && connection.to() instanceof MacroSearch.ComponentEndpoint to) {
-            exact = from;
-            component = to;
-        } else if (connection.from() instanceof MacroSearch.ComponentEndpoint from
-                && connection.to() instanceof MacroSearch.ExactEndpoint to) {
-            exact = to;
-            component = from;
-        } else {
-            errors.add("connection " + index + " has invalid membership endpoints");
-            return;
-        }
-        BaseClusterTopology topology = service.topology(
-                new TopologyService.ClusterKey(dimension, component.section())
-        );
-        if (topology == null || topology.revision() != component.revision()) {
-            errors.add("connection " + index + " membership topology is unavailable or stale");
-            return;
-        }
-        BaseClusterTopology.Component bound = topology.nearestComponent(
-                component.channel(),
-                Math.floorMod(exact.anchor().getX(), BaseClusterTopology.SIDE),
-                Math.floorMod(exact.anchor().getY(), BaseClusterTopology.SIDE),
-                Math.floorMod(exact.anchor().getZ(), BaseClusterTopology.SIDE),
-                2
-        );
-        if (bound == null || bound.id() != component.componentId()) {
-            errors.add("connection " + index + " membership does not match endpoint binding");
-        }
-    }
-
-    private static boolean bitSet(BaseClusterTopology.Component component,
-                                  Direction face,
-                                  int index) {
-        return (component.boundaryMaskWord(face, index >>> 6)
-                & (1L << (index & 63))) != 0L;
-    }
-
-    private static int bitCount(long[] words) {
-        int result = 0;
-        for (long word : words) {
-            result += Long.bitCount(word);
-        }
-        return result;
-    }
-
-    private static SectionPos offset(SectionPos section, Direction face) {
-        return SectionPos.of(
-                section.x() + face.getStepX(),
-                section.y() + face.getStepY(),
-                section.z() + face.getStepZ()
-        );
-    }
-
-    private static BlockPos sectionCenter(SectionPos section) {
-        return new BlockPos(section.minBlockX() + 8, section.minBlockY() + 8,
-                section.minBlockZ() + 8);
-    }
-
-    @SuppressWarnings("unchecked")
-    private static SectionPos sectionFromMap(Object value) {
-        Map<String, Integer> section = (Map<String, Integer>) value;
-        return SectionPos.of(section.get("x"), section.get("y"), section.get("z"));
-    }
+    private static double millis(long nanos) { return nanos / 1_000_000.0D; }
 
     private static Map<String, Integer> sectionMap(SectionPos section) {
         return Map.of("x", section.x(), "y", section.y(), "z", section.z());
     }
 
-    private static Map<String, Integer> positionMap(BlockPos position) {
-        return Map.of("x", position.getX(), "y", position.getY(), "z", position.getZ());
+    private record NodeRef(SectionPos section, int componentId) {}
+    private record BoundCandidate(BlockPos position, int node) {}
+    private record PairCandidate(BoundCandidate start, BoundCandidate goal,
+                                 double distance, double difference) {}
+    private record CachedParent(SuperClusterTopology topology,
+                                @Nullable Object cacheEntry,
+                                String source,
+                                boolean counted) {
+        private CachedParent countedCopy() {
+            return counted ? this : new CachedParent(topology, cacheEntry, source, true);
+        }
+    }
+    private record LinkResolution(@Nullable SuperClusterTopology.CrossingIndex links,
+                                  String source,
+                                  String cachedStatus) {}
+    private record ProjectionResult(boolean mapped,
+                                    boolean conclusive,
+                                    String kind,
+                                    String code,
+                                    Map<String, Object> detail) {
+        private static ProjectionResult mapped(String kind, Map<String, Object> detail) {
+            return new ProjectionResult(true, true, kind, "MAPPED", Map.copyOf(detail));
+        }
+
+        private static ProjectionResult missing(String code,
+                                                boolean conclusive,
+                                                Map<String, Object> detail) {
+            return new ProjectionResult(false, conclusive, "MISSING", code,
+                    Map.copyOf(detail));
+        }
+
+        private Map<String, Object> report() {
+            return Map.of(
+                    "mapped", mapped,
+                    "conclusive", conclusive,
+                    "kind", kind,
+                    "code", code,
+                    "detail", detail
+            );
+        }
     }
 
-    private static double distance(BlockPos first, BlockPos second) {
-        double dx = second.getX() - first.getX();
-        double dy = second.getY() - first.getY();
-        double dz = second.getZ() - first.getZ();
-        return Math.sqrt(dx * dx + dy * dy + dz * dz);
-    }
-
-    private static double nanosToMillis(long nanos) {
-        return nanos / 1_000_000.0D;
-    }
-
-    public enum Status {
-        RUNNING,
-        FOUND,
-        EXHAUSTED,
-        LIMIT_REACHED,
-        INCOMPLETE,
-        ENDPOINT_UNBOUND
-    }
-
-    private record NodeRef(SectionPos section, int componentId) {
-    }
+    public enum Status { RUNNING, FOUND, EXHAUSTED, INCOMPLETE }
 }

@@ -1,123 +1,188 @@
 package com.scarasol.acceleratednavigation.topology;
 
-import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BaseClusterTopologyTest {
 
     @Test
-    void buildsSectionComponentsWithExactBoundaryMasksAndMemberAnchors() {
+    void buildsOneGroundComponentFromPackedFacts() {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
-        for (int x = 0; x < 16; x++) {
-            set(cells, x, 3, 6, BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN);
+        int ground = BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN;
+        for (int z = 0; z < BaseClusterTopology.SIDE; z++) {
+            for (int x = 0; x < BaseClusterTopology.SIDE; x++) {
+                cells[BaseClusterTopology.cellIndex(x, 3, z)] = (byte) ground;
+                cells[BaseClusterTopology.cellIndex(x, 4, z)] = BaseClusterTopology.VOLUME_OPEN;
+            }
         }
 
-        BaseClusterTopology topology = BaseClusterTopology.build(
+        BaseClusterTopology topology = build(
                 SectionPos.of(2, -1, 4),
-                7L,
-                new BaseClusterTopology.Snapshot(cells)
-        );
-
-        assertEquals(1, topology.components(BaseClusterTopology.Channel.GROUND).size());
-        BaseClusterTopology.Component ground = topology.components(BaseClusterTopology.Channel.GROUND).get(0);
-        assertTrue(ground.touches(Direction.WEST));
-        assertTrue(ground.touches(Direction.EAST));
-        assertEquals(16, ground.cellCount());
-        assertNotNull(topology.componentAt(
+                new BaseClusterTopology.Snapshot(cells),
                 BaseClusterTopology.Channel.GROUND,
-                ground.anchorX(),
-                ground.anchorY(),
-                ground.anchorZ()
-        ));
-    }
-
-    @Test
-    void storesStepAndDropAsProfileFilteredConnections() {
-        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
-        set(cells, 4, 3, 4, BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN);
-        set(cells, 5, 4, 4, BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN);
-
-        BaseClusterTopology topology = BaseClusterTopology.build(
-                SectionPos.of(0, 0, 0),
-                1L,
-                new BaseClusterTopology.Snapshot(cells)
-        );
-        BaseClusterTopology.Component lower = topology.componentAt(
-                BaseClusterTopology.Channel.GROUND, 4, 3, 4
-        );
-        BaseClusterTopology.Component upper = topology.componentAt(
-                BaseClusterTopology.Channel.GROUND, 5, 4, 4
+                false
         );
 
-        assertTrue(topology.outgoingConnections(lower.id()).stream()
-                .anyMatch(connection -> connection.toComponent() == upper.id()
-                        && connection.rise() == 1));
-        assertTrue(topology.outgoingConnections(upper.id()).stream()
-                .anyMatch(connection -> connection.toComponent() == lower.id()
-                        && connection.drop() == 1));
-    }
-
-    @Test
-    void storesFluidOnlyOnFacesTouchedByFluidCells() {
-        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
-        set(cells, 0, 7, 9, BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.FLUID);
-        set(cells, 6, 15, 2, BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.FLUID);
-
-        BaseClusterTopology topology = BaseClusterTopology.build(
-                SectionPos.of(0, 0, 0),
-                1L,
-                new BaseClusterTopology.Snapshot(cells)
-        );
-
-        assertTrue(topology.hasFluid(Direction.WEST, 9, 7));
-        assertTrue(topology.hasFluid(Direction.UP, 6, 2));
-        assertFalse(topology.hasFluid(Direction.EAST, 9, 7));
-        assertEquals((1 << Direction.WEST.ordinal()) | (1 << Direction.UP.ordinal()),
-                topology.nonEmptyFluidFaceMask());
-    }
-
-    @Test
-    void rejectsMovementCapabilitiesOutsideTheStructuralGraph() {
-        assertThrows(IllegalArgumentException.class, () ->
-                new BaseClusterTopology.TraversalProfile(0.6F, 1.95F, 2, 3, 3, false));
-        assertThrows(IllegalArgumentException.class, () ->
-                new BaseClusterTopology.TraversalProfile(0.6F, 1.95F, 1, 4, 3, false));
-        assertThrows(IllegalArgumentException.class, () ->
-                new BaseClusterTopology.TraversalProfile(0.6F, 1.95F, 1, 3, 5, false));
-    }
-
-    @Test
-    void snapshotAndBoundaryMasksAreImmutable() {
-        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
-        set(cells, 15, 4, 6, BaseClusterTopology.VOLUME_OPEN);
-        BaseClusterTopology.Snapshot snapshot = new BaseClusterTopology.Snapshot(cells);
-        cells[BaseClusterTopology.cellIndex(15, 4, 6)] = 0;
-
-        BaseClusterTopology topology = BaseClusterTopology.build(
-                SectionPos.of(0, 0, 0),
-                3L,
-                snapshot
-        );
-        BaseClusterTopology.Component component = topology.components(
-                BaseClusterTopology.Channel.VOLUME
-        ).get(0);
-        long original = component.boundaryMaskWord(Direction.EAST, 1);
-        long[] exported = component.boundaryMask(Direction.EAST);
-        exported[1] = 0L;
-
-        assertEquals(original, component.boundaryMaskWord(Direction.EAST, 1));
+        assertEquals(1, topology.componentCount());
+        assertTrue(topology.componentAt(0, 3, 0) >= 0,
+                () -> "componentCount=" + topology.componentCount()
+                        + ", anchor=" + topology.componentAnchorCell(0));
+        assertEquals(BaseClusterTopology.cellIndex(0, 3, 0),
+                topology.componentAnchorCell(0));
         assertTrue(topology.retainedBytes() > 0);
-        assertEquals(snapshot.fingerprint(), topology.sourceFingerprint());
     }
 
-    private static void set(byte[] cells, int x, int y, int z, int flags) {
-        cells[BaseClusterTopology.cellIndex(x, y, z)] = (byte) flags;
+    @Test
+    void sealedOneByOneAnchorsAreRemovedByTheLinearFastPath() {
+        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
+        cells[BaseClusterTopology.cellIndex(8, 8, 8)] = (byte) (
+                BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
+        );
+
+        BaseClusterTopology topology = build(
+                SectionPos.of(0, 0, 0),
+                new BaseClusterTopology.Snapshot(cells),
+                BaseClusterTopology.Channel.GROUND,
+                false
+        );
+
+        assertEquals(0, topology.componentCount(),
+                () -> "componentAt=" + topology.componentAt(8, 8, 8));
+        assertEquals(-1, topology.componentAt(8, 8, 8));
+    }
+
+    @Test
+    void sealedBoundaryAnchorUsesLoadedFaceHalo() {
+        byte[] center = new byte[BaseClusterTopology.CELL_COUNT];
+        center[BaseClusterTopology.cellIndex(0, 8, 8)] = (byte) (
+                BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
+        );
+        BaseClusterTopology.Snapshot centerSnapshot = new BaseClusterTopology.Snapshot(center);
+        BaseClusterTopology.GeometryKey geometry = new BaseClusterTopology.GeometryKey(
+                BaseClusterTopology.Channel.GROUND, 1, 1, false
+        );
+        BaseClusterTopology topology = BaseClusterTopology.build(
+                SectionPos.of(0, 0, 0),
+                1L,
+                new BaseClusterTopology.BuildInput(
+                        centerSnapshot.packedFacts(),
+                        new byte[]{(byte) BaseClusterTopology.haloIndex(-1, 0, 0)},
+                        new BaseClusterTopology.PackedFacts[]{
+                                new BaseClusterTopology.Snapshot(
+                                        new byte[BaseClusterTopology.CELL_COUNT]
+                                ).packedFacts()
+                        },
+                        new long[]{1L},
+                        new long[]{2L}
+                ),
+                geometry,
+                new BaseClusterTopology.BuildScratch()
+        );
+
+        assertEquals(-1, topology.componentAt(0, 8, 8));
+    }
+
+    @Test
+    void sealedBoundaryAnchorRequiresCompleteFaceHalo() {
+        byte[] center = new byte[BaseClusterTopology.CELL_COUNT];
+        center[BaseClusterTopology.cellIndex(0, 8, 8)] = (byte) (
+                BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
+        );
+        byte[] west = new byte[BaseClusterTopology.CELL_COUNT];
+        west[BaseClusterTopology.cellIndex(15, 8, 8)] = BaseClusterTopology.VOLUME_OPEN;
+        BaseClusterTopology.GeometryKey geometry = new BaseClusterTopology.GeometryKey(
+                BaseClusterTopology.Channel.GROUND, 1, 1, false
+        );
+        BaseClusterTopology topology = BaseClusterTopology.build(
+                SectionPos.of(0, 0, 0),
+                1L,
+                new BaseClusterTopology.BuildInput(
+                        new BaseClusterTopology.Snapshot(center).packedFacts(),
+                        new byte[]{(byte) BaseClusterTopology.haloIndex(-1, 0, 0)},
+                        new BaseClusterTopology.PackedFacts[]{
+                                new BaseClusterTopology.Snapshot(west).packedFacts()
+                        },
+                        new long[]{1L},
+                        new long[]{2L}
+                ),
+                geometry,
+                new BaseClusterTopology.BuildScratch()
+        );
+
+        assertTrue(topology.componentAt(0, 8, 8) >= 0);
+    }
+
+    @Test
+    void fluidFactsAreFilteredUnlessTheGeometryAcceptsFluid() {
+        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
+        cells[BaseClusterTopology.cellIndex(4, 3, 4)] = (byte) (
+                BaseClusterTopology.VOLUME_OPEN
+                        | BaseClusterTopology.GROUND_OPEN
+                        | BaseClusterTopology.FLUID
+        );
+        cells[BaseClusterTopology.cellIndex(4, 4, 4)] = BaseClusterTopology.VOLUME_OPEN;
+        BaseClusterTopology.Snapshot snapshot = new BaseClusterTopology.Snapshot(cells);
+
+        assertEquals(0, build(SectionPos.of(0, 0, 0), snapshot,
+                BaseClusterTopology.Channel.GROUND, false).componentCount());
+        assertEquals(1, build(SectionPos.of(0, 0, 0), snapshot,
+                BaseClusterTopology.Channel.GROUND, true).componentCount());
+    }
+
+    @Test
+    void packedSnapshotIsCopiedAndHasStableFingerprint() {
+        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
+        java.util.Arrays.fill(cells, (byte) BaseClusterTopology.VOLUME_OPEN);
+        BaseClusterTopology.Snapshot snapshot = new BaseClusterTopology.Snapshot(cells);
+        long fingerprint = snapshot.fingerprint();
+        cells[0] = 0;
+
+        BaseClusterTopology topology = build(
+                SectionPos.of(0, 0, 0),
+                snapshot,
+                BaseClusterTopology.Channel.VOLUME,
+                false
+        );
+
+        assertEquals(fingerprint, snapshot.fingerprint());
+        assertEquals(fingerprint, topology.sourceFingerprint());
+        assertTrue(topology.componentAt(0, 0, 0) >= 0);
+    }
+
+    @Test
+    void movementKeyRejectsUnsupportedStructuralValues() {
+        assertThrowsIllegalArgument(() -> new BaseClusterTopology.MovementKey(2, 0, 0));
+        assertThrowsIllegalArgument(() -> new BaseClusterTopology.MovementKey(0, 3, 0));
+        assertThrowsIllegalArgument(() -> new BaseClusterTopology.MovementKey(0, 0, 5));
+        assertFalse(new BaseClusterTopology.MovementKey(0, 0, 0).capabilityMask() == 0L);
+    }
+
+    private static BaseClusterTopology build(SectionPos section,
+                                               BaseClusterTopology.Snapshot snapshot,
+                                               BaseClusterTopology.Channel channel,
+                                               boolean acceptsFluid) {
+        BaseClusterTopology.GeometryKey geometry = new BaseClusterTopology.GeometryKey(
+                channel, 1, 1, acceptsFluid
+        );
+        return BaseClusterTopology.build(
+                section,
+                1L,
+                BaseClusterTopology.BuildInput.center(snapshot.packedFacts()),
+                geometry,
+                new BaseClusterTopology.BuildScratch()
+        );
+    }
+
+    private static void assertThrowsIllegalArgument(Runnable runnable) {
+        try {
+            runnable.run();
+        } catch (IllegalArgumentException expected) {
+            return;
+        }
+        throw new AssertionError("expected IllegalArgumentException");
     }
 }

@@ -194,19 +194,28 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
 
     public void topologyAvailable(SectionPos section) {
         Objects.requireNonNull(section, "section");
-        waitingByDependency.keySet().stream()
+        dependenciesAvailable(waitingByDependency.keySet().stream()
                 .filter(key -> key.position().equals(section))
-                .toList()
-                .forEach(this::dependencyAvailable);
+                .toList());
     }
 
     public void dependencyAvailable(DependencyKey dependency) {
-        Objects.requireNonNull(dependency, "dependency");
-        Set<SearchNode> affected = waitingByDependency.get(dependency);
-        if (affected == null || affected.isEmpty()) {
-            return;
+        dependenciesAvailable(List.of(Objects.requireNonNull(dependency, "dependency")));
+    }
+
+    void dependenciesAvailable(Iterable<DependencyKey> dependencies) {
+        Objects.requireNonNull(dependencies, "dependencies");
+        Set<SearchNode> affectedNodes = new HashSet<>();
+        for (DependencyKey dependency : dependencies) {
+            Set<SearchNode> affected = waitingByDependency.get(
+                    Objects.requireNonNull(dependency, "dependency")
+            );
+            if (affected != null) {
+                affectedNodes.addAll(affected);
+            }
         }
-        for (SearchNode node : List.copyOf(affected)) {
+        boolean reopened = false;
+        for (SearchNode node : affectedNodes) {
             if (!blockedNodes.contains(node)) {
                 continue;
             }
@@ -216,9 +225,12 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
                 openSet.insert(node);
             }
             reexpandedBlockedNodes++;
+            reopened = true;
         }
-        waitingForTopology = false;
-        blockedSection = null;
+        if (reopened) {
+            waitingForTopology = false;
+            blockedSection = null;
+        }
     }
 
     @Override
@@ -281,6 +293,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             next.viaKind = expansionBuffer.transitionKind(index);
             next.viaPayload = expansionBuffer.transitionPayload(index);
             next.viaPayloadIndex = expansionBuffer.transitionPayloadIndex(index);
+            next.viaPrimitivePayload = expansionBuffer.transitionPrimitivePayload(index);
             boolean wasBlocked = blockedNodes.contains(next);
             if (wasBlocked) {
                 unregisterBlocked(next, true);
@@ -427,7 +440,8 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             Transition transition = materializeTransition(
                     node.viaKind,
                     node.viaPayload,
-                    node.viaPayloadIndex
+                    node.viaPayloadIndex,
+                    node.viaPrimitivePayload
             );
             connections.add(new Connection(
                     node.viaId,
@@ -442,16 +456,18 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         return new Corridor(endpoints, connections, cost);
     }
 
-    private static Transition materializeTransition(byte kind, Object payload, int payloadIndex) {
+    private static Transition materializeTransition(byte kind,
+                                                    Object payload,
+                                                    int payloadIndex,
+                                                    long primitivePayload) {
         return switch (kind) {
             case ExpansionBuffer.DIRECT -> (Transition) Objects.requireNonNull(payload);
             case ExpansionBuffer.MEMBERSHIP -> MembershipTransition.INSTANCE;
-            case ExpansionBuffer.LOCAL -> new LocalTransition(
-                    (BaseClusterTopology.LocalConnection) Objects.requireNonNull(payload)
-            );
+            case ExpansionBuffer.LOCAL -> LocalTransition.INSTANCE;
             case ExpansionBuffer.BOUNDARY -> materializeBoundary(
                     (SuperClusterTopology.BoundaryLinks) Objects.requireNonNull(payload),
-                    payloadIndex
+                    payloadIndex,
+                    primitivePayload
             );
             case ExpansionBuffer.AGGREGATE -> AggregateTransition.INSTANCE;
             default -> throw new IllegalStateException("unknown transition descriptor " + kind);
@@ -459,18 +475,24 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
     }
 
     private static BoundaryTransition materializeBoundary(SuperClusterTopology.BoundaryLinks links,
-                                                            int edgeIndex) {
-        List<BoundaryBand> bands = new ArrayList<>(links.bandEnd(edgeIndex) - links.bandStart(edgeIndex));
+                                                            int edgeIndex,
+                                                            long movementMask) {
+        int count = 0;
         for (int band = links.bandStart(edgeIndex); band < links.bandEnd(edgeIndex); band++) {
-            bands.add(new BoundaryBand(
-                    links.verticalShift(band),
-                    links.maskWord(band, 0),
-                    links.maskWord(band, 1),
-                    links.maskWord(band, 2),
-                    links.maskWord(band, 3)
-            ));
+            if ((links.capabilityMask(band) & movementMask) != 0L) count++;
         }
-        return new BoundaryTransition(links.face(), bands);
+        byte[] shifts = new byte[count];
+        long[] masks = new long[count * 4];
+        int selected = 0;
+        for (int band = links.bandStart(edgeIndex); band < links.bandEnd(edgeIndex); band++) {
+            if ((links.capabilityMask(band) & movementMask) == 0L) continue;
+            shifts[selected] = (byte) links.verticalShift(band);
+            for (int word = 0; word < 4; word++) {
+                masks[selected * 4 + word] = links.maskWord(band, word);
+            }
+            selected++;
+        }
+        return new BoundaryTransition(links.face(), shifts, masks);
     }
 
     private Status fail(Failure reason) {
@@ -488,17 +510,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
 
         Endpoint goal();
 
-        Expansion expand(Endpoint from);
-
-        default void expandInto(Endpoint from, ExpansionBuffer output) {
-            Expansion expansion = Objects.requireNonNull(expand(from), "graph returned null expansion");
-            for (Connection connection : expansion.connections()) {
-                output.add(connection);
-            }
-            for (Dependency dependency : expansion.dependencies()) {
-                output.addDependency(dependency);
-            }
-        }
+        void expandInto(Endpoint from, ExpansionBuffer output);
 
         boolean revisionsValid();
 
@@ -531,6 +543,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         private byte[] kinds = new byte[16];
         private Object[] payloads = new Object[16];
         private int[] payloadIndexes = new int[16];
+        private long[] primitivePayloads = new long[16];
         private int connectionCount;
         private Dependency[] dependencies = new Dependency[4];
         private int dependencyCount;
@@ -553,30 +566,36 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             if (connection.from().id() != source.id()) {
                 throw new IllegalArgumentException("connection source does not match the expansion source");
             }
-            add(connection.id(), connection.to(), connection.lowerBound(), DIRECT, connection.transition(), 0);
+            add(connection.id(), connection.to(), connection.lowerBound(), DIRECT,
+                    connection.transition(), 0, 0L);
         }
 
         public void addMembership(long id, Endpoint target, float lowerBound) {
-            add(id, target, lowerBound, MEMBERSHIP, null, 0);
+            add(id, target, lowerBound, MEMBERSHIP, null, 0, 0L);
         }
 
         public void addLocal(long id,
                              Endpoint target,
                              float lowerBound,
-                             BaseClusterTopology.LocalConnection connection) {
-            add(id, target, lowerBound, LOCAL, Objects.requireNonNull(connection, "connection"), 0);
+                             long capabilityMask) {
+            if (capabilityMask == 0L) {
+                throw new IllegalArgumentException("local transition needs a capability mask");
+            }
+            add(id, target, lowerBound, LOCAL, null, 0, 0L);
         }
 
         public void addBoundary(long id,
                                 Endpoint target,
                                 float lowerBound,
                                 SuperClusterTopology.BoundaryLinks links,
-                                int edgeIndex) {
-            add(id, target, lowerBound, BOUNDARY, Objects.requireNonNull(links, "links"), edgeIndex);
+                                int edgeIndex,
+                                long movementMask) {
+            add(id, target, lowerBound, BOUNDARY, Objects.requireNonNull(links, "links"),
+                    edgeIndex, movementMask);
         }
 
         public void addAggregate(long id, Endpoint target, float lowerBound) {
-            add(id, target, lowerBound, AGGREGATE, null, 0);
+            add(id, target, lowerBound, AGGREGATE, null, 0, 0L);
         }
 
         public void addDependency(Dependency dependency) {
@@ -585,26 +604,13 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             dependencies[dependencyCount++] = dependency;
         }
 
-        public Expansion snapshot() {
-            List<Connection> connections = new ArrayList<>(connectionCount);
-            for (int index = 0; index < connectionCount; index++) {
-                connections.add(new Connection(
-                        ids[index],
-                        source,
-                        targets[index],
-                        costs[index],
-                        materializeTransition(kinds[index], payloads[index], payloadIndexes[index])
-                ));
-            }
-            return new Expansion(connections, dependencies());
-        }
-
         private void add(long id,
                          Endpoint target,
                          float lowerBound,
                          byte kind,
                          @Nullable Object payload,
-                         int payloadIndex) {
+                         int payloadIndex,
+                         long primitivePayload) {
             Objects.requireNonNull(target, "target");
             if (!Float.isFinite(lowerBound) || lowerBound < 0.0F) {
                 throw new IllegalArgumentException("lowerBound must be finite and non-negative");
@@ -616,6 +622,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             kinds[connectionCount] = kind;
             payloads[connectionCount] = payload;
             payloadIndexes[connectionCount] = payloadIndex;
+            primitivePayloads[connectionCount] = primitivePayload;
             connectionCount++;
         }
 
@@ -647,6 +654,10 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             return payloadIndexes[index];
         }
 
+        private long transitionPrimitivePayload(int index) {
+            return primitivePayloads[index];
+        }
+
         private int dependencyCount() {
             return dependencyCount;
         }
@@ -673,6 +684,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             kinds = java.util.Arrays.copyOf(kinds, capacity);
             payloads = java.util.Arrays.copyOf(payloads, capacity);
             payloadIndexes = java.util.Arrays.copyOf(payloadIndexes, capacity);
+            primitivePayloads = java.util.Arrays.copyOf(primitivePayloads, capacity);
         }
 
         private void ensureDependencyCapacity(int required) {
@@ -682,17 +694,6 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
                         Math.max(required, dependencies.length << 1)
                 );
             }
-        }
-    }
-
-    public record Expansion(List<Connection> connections, List<Dependency> dependencies) {
-        public Expansion {
-            connections = List.copyOf(connections);
-            dependencies = List.copyOf(dependencies);
-        }
-
-        public static Expansion complete(List<Connection> connections) {
-            return new Expansion(connections, List.of());
         }
     }
 
@@ -730,9 +731,6 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             );
         }
 
-        public SectionPos section() {
-            return key.position();
-        }
     }
 
     public record DependencyKey(DependencyKind kind,
@@ -753,7 +751,14 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
                 int distance = kind == DependencyKind.SUPER_BOUNDARY
                         ? SuperClusterTopology.CHILDREN_PER_AXIS
                         : 1;
-                if (!target.equals(SuperClusterTopology.offset(position, face, distance))) {
+                SectionPos direct = SuperClusterTopology.offset(position, face, distance);
+                int verticalDelta = target.y() - position.y();
+                boolean adjacent = face.getAxis().isVertical()
+                        ? target.equals(direct)
+                        : target.x() == direct.x() && target.z() == direct.z()
+                        && Math.abs(verticalDelta) <= distance
+                        && verticalDelta % distance == 0;
+                if (!adjacent) {
                     throw new IllegalArgumentException("boundary dependency is not adjacent");
                 }
             }
@@ -845,47 +850,38 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         private static final MembershipTransition INSTANCE = new MembershipTransition();
     }
 
-    public record LocalTransition(BaseClusterTopology.LocalConnection requirement)
-            implements Transition {
-        public LocalTransition {
-            Objects.requireNonNull(requirement, "requirement");
-        }
+    public record LocalTransition() implements Transition {
+        private static final LocalTransition INSTANCE = new LocalTransition();
     }
 
-    public record BoundaryTransition(Direction face, List<BoundaryBand> bands) implements Transition {
-        public BoundaryTransition {
-            Objects.requireNonNull(face, "face");
-            bands = List.copyOf(bands);
-            if (bands.isEmpty()) {
-                throw new IllegalArgumentException("boundary transition requires at least one band");
+    public static final class BoundaryTransition implements Transition {
+        private final Direction face;
+        private final byte[] verticalShifts;
+        private final long[] spatialMasks;
+
+        private BoundaryTransition(Direction face, byte[] verticalShifts, long[] spatialMasks) {
+            this.face = Objects.requireNonNull(face, "face");
+            this.verticalShifts = verticalShifts;
+            this.spatialMasks = spatialMasks;
+            if (verticalShifts.length == 0 || spatialMasks.length != verticalShifts.length * 4) {
+                throw new IllegalArgumentException("boundary transition requires complete bands");
             }
+        }
+
+        public Direction face() { return face; }
+        public int bandCount() { return verticalShifts.length; }
+        public int verticalShift(int band) { return verticalShifts[band]; }
+        public long maskWord(int band, int word) {
+            if (word < 0 || word >= 4) throw new IndexOutOfBoundsException("boundary mask word");
+            return spatialMasks[band * 4 + word];
+        }
+        public int retainedBytes() {
+            return 40 + verticalShifts.length + spatialMasks.length * Long.BYTES;
         }
     }
 
     public record AggregateTransition() implements Transition {
         private static final AggregateTransition INSTANCE = new AggregateTransition();
-    }
-
-    public record BoundaryBand(int verticalShift,
-                               long mask0,
-                               long mask1,
-                               long mask2,
-                               long mask3) {
-        public BoundaryBand {
-            if ((mask0 | mask1 | mask2 | mask3) == 0L) {
-                throw new IllegalArgumentException("boundary band mask cannot be empty");
-            }
-        }
-
-        public long maskWord(int index) {
-            return switch (index) {
-                case 0 -> mask0;
-                case 1 -> mask1;
-                case 2 -> mask2;
-                case 3 -> mask3;
-                default -> throw new IndexOutOfBoundsException("boundary mask word must be in [0, 3]");
-            };
-        }
     }
 
     public record Corridor(List<Endpoint> endpoints, List<Connection> connections, float cost) {
@@ -943,6 +939,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         private byte viaKind;
         private Object viaPayload;
         private int viaPayloadIndex;
+        private long viaPrimitivePayload;
         private LongOpenHashSet emittedConnectionIds;
         private Set<DependencyKey> pendingDependencies = Set.of();
         private Set<DependencyKey> unavailableDependencies = Set.of();
@@ -954,3 +951,5 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         }
     }
 }
+
+

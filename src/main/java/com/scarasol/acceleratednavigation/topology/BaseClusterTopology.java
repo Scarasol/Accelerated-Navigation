@@ -1,21 +1,16 @@
 package com.scarasol.acceleratednavigation.topology;
 
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import net.minecraft.util.BitStorage;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.ZeroBitStorage;
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 
-/** Immutable, entity-independent structural topology exported by one 16-cubed section. */
+/** One immutable macro traversal view for a section generation and normalized geometry. */
 public final class BaseClusterTopology {
 
     public static final int SIDE = 16;
@@ -26,94 +21,105 @@ public final class BaseClusterTopology {
     public static final int FLUID = 1 << 2;
     public static final int EXACT_REQUIRED = 1 << 3;
 
-    private static final int FACE_CELL_COUNT = SIDE * SIDE;
-    private static final int FACE_WORDS = FACE_CELL_COUNT / Long.SIZE;
     private static final int VALID_FLAGS = VOLUME_OPEN | GROUND_OPEN | FLUID | EXACT_REQUIRED;
-    private static final int MAX_STRUCTURAL_STEP = 1;
-    private static final int MAX_STRUCTURAL_JUMP = 3;
-    private static final int MAX_STRUCTURAL_DROP = 4;
+    static final int MAX_STRUCTURAL_STEP = 1;
+    static final int MAX_STRUCTURAL_JUMP = 3;
+    static final int MAX_STRUCTURAL_DROP = 4;
+    private static final int CENTER_HALO_INDEX = 13;
+    private static final int EXTENDED_MIN = -8;
+    private static final int EXTENDED_SIDE = SIDE * 2;
+    private static final int PRISM_LAYERS = SIDE + 1;
+    private static final int SEALED_SIDE = SIDE + 2;
 
     private final SectionPos section;
     private final long revision;
     private final long sourceFingerprint;
-    private final List<Component> components;
-    private final List<LocalConnection> localConnections;
-    private final int[][] componentIdsByChannel;
-    private final int[][][] boundaryComponentIds;
-    private final List<Component>[] componentViewsByChannel;
-    private final List<Component>[][] boundaryComponentViews;
-    private final int[] localOutgoingOffsets;
-    private final LocalConnection[] localOutgoing;
-    private final List<LocalConnection>[] localOutgoingViews;
-    private final BitStorage[] componentLabels;
-    private final long[][] fluidFaces;
-    private final int nonEmptyFluidFaceMask;
+    private final GeometryKey geometry;
+    private final BitStorage componentLabels;
+    private final int baseLabel;
+    private final int[] componentMetadata;
+    private final int[] outgoingOffsets;
+    private final int[] outgoingTargets;
+    private final long[] outgoingCapabilityMasks;
+    private final float[] outgoingLowerBounds;
+    private final byte[] haloOffsets;
+    private final long[] haloRevisions;
+    private final long[] haloFingerprints;
+    private final long signature;
     private final int retainedBytes;
 
     private BaseClusterTopology(SectionPos section,
                                 long revision,
                                 long sourceFingerprint,
-                                List<Component> components,
-                                List<LocalConnection> localConnections,
-                                char[][] componentLabels,
-                                long[][] fluidFaces) {
+                                GeometryKey geometry,
+                                BitStorage componentLabels,
+                                int baseLabel,
+                                int[] componentMetadata,
+                                int[] outgoingOffsets,
+                                int[] outgoingTargets,
+                                long[] outgoingCapabilityMasks,
+                                float[] outgoingLowerBounds,
+                                byte[] haloOffsets,
+                                long[] haloRevisions,
+                                long[] haloFingerprints) {
         this.section = Objects.requireNonNull(section, "section");
         this.revision = revision;
         this.sourceFingerprint = sourceFingerprint;
-        this.components = List.copyOf(components);
-        List<LocalConnection> sortedConnections = new ArrayList<>(localConnections);
-        sortedConnections.sort(Comparator.comparingInt(LocalConnection::fromComponent)
-                .thenComparingInt(LocalConnection::toComponent));
-        this.localConnections = List.copyOf(sortedConnections);
-        this.fluidFaces = copyFaces(fluidFaces);
-        this.componentIdsByChannel = buildComponentIds(this.components);
-        this.componentLabels = compactLabels(componentLabels, componentIdsByChannel);
-        this.boundaryComponentIds = buildBoundaryComponentIds(this.components);
-        this.componentViewsByChannel = buildComponentViews(this.components, componentIdsByChannel);
-        this.boundaryComponentViews = buildBoundaryComponentViews(this.components, boundaryComponentIds);
-        this.localOutgoingOffsets = buildOutgoingOffsets(this.components.size(), this.localConnections);
-        this.localOutgoing = this.localConnections.toArray(LocalConnection[]::new);
-        this.localOutgoingViews = buildOutgoingViews(localOutgoingOffsets, localOutgoing);
-
-        int fluidFaceMask = 0;
-        for (Direction face : Direction.values()) {
-            if (this.fluidFaces[face.ordinal()] != null) {
-                fluidFaceMask |= 1 << face.ordinal();
-            }
-        }
-        this.nonEmptyFluidFaceMask = fluidFaceMask;
-        this.retainedBytes = 96
-                + Arrays.stream(this.componentLabels).mapToInt(labels -> labels.getRaw().length).sum()
-                * Long.BYTES
-                + Integer.bitCount(fluidFaceMask) * FACE_WORDS * Long.BYTES
-                + this.components.stream().mapToInt(Component::retainedBytes).sum()
-                + this.localConnections.size() * LocalConnection.RETAINED_BYTES
-                + Arrays.stream(componentIdsByChannel).mapToInt(ids -> ids.length).sum() * Integer.BYTES
-                + Arrays.stream(boundaryComponentIds)
-                .flatMap(Arrays::stream)
-                .mapToInt(ids -> ids.length)
-                .sum() * Integer.BYTES
-                + localOutgoingOffsets.length * Integer.BYTES;
+        this.geometry = Objects.requireNonNull(geometry, "geometry");
+        this.componentLabels = Objects.requireNonNull(componentLabels, "componentLabels");
+        this.baseLabel = baseLabel;
+        this.componentMetadata = componentMetadata;
+        this.outgoingOffsets = outgoingOffsets;
+        this.outgoingTargets = outgoingTargets;
+        this.outgoingCapabilityMasks = outgoingCapabilityMasks;
+        this.outgoingLowerBounds = outgoingLowerBounds;
+        this.haloOffsets = haloOffsets;
+        this.haloRevisions = haloRevisions;
+        this.haloFingerprints = haloFingerprints;
+        this.signature = signature(section, revision, sourceFingerprint, geometry,
+                haloOffsets, haloRevisions, haloFingerprints);
+        this.retainedBytes = 128 + componentLabels.getRaw().length * Long.BYTES
+                + (componentMetadata.length + outgoingOffsets.length + outgoingTargets.length)
+                * Integer.BYTES
+                + outgoingCapabilityMasks.length * Long.BYTES
+                + outgoingLowerBounds.length * Float.BYTES
+                + haloOffsets.length + (haloRevisions.length + haloFingerprints.length) * Long.BYTES;
         validate();
     }
 
-    public static BaseClusterTopology build(SectionPos section, long revision, Snapshot snapshot) {
-        Objects.requireNonNull(section, "section");
-        Objects.requireNonNull(snapshot, "snapshot");
-
-        List<Component> components = new ArrayList<>();
-        char[][] labels = new char[Channel.values().length][CELL_COUNT];
-        buildComponents(snapshot, Channel.GROUND, components, labels[Channel.GROUND.ordinal()]);
-        buildComponents(snapshot, Channel.VOLUME, components, labels[Channel.VOLUME.ordinal()]);
-        List<LocalConnection> connections = buildGroundConnections(snapshot, labels);
+    public static BaseClusterTopology build(SectionPos section,
+                                            long revision,
+                                            BuildInput input,
+                                            GeometryKey geometry,
+                                            BuildScratch scratch) {
+        Objects.requireNonNull(input, "input");
+        Objects.requireNonNull(geometry, "geometry");
+        Objects.requireNonNull(scratch, "scratch").reset();
+        deriveLegalAnchors(input, geometry, scratch);
+        int componentCount = labelComponents(geometry.channel(), scratch);
+        BitStorage labels = compactLabels(scratch.labels, componentCount);
+        int uniformLabel = uniformLabel(scratch.labels);
+        int baseLabel = uniformLabel < 0 ? 0 : uniformLabel;
+        int[] metadata = Arrays.copyOf(scratch.componentMetadata, componentCount);
+        PrimitiveEdges edges = geometry.channel() == Channel.GROUND
+                ? buildGroundEdges(input, geometry, scratch, componentCount)
+                : PrimitiveEdges.empty(componentCount);
+        HaloStamps stamps = input.usedStamps(scratch.haloUsed);
         return new BaseClusterTopology(
                 section,
                 revision,
-                snapshot.fingerprint(),
-                components,
-                connections,
+                input.center().fingerprint(),
+                geometry,
                 labels,
-                buildFluidFaces(snapshot)
+                baseLabel,
+                metadata,
+                edges.offsets,
+                edges.targets,
+                edges.capabilities,
+                edges.lowerBounds,
+                stamps.offsets,
+                stamps.revisions,
+                stamps.fingerprints
         );
     }
 
@@ -129,577 +135,503 @@ public final class BaseClusterTopology {
         return sourceFingerprint;
     }
 
-    public List<Component> components() {
-        return components;
+    public GeometryKey geometry() {
+        return geometry;
     }
 
-    public List<Component> components(Channel channel) {
-        Objects.requireNonNull(channel, "channel");
-        return componentViewsByChannel[channel.ordinal()];
+    public int componentCount() {
+        return componentMetadata.length;
     }
 
-    public List<Component> boundaryComponents(Direction face, Channel channel) {
-        Objects.requireNonNull(face, "face");
-        Objects.requireNonNull(channel, "channel");
-        return boundaryComponentViews[channel.ordinal()][face.ordinal()];
-    }
-
-    public Component component(int id) {
-        if (id < 0 || id >= components.size()) {
-            throw new IndexOutOfBoundsException("unknown component " + id);
+    public int componentAt(int x, int y, int z) {
+        if (!inBounds(x, y, z)) {
+            return -1;
         }
-        return components.get(id);
+        int label = baseLabel + componentLabels.get(cellIndex(x, y, z));
+        return label == 0 ? -1 : label - 1;
     }
 
-    public Component componentAt(Channel channel, int x, int y, int z) {
-        Objects.requireNonNull(channel, "channel");
-        int channelIndex = channel.ordinal();
-        int encoded = componentLabels[channelIndex].get(cellIndex(x, y, z));
-        return encoded == 0 ? null : component(componentIdsByChannel[channelIndex][encoded - 1]);
+    public int componentAnchorCell(int componentId) {
+        return metadata(componentId) & 0xfff;
     }
 
-    public Component nearestComponent(Channel channel, int x, int y, int z, int radius) {
-        Objects.requireNonNull(channel, "channel");
-        if (radius < 0) {
-            throw new IllegalArgumentException("radius must be non-negative");
-        }
-        Component direct = componentAt(channel, x, y, z);
-        if (direct != null) {
-            return direct;
-        }
-        for (int distance = 1; distance <= radius; distance++) {
-            for (int dy = -distance; dy <= distance; dy++) {
-                for (int dz = -distance; dz <= distance; dz++) {
-                    int dxMagnitude = distance - Math.abs(dy) - Math.abs(dz);
-                    if (dxMagnitude < 0) {
-                        continue;
-                    }
-                    for (int sign : dxMagnitude == 0 ? new int[]{1} : new int[]{-1, 1}) {
-                        int nx = x + sign * dxMagnitude;
-                        int ny = y + dy;
-                        int nz = z + dz;
-                        if (inBounds(nx, ny, nz)) {
-                            Component candidate = componentAt(channel, nx, ny, nz);
-                            if (candidate != null) {
-                                return candidate;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return null;
+    public int localEdgeStart(int componentId) {
+        metadata(componentId);
+        return outgoingOffsets[componentId];
     }
 
-    public List<LocalConnection> outgoingConnections(int componentId) {
-        if (componentId < 0 || componentId >= components.size()) {
-            throw new IndexOutOfBoundsException("unknown component " + componentId);
-        }
-        return localOutgoingViews[componentId];
+    public int localEdgeEnd(int componentId) {
+        metadata(componentId);
+        return outgoingOffsets[componentId + 1];
     }
 
-    int componentCount(Channel channel) {
-        return componentIdsByChannel[Objects.requireNonNull(channel, "channel").ordinal()].length;
+    public int localEdgeTarget(int edge) {
+        return outgoingTargets[edge];
     }
 
-    int componentId(Channel channel, int index) {
-        return componentIdsByChannel[Objects.requireNonNull(channel, "channel").ordinal()][index];
+    public long localEdgeCapabilities(int edge) {
+        return outgoingCapabilityMasks[edge];
     }
 
-    int boundaryComponentCount(Direction face, Channel channel) {
-        return boundaryComponentIds[Objects.requireNonNull(channel, "channel").ordinal()]
-                [Objects.requireNonNull(face, "face").ordinal()].length;
+    public float localEdgeLowerBound(int edge) {
+        return outgoingLowerBounds[edge];
     }
 
-    int boundaryComponentId(Direction face, Channel channel, int index) {
-        return boundaryComponentIds[Objects.requireNonNull(channel, "channel").ordinal()]
-                [Objects.requireNonNull(face, "face").ordinal()][index];
+    public boolean localEdgeSupports(int edge, MovementKey movement) {
+        return (outgoingCapabilityMasks[edge] & movement.capabilityMask()) != 0L;
     }
 
-    int localOutgoingStart(int componentId) {
-        return localOutgoingOffsets[componentId];
+    public int haloStampCount() {
+        return haloOffsets.length;
     }
 
-    int localOutgoingEnd(int componentId) {
-        return localOutgoingOffsets[componentId + 1];
+    public byte haloOffset(int index) {
+        return haloOffsets[index];
     }
 
-    LocalConnection localOutgoing(int index) {
-        return localOutgoing[index];
+    public long haloRevision(int index) {
+        return haloRevisions[index];
     }
 
-    public List<LocalConnection> localConnections() {
-        return localConnections;
-    }
-
-    public int nonEmptyFluidFaceMask() {
-        return nonEmptyFluidFaceMask;
-    }
-
-    public boolean hasFluid(Direction face, int u, int v) {
-        checkFaceCoordinate(u, v);
-        long[] mask = fluidFaces[Objects.requireNonNull(face, "face").ordinal()];
-        return mask != null && isSet(mask, faceIndex(u, v));
-    }
-
-    public long[] fluidMask(Direction face) {
-        long[] mask = fluidFaces[Objects.requireNonNull(face, "face").ordinal()];
-        return mask == null ? new long[FACE_WORDS] : mask.clone();
+    public long haloFingerprint(int index) {
+        return haloFingerprints[index];
     }
 
     public int retainedBytes() {
         return retainedBytes;
     }
 
-    private static int[][] buildComponentIds(List<Component> components) {
-        int[][] result = new int[Channel.values().length][];
-        for (Channel channel : Channel.values()) {
-            int count = 0;
-            for (Component component : components) {
-                if (component.channel() == channel) {
-                    count++;
-                }
-            }
-            int[] ids = new int[count];
-            int cursor = 0;
-            for (Component component : components) {
-                if (component.channel() == channel) {
-                    ids[cursor++] = component.id();
-                }
-            }
-            result[channel.ordinal()] = ids;
-        }
-        return result;
+    long signature() {
+        return signature;
     }
 
-    private static BitStorage[] compactLabels(char[][] source, int[][] componentIdsByChannel) {
-        Objects.requireNonNull(source, "componentLabels");
-        if (source.length != Channel.values().length) {
-            throw new IllegalArgumentException("component label channel count is invalid");
+    private int metadata(int componentId) {
+        if (componentId < 0 || componentId >= componentMetadata.length) {
+            throw new IndexOutOfBoundsException("unknown component " + componentId);
         }
-        BitStorage[] result = new BitStorage[source.length];
-        for (Channel channel : Channel.values()) {
-            int channelIndex = channel.ordinal();
-            char[] labels = Objects.requireNonNull(source[channelIndex], "componentLabels entry");
-            if (labels.length != CELL_COUNT) {
-                throw new IllegalArgumentException("component label array has the wrong size");
-            }
-            int[] componentIds = componentIdsByChannel[channelIndex];
-            if (componentIds.length == 0) {
-                for (char label : labels) {
-                    if (label != 0) {
-                        throw new IllegalArgumentException("empty channel contains a component label");
+        return componentMetadata[componentId];
+    }
+
+    private static void deriveLegalAnchors(BuildInput input,
+                                           GeometryKey geometry,
+                                           BuildScratch scratch) {
+        int minimum = minimumFootprintOffset(geometry.widthCells(), 0);
+        int maximum = minimumFootprintOffset(geometry.widthCells(),
+                (geometry.widthCells() & 1) == 0 ? 1 : 0) + geometry.widthCells() - 1;
+        int maximumY = geometry.channel() == Channel.GROUND
+                ? SIDE + geometry.heightCells() - 1
+                : SIDE + geometry.heightCells() - 2;
+        for (int y = 0; y <= maximumY; y++) {
+            for (int z = minimum; z <= SIDE - 1 + maximum; z++) {
+                int volume = 0;
+                int ground = 0;
+                for (int x = minimum; x <= SIDE - 1 + maximum; x++) {
+                    int flags = input.flags(x, y, z, scratch);
+                    if ((geometry.acceptsFluid() || (flags & FLUID) == 0)
+                            && (flags & VOLUME_OPEN) != 0) {
+                        volume |= 1 << (x - EXTENDED_MIN);
+                    }
+                    if (y < SIDE && (geometry.acceptsFluid() || (flags & FLUID) == 0)
+                            && (flags & GROUND_OPEN) != 0) {
+                        ground |= 1 << (x - EXTENDED_MIN);
                     }
                 }
-                result[channelIndex] = new ZeroBitStorage(CELL_COUNT);
-                continue;
+                int row = z - EXTENDED_MIN;
+                scratch.volumeRows[y * EXTENDED_SIDE + row] = volume;
+                if (y < SIDE) scratch.groundRows[y * EXTENDED_SIDE + row] = ground;
             }
-            int[] localIds = new int[Arrays.stream(componentIds).max().orElse(-1) + 1];
-            for (int index = 0; index < componentIds.length; index++) {
-                localIds[componentIds[index]] = index + 1;
+        }
+
+        int alignments = (geometry.widthCells() & 1) == 0 ? 4 : 1;
+        for (int alignment = 0; alignment < alignments; alignment++) {
+            int minX = minimumFootprintOffset(geometry.widthCells(), alignment & 1);
+            int minZ = minimumFootprintOffset(geometry.widthCells(), alignment >>> 1);
+            for (int y = 0; y < PRISM_LAYERS; y++) {
+                erodeRows(geometry, scratch, y, minX, false);
+                appendErodedLayer(scratch.prismMask, scratch.erodedRows,
+                        y, minZ, geometry.widthCells());
             }
-            BitStorage packed = new SimpleBitStorage(
-                    Integer.SIZE - Integer.numberOfLeadingZeros(componentIds.length),
-                    CELL_COUNT
-            );
-            for (int cell = 0; cell < labels.length; cell++) {
-                int encoded = labels[cell];
-                if (encoded != 0) {
-                    packed.set(cell, localIds[encoded - 1]);
+            if (geometry.channel() == Channel.GROUND) {
+                for (int y = 0; y < SIDE; y++) {
+                    erodeRows(geometry, scratch, y, minX, true);
+                    appendErodedLayer(scratch.legalMask, scratch.erodedRows,
+                            y, minZ, geometry.widthCells());
                 }
             }
-            result[channelIndex] = packed;
         }
-        return result;
+        if (geometry.channel() == Channel.VOLUME) {
+            System.arraycopy(scratch.prismMask, 0, scratch.legalMask, 0,
+                    scratch.legalMask.length);
+        }
+        if (geometry.widthCells() == 1 && geometry.heightCells() == 1) {
+            removeSealedCells(input, scratch);
+        }
     }
 
-    private static int[][][] buildBoundaryComponentIds(List<Component> components) {
-        int[][][] result = new int[Channel.values().length][Direction.values().length][];
-        for (Channel channel : Channel.values()) {
-            for (Direction face : Direction.values()) {
-                int count = 0;
-                for (Component component : components) {
-                    if (component.channel() == channel && component.touches(face)) {
-                        count++;
-                    }
-                }
-                int[] ids = new int[count];
-                int cursor = 0;
-                for (Component component : components) {
-                    if (component.channel() == channel && component.touches(face)) {
-                        ids[cursor++] = component.id();
-                    }
-                }
-                result[channel.ordinal()][face.ordinal()] = ids;
+    /**
+     * Bits 1..16 represent the center section x coordinates; bits 0 and 17 are
+     * the west/east halo. The row grid uses the same one-cell shell for y and z.
+     */
+    private static void removeSealedCells(BuildInput input, BuildScratch scratch) {
+        input.populateFullCollisionRows(scratch);
+        for (int y = 0; y < SIDE; y++) {
+            for (int z = 0; z < SIDE; z++) {
+                int row = (y + 1) * SEALED_SIDE + z + 1;
+                int full = scratch.fullCollisionRows[row];
+                int sealed = (full << 1) & (full >>> 1)
+                        & scratch.fullCollisionRows[row - 1]
+                        & scratch.fullCollisionRows[row + 1]
+                        & scratch.fullCollisionRows[row - SEALED_SIDE]
+                        & scratch.fullCollisionRows[row + SEALED_SIDE];
+                int word = (y << 2) + (z >>> 2);
+                int shift = (z & 3) << 4;
+                int legal = (int) (scratch.legalMask[word] >>> shift) & 0xffff;
+                int sealedAnchors = (sealed >>> 1) & legal & 0xffff;
+                scratch.legalMask[word] &= ~((long) sealedAnchors << shift);
             }
         }
-        return result;
     }
 
-    @SuppressWarnings("unchecked")
-    private static List<Component>[] buildComponentViews(List<Component> components, int[][] ids) {
-        List<Component>[] result = (List<Component>[]) new List<?>[Channel.values().length];
-        for (Channel channel : Channel.values()) {
-            List<Component> view = new ArrayList<>(ids[channel.ordinal()].length);
-            for (int id : ids[channel.ordinal()]) {
-                view.add(components.get(id));
+    private static int minimumFootprintOffset(int width, int positiveEvenAlignment) {
+        return (width & 1) == 1 ? -(width >>> 1) : -(width >>> 1) + positiveEvenAlignment;
+    }
+
+    private static void erodeRows(GeometryKey geometry,
+                                  BuildScratch scratch,
+                                  int anchorY,
+                                  int minX,
+                                  boolean ground) {
+        for (int row = 0; row < EXTENDED_SIDE; row++) {
+            int open = -1;
+            for (int dy = 0; dy < geometry.heightCells(); dy++) {
+                open &= scratch.volumeRows[(anchorY + dy) * EXTENDED_SIDE + row];
             }
-            result[channel.ordinal()] = List.copyOf(view);
-        }
-        return result;
-    }
-
-    @SuppressWarnings("unchecked")
-    private static List<Component>[][] buildBoundaryComponentViews(List<Component> components,
-                                                                    int[][][] ids) {
-        List<Component>[][] result = (List<Component>[][]) new List<?>[Channel.values().length]
-                [Direction.values().length];
-        for (Channel channel : Channel.values()) {
-            for (Direction face : Direction.values()) {
-                int[] faceIds = ids[channel.ordinal()][face.ordinal()];
-                List<Component> view = new ArrayList<>(faceIds.length);
-                for (int id : faceIds) {
-                    view.add(components.get(id));
-                }
-                result[channel.ordinal()][face.ordinal()] = List.copyOf(view);
+            if (ground) open &= scratch.groundRows[anchorY * EXTENDED_SIDE + row];
+            int anchors = 0xffff;
+            for (int dx = 0; dx < geometry.widthCells(); dx++) {
+                anchors &= open >>> (minX + dx - EXTENDED_MIN);
             }
+            scratch.erodedRows[row] = anchors & 0xffff;
         }
-        return result;
     }
 
-    private static int[] buildOutgoingOffsets(int componentCount,
-                                              List<LocalConnection> connections) {
-        int[] offsets = new int[componentCount + 1];
-        for (LocalConnection connection : connections) {
-            if (connection.fromComponent() >= componentCount) {
-                throw new IllegalArgumentException("local connection source is outside the component table");
+    private static void appendErodedLayer(long[] destination,
+                                          int[] rows,
+                                          int y,
+                                          int minZ,
+                                          int width) {
+        int layer = y << 2;
+        for (int z = 0; z < SIDE; z++) {
+            int anchors = 0xffff;
+            for (int dz = 0; dz < width; dz++) {
+                anchors &= rows[z + minZ + dz - EXTENDED_MIN];
             }
-            offsets[connection.fromComponent() + 1]++;
+            destination[layer + (z >>> 2)] |= (long) anchors << ((z & 3) << 4);
         }
-        for (int component = 1; component < offsets.length; component++) {
-            offsets[component] += offsets[component - 1];
-        }
-        return offsets;
     }
 
-    @SuppressWarnings("unchecked")
-    private static List<LocalConnection>[] buildOutgoingViews(int[] offsets,
-                                                               LocalConnection[] connections) {
-        List<LocalConnection>[] result = (List<LocalConnection>[]) new List<?>[offsets.length - 1];
-        for (int component = 0; component < result.length; component++) {
-            result[component] = List.copyOf(Arrays.asList(connections)
-                    .subList(offsets[component], offsets[component + 1]));
-        }
-        return result;
-    }
-
-    private static void buildComponents(Snapshot snapshot,
-                                        Channel channel,
-                                        List<Component> output,
-                                        char[] labels) {
-        int requiredFlag = channel == Channel.GROUND ? GROUND_OPEN : VOLUME_OPEN;
-        int[] queue = new int[CELL_COUNT];
+    private static int labelComponents(Channel channel, BuildScratch scratch) {
+        int componentCount = 0;
         for (int candidate = 0; candidate < CELL_COUNT; candidate++) {
-            if ((snapshot.flags(candidate) & requiredFlag) == 0 || labels[candidate] != 0) {
+            if (!isSet(scratch.legalMask, candidate) || scratch.labels[candidate] != 0) {
                 continue;
             }
-            int id = output.size();
-            if (id >= Character.MAX_VALUE) {
+            if (componentCount >= Character.MAX_VALUE) {
                 throw new IllegalStateException("too many topology components");
             }
             int head = 0;
             int tail = 0;
-            int anchor = candidate;
-            boolean fluid = false;
-            boolean exact = false;
-            long[][] boundaryMasks = new long[Direction.values().length][];
-            queue[tail++] = candidate;
-            labels[candidate] = (char) (id + 1);
+            scratch.queue[tail++] = candidate;
+            scratch.labels[candidate] = (char) (componentCount + 1);
             while (head < tail) {
-                int current = queue[head++];
-                int flags = snapshot.flags(current);
-                fluid |= (flags & FLUID) != 0;
-                exact |= (flags & EXACT_REQUIRED) != 0;
-                int x = x(current);
-                int y = y(current);
-                int z = z(current);
-                addBoundaryCells(boundaryMasks, x, y, z);
-
-                if (channel == Channel.GROUND) {
-                    tail = enqueue(x - 1, y, z, requiredFlag, snapshot, labels, queue, tail, id);
-                    tail = enqueue(x + 1, y, z, requiredFlag, snapshot, labels, queue, tail, id);
-                    tail = enqueue(x, y, z - 1, requiredFlag, snapshot, labels, queue, tail, id);
-                    tail = enqueue(x, y, z + 1, requiredFlag, snapshot, labels, queue, tail, id);
-                } else {
-                    tail = enqueue(x - 1, y, z, requiredFlag, snapshot, labels, queue, tail, id);
-                    tail = enqueue(x + 1, y, z, requiredFlag, snapshot, labels, queue, tail, id);
-                    tail = enqueue(x, y - 1, z, requiredFlag, snapshot, labels, queue, tail, id);
-                    tail = enqueue(x, y + 1, z, requiredFlag, snapshot, labels, queue, tail, id);
-                    tail = enqueue(x, y, z - 1, requiredFlag, snapshot, labels, queue, tail, id);
-                    tail = enqueue(x, y, z + 1, requiredFlag, snapshot, labels, queue, tail, id);
+                int cell = scratch.queue[head++];
+                int x = x(cell);
+                int y = y(cell);
+                int z = z(cell);
+                tail = enqueue(x - 1, y, z, componentCount, scratch, tail);
+                tail = enqueue(x + 1, y, z, componentCount, scratch, tail);
+                tail = enqueue(x, y, z - 1, componentCount, scratch, tail);
+                tail = enqueue(x, y, z + 1, componentCount, scratch, tail);
+                if (channel == Channel.VOLUME) {
+                    tail = enqueue(x, y - 1, z, componentCount, scratch, tail);
+                    tail = enqueue(x, y + 1, z, componentCount, scratch, tail);
                 }
             }
-            output.add(new Component(id, channel, anchor, tail, boundaryMasks, fluid, exact));
+            scratch.componentMetadata[componentCount] = candidate;
+            componentCount++;
         }
-    }
-
-    private static List<LocalConnection> buildGroundConnections(Snapshot snapshot,
-                                                                 char[][] labels) {
-        char[] ground = labels[Channel.GROUND.ordinal()];
-        Map<Long, LocalConnection> best = new HashMap<>();
-        int[][] directions = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
-        for (int cell = 0; cell < CELL_COUNT; cell++) {
-            if (ground[cell] == 0) {
-                continue;
-            }
-            int from = ground[cell] - 1;
-            int x = x(cell);
-            int y = y(cell);
-            int z = z(cell);
-            for (int[] direction : directions) {
-                for (int horizontal = 1; horizontal <= MAX_STRUCTURAL_JUMP; horizontal++) {
-                    int nx = x + direction[0] * horizontal;
-                    int nz = z + direction[1] * horizontal;
-                    if (!inBounds(nx, y, nz)) {
-                        break;
-                    }
-                    if (horizontal > 1 && !structurallyOpen(snapshot, nx - direction[0], y, nz - direction[1])) {
-                        break;
-                    }
-                    for (int dy = -MAX_STRUCTURAL_DROP; dy <= MAX_STRUCTURAL_STEP; dy++) {
-                        int ny = y + dy;
-                        if (!inBounds(nx, ny, nz)) {
-                            continue;
-                        }
-                        int encoded = ground[cellIndex(nx, ny, nz)];
-                        if (encoded == 0 || encoded - 1 == from) {
-                            continue;
-                        }
-                        TraversalKind kind = horizontal == 1 ? TraversalKind.STEP : TraversalKind.JUMP;
-                        LocalConnection candidate = new LocalConnection(
-                                from,
-                                encoded - 1,
-                                Math.max(0, dy),
-                                Math.max(0, -dy),
-                                horizontal,
-                                kind
-                        );
-                        long key = ((long) from << 32) | Integer.toUnsignedLong(encoded - 1);
-                        best.merge(key, candidate, BaseClusterTopology::lessDemanding);
-                    }
-                    if (horizontal == 1) {
-                        continue;
-                    }
-                }
-            }
-        }
-        List<LocalConnection> result = new ArrayList<>(best.values());
-        result.sort(Comparator.comparingInt(LocalConnection::fromComponent)
-                .thenComparingInt(LocalConnection::toComponent));
-        return List.copyOf(result);
-    }
-
-    private static LocalConnection lessDemanding(LocalConnection first, LocalConnection second) {
-        int firstScore = first.rise() * 16 + first.horizontalDistance() * 4 + first.drop();
-        int secondScore = second.rise() * 16 + second.horizontalDistance() * 4 + second.drop();
-        return firstScore <= secondScore ? first : second;
-    }
-
-    private static boolean structurallyOpen(Snapshot snapshot, int x, int y, int z) {
-        return inBounds(x, y, z)
-                && (snapshot.flags(cellIndex(x, y, z)) & VOLUME_OPEN) != 0;
+        return componentCount;
     }
 
     private static int enqueue(int x,
                                int y,
                                int z,
-                               int requiredFlag,
-                               Snapshot snapshot,
-                               char[] labels,
-                               int[] queue,
-                               int tail,
-                               int componentId) {
+                               int componentId,
+                               BuildScratch scratch,
+                               int tail) {
         if (!inBounds(x, y, z)) {
             return tail;
         }
-        int candidate = cellIndex(x, y, z);
-        if ((snapshot.flags(candidate) & requiredFlag) != 0 && labels[candidate] == 0) {
-            labels[candidate] = (char) (componentId + 1);
-            queue[tail++] = candidate;
+        int cell = cellIndex(x, y, z);
+        if (isSet(scratch.legalMask, cell) && scratch.labels[cell] == 0) {
+            scratch.labels[cell] = (char) (componentId + 1);
+            scratch.queue[tail++] = cell;
         }
         return tail;
     }
 
-    private static void addBoundaryCells(long[][] masks, int x, int y, int z) {
-        if (y == 0) {
-            set(boundaryMask(masks, Direction.DOWN), faceIndex(x, z));
-        }
-        if (y == 15) {
-            set(boundaryMask(masks, Direction.UP), faceIndex(x, z));
-        }
-        if (z == 0) {
-            set(boundaryMask(masks, Direction.NORTH), faceIndex(x, y));
-        }
-        if (z == 15) {
-            set(boundaryMask(masks, Direction.SOUTH), faceIndex(x, y));
-        }
-        if (x == 0) {
-            set(boundaryMask(masks, Direction.WEST), faceIndex(z, y));
-        }
-        if (x == 15) {
-            set(boundaryMask(masks, Direction.EAST), faceIndex(z, y));
-        }
-    }
-
-    private static long[] boundaryMask(long[][] masks, Direction face) {
-        long[] mask = masks[face.ordinal()];
-        if (mask == null) {
-            mask = new long[FACE_WORDS];
-            masks[face.ordinal()] = mask;
-        }
-        return mask;
-    }
-
-    private static long[][] buildFluidFaces(Snapshot snapshot) {
-        long[][] faces = new long[Direction.values().length][];
-        for (Direction face : Direction.values()) {
-            long[] mask = new long[FACE_WORDS];
-            for (int v = 0; v < SIDE; v++) {
-                for (int u = 0; u < SIDE; u++) {
-                    if ((snapshot.flags(cellIndex(face, u, v)) & FLUID) != 0) {
-                        set(mask, faceIndex(u, v));
+    private static PrimitiveEdges buildGroundEdges(BuildInput input,
+                                                    GeometryKey geometry,
+                                                    BuildScratch scratch,
+                                                    int componentCount) {
+        Long2LongOpenHashMap merged = scratch.edgeMap;
+        for (int cell = 0; cell < CELL_COUNT; cell++) {
+            int encoded = scratch.labels[cell];
+            if (encoded == 0) {
+                continue;
+            }
+            int from = encoded - 1;
+            int x = x(cell);
+            int y = y(cell);
+            int z = z(cell);
+            for (Direction direction : HORIZONTAL_DIRECTIONS) {
+                for (int horizontal = 1; horizontal <= MAX_STRUCTURAL_JUMP; horizontal++) {
+                    int nx = x + direction.getStepX() * horizontal;
+                    int nz = z + direction.getStepZ() * horizontal;
+                    if (nx < 0 || nx >= SIDE || nz < 0 || nz >= SIDE) {
+                        break;
+                    }
+                    for (int dy = -MAX_STRUCTURAL_DROP; dy <= MAX_STRUCTURAL_STEP; dy++) {
+                        int ny = y + dy;
+                        if (ny < 0 || ny >= SIDE) {
+                            continue;
+                        }
+                        int targetLabel = scratch.labels[cellIndex(nx, ny, nz)];
+                        if (targetLabel == 0 || targetLabel - 1 == from) {
+                            continue;
+                        }
+                        int jumpClass = horizontal - 1;
+                        int requiredStep = Math.max(0, dy);
+                        int requiredDrop = Math.max(0, -dy);
+                        if (!movementEnvelopeOpen(
+                                x,
+                                y,
+                                z,
+                                direction,
+                                horizontal,
+                                dy,
+                                scratch
+                        )) {
+                            continue;
+                        }
+                        long capabilityMask = supportingCapabilities(
+                                requiredStep,
+                                jumpClass,
+                                requiredDrop
+                        );
+                        if (capabilityMask == 0L) {
+                            continue;
+                        }
+                        int target = targetLabel - 1;
+                        long key = ((long) from << 32) | Integer.toUnsignedLong(target);
+                        float cost = (float) Math.sqrt(horizontal * horizontal + dy * dy);
+                        long old = merged.getOrDefault(key, 0L);
+                        long capabilities = (old & 0x3fff_ffffL) | capabilityMask;
+                        float oldCost = old == 0L
+                                ? Float.POSITIVE_INFINITY
+                                : Float.intBitsToFloat((int) (old >>> 32));
+                        merged.put(key,
+                                ((long) Float.floatToRawIntBits(Math.min(oldCost, cost)) << 32)
+                                        | capabilities);
                     }
                 }
             }
-            if (!isEmpty(mask)) {
-                faces[face.ordinal()] = mask;
-            }
         }
-        return faces;
+        long[] keys = merged.keySet().toLongArray();
+        Arrays.sort(keys);
+        int[] offsets = new int[componentCount + 1];
+        for (long key : keys) {
+            offsets[(int) (key >>> 32) + 1]++;
+        }
+        for (int index = 1; index < offsets.length; index++) {
+            offsets[index] += offsets[index - 1];
+        }
+        int[] targets = new int[keys.length];
+        long[] capabilities = new long[keys.length];
+        float[] lowerBounds = new float[keys.length];
+        for (int index = 0; index < keys.length; index++) {
+            long key = keys[index];
+            long value = merged.get(key);
+            targets[index] = (int) key;
+            capabilities[index] = value & 0x3fff_ffffL;
+            lowerBounds[index] = Float.intBitsToFloat((int) (value >>> 32));
+        }
+        return new PrimitiveEdges(offsets, targets, capabilities, lowerBounds);
     }
 
-    private void validate() {
-        for (int id = 0; id < components.size(); id++) {
-            if (components.get(id).id() != id) {
-                throw new IllegalArgumentException("component IDs must be dense and ordered");
-            }
-        }
-        for (Channel channel : Channel.values()) {
-            int channelIndex = channel.ordinal();
-            BitStorage labels = componentLabels[channelIndex];
-            if (labels.getSize() != CELL_COUNT) {
-                throw new IllegalArgumentException("component label array has the wrong size");
-            }
-            for (int cell = 0; cell < CELL_COUNT; cell++) {
-                int encoded = labels.get(cell);
-                if (encoded == 0) {
-                    continue;
-                }
-                if (encoded > componentIdsByChannel[channelIndex].length) {
-                    throw new IllegalArgumentException("component label is outside its channel table");
-                }
-                Component component = component(componentIdsByChannel[channelIndex][encoded - 1]);
-                if (component.channel() != channel) {
-                    throw new IllegalArgumentException("component label points to the wrong channel");
+    private static boolean movementEnvelopeOpen(int x,
+                                                int y,
+                                                int z,
+                                                Direction direction,
+                                                int horizontal,
+                                                int dy,
+                                                BuildScratch scratch) {
+        if (dy < 0) {
+            int landingX = x + direction.getStepX() * horizontal;
+            int landingZ = z + direction.getStepZ() * horizontal;
+            for (int shaftY = y - 1; shaftY > y + dy; shaftY--) {
+                if (!prismOpen(landingX, shaftY, landingZ, scratch)) {
+                    return false;
                 }
             }
         }
-        for (LocalConnection connection : localConnections) {
-            if (component(connection.fromComponent()).channel() != Channel.GROUND
-                    || component(connection.toComponent()).channel() != Channel.GROUND) {
-                throw new IllegalArgumentException("local ground connection references another channel");
-            }
-        }
-    }
-
-    private static long[][] copyFaces(long[][] source) {
-        Objects.requireNonNull(source, "fluidFaces");
-        if (source.length != Direction.values().length) {
-            throw new IllegalArgumentException("fluid face array has the wrong length");
-        }
-        long[][] copy = new long[source.length][];
-        for (int index = 0; index < source.length; index++) {
-            long[] mask = source[index];
-            if (mask != null) {
-                if (mask.length != FACE_WORDS || isEmpty(mask)) {
-                    throw new IllegalArgumentException("invalid fluid face mask");
-                }
-                copy[index] = mask.clone();
-            }
-        }
-        return copy;
-    }
-
-    private static boolean inBounds(int x, int y, int z) {
-        return (x | y | z) >= 0 && x < SIDE && y < SIDE && z < SIDE;
-    }
-
-    private static boolean isEmpty(long[] mask) {
-        for (long word : mask) {
-            if (word != 0L) {
+        for (int distance = 1; distance < horizontal; distance++) {
+            int intermediateY = y + Math.floorDiv(dy * distance, horizontal);
+            int intermediateX = x + direction.getStepX() * distance;
+            int intermediateZ = z + direction.getStepZ() * distance;
+            if (!prismOpen(intermediateX, intermediateY, intermediateZ, scratch)
+                    && !prismOpen(intermediateX, intermediateY + 1, intermediateZ, scratch)) {
                 return false;
             }
         }
         return true;
     }
 
-    private static void set(long[] mask, int index) {
-        mask[index >>> 6] |= 1L << (index & 63);
+    private static boolean prismOpen(int anchorX,
+                                     int anchorY,
+                                     int anchorZ,
+                                     BuildScratch scratch) {
+        if (!inBounds(anchorX, 0, anchorZ) || anchorY < 0 || anchorY >= PRISM_LAYERS) return false;
+        int cell = (anchorY << 8) | (anchorZ << 4) | anchorX;
+        return isSet(scratch.prismMask, cell);
     }
 
-    private static boolean isSet(long[] mask, int index) {
-        return (mask[index >>> 6] & (1L << (index & 63))) != 0L;
+    static long supportingCapabilities(int step, int jumpClass, int drop) {
+        long result = 0L;
+        for (int candidateStep = step; candidateStep <= MAX_STRUCTURAL_STEP; candidateStep++) {
+            for (int candidateJump = jumpClass; candidateJump < 3; candidateJump++) {
+                for (int candidateDrop = drop; candidateDrop <= MAX_STRUCTURAL_DROP; candidateDrop++) {
+                    result |= 1L << new MovementKey(
+                            candidateStep,
+                            candidateJump,
+                            candidateDrop
+                    ).capabilityBit();
+                }
+            }
+        }
+        return result;
     }
 
-    private static int x(int index) {
-        return index & 15;
+    private static BitStorage compactLabels(char[] labels, int componentCount) {
+        int uniform = uniformLabel(labels);
+        if (uniform >= 0) {
+            return new ZeroBitStorage(CELL_COUNT);
+        }
+        int bits = Integer.SIZE - Integer.numberOfLeadingZeros(componentCount);
+        BitStorage packed = new SimpleBitStorage(bits, CELL_COUNT);
+        for (int cell = 0; cell < CELL_COUNT; cell++) {
+            packed.set(cell, labels[cell]);
+        }
+        return packed;
     }
 
-    private static int y(int index) {
-        return index >>> 8;
+    private static int uniformLabel(char[] labels) {
+        int first = labels[0];
+        for (int cell = 1; cell < labels.length; cell++) {
+            if (labels[cell] != first) {
+                return -1;
+            }
+        }
+        return first;
     }
 
-    private static int z(int index) {
-        return index >>> 4 & 15;
+    private void validate() {
+        if (componentLabels.getSize() != CELL_COUNT
+                || outgoingOffsets.length != componentMetadata.length + 1
+                || outgoingTargets.length != outgoingCapabilityMasks.length
+                || outgoingTargets.length != outgoingLowerBounds.length
+                || haloOffsets.length != haloRevisions.length
+                || haloOffsets.length != haloFingerprints.length) {
+            throw new IllegalArgumentException("inconsistent primitive topology arrays");
+        }
+        for (int edge = 0; edge < outgoingTargets.length; edge++) {
+            if (outgoingTargets[edge] < 0 || outgoingTargets[edge] >= componentMetadata.length
+                    || outgoingCapabilityMasks[edge] == 0L
+                    || !Float.isFinite(outgoingLowerBounds[edge])
+                    || outgoingLowerBounds[edge] < 0.0F) {
+                throw new IllegalArgumentException("invalid local topology edge");
+            }
+        }
     }
 
-    private static int cellIndex(Direction face, int u, int v) {
-        return switch (face) {
-            case DOWN -> cellIndex(u, 0, v);
-            case UP -> cellIndex(u, 15, v);
-            case NORTH -> cellIndex(u, v, 0);
-            case SOUTH -> cellIndex(u, v, 15);
-            case WEST -> cellIndex(0, v, u);
-            case EAST -> cellIndex(15, v, u);
-        };
+    private static boolean isSet(long[] mask, int cell) {
+        return (mask[cell >>> 6] & (1L << cell)) != 0L;
+    }
+
+    private static boolean inBounds(int x, int y, int z) {
+        return (x | y | z) >= 0 && x < SIDE && y < SIDE && z < SIDE;
     }
 
     public static int cellIndex(int x, int y, int z) {
         if (!inBounds(x, y, z)) {
-            throw new IndexOutOfBoundsException("section coordinates must be in [0, 15]");
+            throw new IndexOutOfBoundsException("cell coordinates must be in [0, 15]");
         }
         return (y << 8) | (z << 4) | x;
     }
 
+    public static int x(int cell) {
+        return cell & 15;
+    }
+
+    public static int y(int cell) {
+        return (cell >>> 8) & 15;
+    }
+
+    public static int z(int cell) {
+        return (cell >>> 4) & 15;
+    }
+
     private static int faceIndex(int u, int v) {
-        checkFaceCoordinate(u, v);
         return (v << 4) | u;
     }
 
-    private static void checkFaceCoordinate(int u, int v) {
-        if ((u | v) < 0 || u >= SIDE || v >= SIDE) {
-            throw new IndexOutOfBoundsException("face coordinates must be in [0, 15]");
-        }
-    }
+    private static final Direction[] HORIZONTAL_DIRECTIONS = {
+            Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST
+    };
 
     public enum Channel {
         GROUND,
         VOLUME
     }
 
-    public enum TraversalKind {
-        STEP,
-        JUMP
+    public record GeometryKey(Channel channel,
+                              int widthCells,
+                              int heightCells,
+                              boolean acceptsFluid) {
+        public GeometryKey {
+            Objects.requireNonNull(channel, "channel");
+            if (widthCells < 1 || widthCells > SIDE || heightCells < 1 || heightCells > SIDE) {
+                throw new IllegalArgumentException("unsupported macro geometry");
+            }
+        }
+    }
+
+    public record MovementKey(int maxStep, int jumpClass, int maxDrop) {
+        public MovementKey {
+            if (maxStep < 0 || maxStep > MAX_STRUCTURAL_STEP
+                    || jumpClass < 0 || jumpClass > 2
+                    || maxDrop < 0 || maxDrop > MAX_STRUCTURAL_DROP) {
+                throw new IllegalArgumentException("unsupported macro movement");
+            }
+        }
+
+        public int capabilityBit() {
+            return (maxStep * 3 + jumpClass) * 5 + maxDrop;
+        }
+
+        public long capabilityMask() {
+            return 1L << capabilityBit();
+        }
     }
 
     public record TraversalProfile(float width,
@@ -721,149 +653,225 @@ public final class BaseClusterTopology {
             }
         }
 
-        public boolean supports(LocalConnection connection) {
-            if (connection.drop() > maxDrop) {
-                return false;
+        public GeometryKey geometry(Channel channel) {
+            int widthCells = (int) Math.ceil(width);
+            int heightCells = (int) Math.ceil(height);
+            return new GeometryKey(channel, widthCells, heightCells, acceptsFluid);
+        }
+
+        public MovementKey movement(Channel channel) {
+            if (channel == Channel.VOLUME) {
+                return new MovementKey(0, 0, 0);
             }
-            return connection.kind() == TraversalKind.STEP
-                    ? connection.rise() <= maxStep
-                    : connection.rise() <= maxStep && connection.horizontalDistance() <= maxJump;
+            int jumpClass = maxJump <= 1 ? 0 : maxJump - 1;
+            return new MovementKey(maxStep, jumpClass, maxDrop);
         }
     }
 
-    public record LocalConnection(int fromComponent,
-                                  int toComponent,
-                                  int rise,
-                                  int drop,
-                                  int horizontalDistance,
-                                  TraversalKind kind) {
-        private static final int RETAINED_BYTES = 32;
+    /** Immutable facts and sparse loaded-neighbour stamps supplied to the worker. */
+    static final class BuildInput {
+        private final PackedFacts center;
+        private final byte[] offsets;
+        private final PackedFacts[] facts;
+        private final long[] revisions;
+        private final long[] fingerprints;
 
-        public LocalConnection {
-            Objects.requireNonNull(kind, "kind");
-            if (fromComponent < 0 || toComponent < 0 || fromComponent == toComponent
-                    || rise < 0 || drop < 0 || horizontalDistance <= 0) {
-                throw new IllegalArgumentException("invalid local topology connection");
+        BuildInput(PackedFacts center,
+                   byte[] offsets,
+                   PackedFacts[] facts,
+                   long[] revisions,
+                   long[] fingerprints) {
+            this.center = Objects.requireNonNull(center, "center");
+            this.offsets = offsets.clone();
+            this.facts = facts.clone();
+            this.revisions = revisions.clone();
+            this.fingerprints = fingerprints.clone();
+            if (offsets.length != facts.length || offsets.length != revisions.length
+                    || offsets.length != fingerprints.length || offsets.length > 26) {
+                throw new IllegalArgumentException("inconsistent halo facts");
+            }
+            int previous = -1;
+            for (byte encoded : this.offsets) {
+                int value = Byte.toUnsignedInt(encoded);
+                if (value == CENTER_HALO_INDEX || value <= previous || value > 26) {
+                    throw new IllegalArgumentException("halo offsets must be unique and sorted");
+                }
+                previous = value;
             }
         }
 
-        public float lowerBound() {
-            return (float) Math.sqrt(horizontalDistance * horizontalDistance
-                    + (rise + drop) * (rise + drop));
+        static BuildInput center(PackedFacts facts) {
+            return new BuildInput(facts, new byte[0], new PackedFacts[0], new long[0], new long[0]);
         }
-    }
 
-    public static final class Component {
-        private final int id;
-        private final Channel channel;
-        private final int anchorCell;
-        private final int cellCount;
-        private final long[][] boundaryMasks;
-        private final boolean containsFluid;
-        private final boolean requiresExactCheck;
+        PackedFacts center() {
+            return center;
+        }
 
-        Component(int id,
-                  Channel channel,
-                  int anchorCell,
-                  int cellCount,
-                  long[][] boundaryMasks,
-                  boolean containsFluid,
-                  boolean requiresExactCheck) {
-            if (id < 0 || anchorCell < 0 || anchorCell >= CELL_COUNT || cellCount <= 0) {
-                throw new IllegalArgumentException("invalid component identity");
-            }
-            this.id = id;
-            this.channel = Objects.requireNonNull(channel, "channel");
-            this.anchorCell = anchorCell;
-            this.cellCount = cellCount;
-            Objects.requireNonNull(boundaryMasks, "boundaryMasks");
-            if (boundaryMasks.length != Direction.values().length) {
-                throw new IllegalArgumentException("boundary mask array has the wrong length");
-            }
-            this.boundaryMasks = new long[boundaryMasks.length][];
-            for (int index = 0; index < boundaryMasks.length; index++) {
-                long[] mask = boundaryMasks[index];
-                if (mask != null) {
-                    if (mask.length != FACE_WORDS || isEmpty(mask)) {
-                        throw new IllegalArgumentException("invalid component boundary mask");
+        int flags(int x, int y, int z, BuildScratch scratch) {
+            int sectionX = Math.floorDiv(x, SIDE);
+            int sectionY = Math.floorDiv(y, SIDE);
+            int sectionZ = Math.floorDiv(z, SIDE);
+            if (sectionX == 0 && sectionY == 0 && sectionZ == 0) {
+                int flags = center.flags(cellIndex(x, y, z));
+                if (y == 0 && (flags & VOLUME_OPEN) != 0) {
+                    int lowerIndex = Arrays.binarySearch(offsets,
+                            (byte) haloIndex(0, -1, 0));
+                    if (lowerIndex >= 0) {
+                        scratch.haloUsed[lowerIndex] = true;
+                        int below = facts[lowerIndex].flags(cellIndex(x, SIDE - 1, z));
+                        if ((below & VOLUME_OPEN) == 0 || (below & EXACT_REQUIRED) != 0) {
+                            flags |= GROUND_OPEN;
+                        }
                     }
-                    this.boundaryMasks[index] = mask.clone();
+                }
+                return flags;
+            }
+            if (Math.abs(sectionX) > 1 || Math.abs(sectionY) > 1 || Math.abs(sectionZ) > 1) {
+                return 0;
+            }
+            int encoded = haloIndex(sectionX, sectionY, sectionZ);
+            int index = Arrays.binarySearch(offsets, (byte) encoded);
+            if (index < 0) {
+                return 0;
+            }
+            scratch.haloUsed[index] = true;
+            return facts[index].flags(cellIndex(
+                    Math.floorMod(x, SIDE),
+                    Math.floorMod(y, SIDE),
+                    Math.floorMod(z, SIDE)
+            ));
+        }
+
+        private void populateFullCollisionRows(BuildScratch scratch) {
+            for (int y = 0; y < SIDE; y++) {
+                for (int z = 0; z < SIDE; z++) {
+                    int open = scratch.volumeRows[y * EXTENDED_SIDE + z - EXTENDED_MIN];
+                    int full = (~(open >>> -EXTENDED_MIN)) & 0xffff;
+                    scratch.fullCollisionRows[(y + 1) * SEALED_SIDE + z + 1] = full << 1;
                 }
             }
-            this.containsFluid = containsFluid;
-            this.requiresExactCheck = requiresExactCheck;
-        }
-
-        public int id() {
-            return id;
-        }
-
-        public Channel channel() {
-            return channel;
-        }
-
-        public int anchorCell() {
-            return anchorCell;
-        }
-
-        public int anchorX() {
-            return x(anchorCell);
-        }
-
-        public int anchorY() {
-            return y(anchorCell);
-        }
-
-        public int anchorZ() {
-            return z(anchorCell);
-        }
-
-        public int cellCount() {
-            return cellCount;
-        }
-
-        public boolean touches(Direction face) {
-            return boundaryMasks[Objects.requireNonNull(face, "face").ordinal()] != null;
-        }
-
-        public long[] boundaryMask(Direction face) {
-            long[] mask = boundaryMasks[Objects.requireNonNull(face, "face").ordinal()];
-            return mask == null ? new long[FACE_WORDS] : mask.clone();
-        }
-
-        public long boundaryMaskWord(Direction face, int word) {
-            if (word < 0 || word >= FACE_WORDS) {
-                throw new IndexOutOfBoundsException("boundary mask word must be in [0, 3]");
-            }
-            long[] mask = boundaryMasks[Objects.requireNonNull(face, "face").ordinal()];
-            return mask == null ? 0L : mask[word];
-        }
-
-        public int boundaryFaceMask() {
-            int result = 0;
             for (Direction face : Direction.values()) {
-                if (touches(face)) {
-                    result |= 1 << face.ordinal();
+                copyFullCollisionFace(face, scratch);
+            }
+        }
+
+        private void copyFullCollisionFace(Direction face, BuildScratch scratch) {
+            int index = Arrays.binarySearch(offsets, (byte) haloIndex(
+                    face.getStepX(), face.getStepY(), face.getStepZ()
+            ));
+            if (index < 0) {
+                return;
+            }
+            scratch.haloUsed[index] = true;
+            PackedFacts source = facts[index];
+            for (int first = 0; first < SIDE; first++) {
+                for (int second = 0; second < SIDE; second++) {
+                    int sourceX;
+                    int sourceY;
+                    int sourceZ;
+                    int targetX;
+                    int targetY;
+                    int targetZ;
+                    switch (face.getAxis()) {
+                        case X -> {
+                            sourceX = face == Direction.WEST ? SIDE - 1 : 0;
+                            sourceY = first;
+                            sourceZ = second;
+                            targetX = face == Direction.WEST ? -1 : SIDE;
+                            targetY = first;
+                            targetZ = second;
+                        }
+                        case Y -> {
+                            sourceX = first;
+                            sourceY = face == Direction.DOWN ? SIDE - 1 : 0;
+                            sourceZ = second;
+                            targetX = first;
+                            targetY = face == Direction.DOWN ? -1 : SIDE;
+                            targetZ = second;
+                        }
+                        case Z -> {
+                            sourceX = first;
+                            sourceY = second;
+                            sourceZ = face == Direction.NORTH ? SIDE - 1 : 0;
+                            targetX = first;
+                            targetY = second;
+                            targetZ = face == Direction.NORTH ? -1 : SIDE;
+                        }
+                        default -> throw new IllegalStateException("unknown direction axis");
+                    }
+                    if ((source.flags(cellIndex(sourceX, sourceY, sourceZ))
+                            & VOLUME_OPEN) == 0) {
+                        scratch.fullCollisionRows[(targetY + 1) * SEALED_SIDE + targetZ + 1]
+                                |= 1 << (targetX + 1);
+                    }
                 }
             }
-            return result;
         }
 
-        public boolean containsFluid() {
-            return containsFluid;
+        HaloStamps usedStamps(boolean[] used) {
+            int count = 0;
+            for (int index = 0; index < offsets.length; index++) {
+                if (used[index]) count++;
+            }
+            byte[] usedOffsets = new byte[count];
+            long[] usedRevisions = new long[count];
+            long[] usedFingerprints = new long[count];
+            int cursor = 0;
+            for (int index = 0; index < offsets.length; index++) {
+                if (!used[index]) continue;
+                usedOffsets[cursor] = offsets[index];
+                usedRevisions[cursor] = revisions[index];
+                usedFingerprints[cursor] = fingerprints[index];
+                cursor++;
+            }
+            return new HaloStamps(usedOffsets, usedRevisions, usedFingerprints);
         }
 
-        public boolean requiresExactCheck() {
-            return requiresExactCheck;
+    }
+
+    /** Reused by the single topology worker; never retained by a published graph. */
+    static final class BuildScratch {
+        private static final int MAX_PARENT_NODES = CELL_COUNT * 8;
+        private final char[] labels = new char[CELL_COUNT];
+        private final int[] queue = new int[CELL_COUNT];
+        private final int[] componentMetadata = new int[CELL_COUNT];
+        private final long[] legalMask = new long[CELL_COUNT / Long.SIZE];
+        private final long[] prismMask = new long[PRISM_LAYERS * SIDE * SIDE / Long.SIZE];
+        private final int[] volumeRows = new int[(SIDE * 2) * EXTENDED_SIDE];
+        private final int[] groundRows = new int[SIDE * EXTENDED_SIDE];
+        private final int[] erodedRows = new int[EXTENDED_SIDE];
+        private final int[] fullCollisionRows = new int[SEALED_SIDE * SEALED_SIDE];
+        private final boolean[] haloUsed = new boolean[26];
+        private final Long2LongOpenHashMap edgeMap = new Long2LongOpenHashMap();
+        final int[] parentCounts = new int[MAX_PARENT_NODES + 1];
+        final int[] parentCursors = new int[MAX_PARENT_NODES + 1];
+        final int[] parentOrder = new int[MAX_PARENT_NODES];
+        final int[] parentStackNodes = new int[MAX_PARENT_NODES];
+        final int[] parentStackEdges = new int[MAX_PARENT_NODES];
+        final int[] parentComponents = new int[MAX_PARENT_NODES];
+        final boolean[] parentVisited = new boolean[MAX_PARENT_NODES];
+
+        private void reset() {
+            Arrays.fill(labels, (char) 0);
+            Arrays.fill(legalMask, 0L);
+            Arrays.fill(prismMask, 0L);
+            Arrays.fill(volumeRows, 0);
+            Arrays.fill(groundRows, 0);
+            Arrays.fill(fullCollisionRows, 0);
+            Arrays.fill(haloUsed, false);
+            edgeMap.clear();
         }
 
-        private int retainedBytes() {
-            return 56 + Integer.bitCount(boundaryFaceMask()) * FACE_WORDS * Long.BYTES;
-        }
-
-        @Override
-        public String toString() {
-            return "Component{" + id + ", " + channel + ", cells=" + cellCount + '}';
+        int retainedBytes() {
+            return labels.length * Character.BYTES + queue.length * Integer.BYTES
+                    + componentMetadata.length * Integer.BYTES
+                    + (legalMask.length + prismMask.length) * Long.BYTES
+                    + (volumeRows.length + groundRows.length + erodedRows.length
+                    + fullCollisionRows.length) * Integer.BYTES
+                    + haloUsed.length + (parentCounts.length + parentCursors.length
+                    + parentOrder.length + parentStackNodes.length + parentStackEdges.length
+                    + parentComponents.length) * Integer.BYTES + parentVisited.length;
         }
     }
 
@@ -877,23 +885,11 @@ public final class BaseClusterTopology {
                 throw new IllegalArgumentException("snapshot must contain exactly 4096 cells");
             }
             this.cells = cells.clone();
-            long hash = 0xcbf29ce484222325L;
-            for (byte cell : this.cells) {
-                if ((cell & ~VALID_FLAGS) != 0) {
-                    throw new IllegalArgumentException("snapshot contains unknown cell flags");
-                }
-                hash ^= Byte.toUnsignedInt(cell);
-                hash *= 0x100000001b3L;
-            }
-            this.fingerprint = hash;
+            this.fingerprint = fingerprintCells(this.cells);
         }
 
         public int flags(int index) {
             return Byte.toUnsignedInt(cells[index]);
-        }
-
-        public byte[] cells() {
-            return cells.clone();
         }
 
         PackedFacts packedFacts() {
@@ -908,10 +904,12 @@ public final class BaseClusterTopology {
     /** Compact persistent form of the four structural flags for each cell. */
     static final class PackedFacts {
         private final byte[] data;
+        private final int uniformFlags;
         private final long fingerprint;
 
-        private PackedFacts(byte[] data, long fingerprint) {
+        private PackedFacts(byte[] data, int uniformFlags, long fingerprint) {
             this.data = data;
+            this.uniformFlags = uniformFlags;
             this.fingerprint = fingerprint;
         }
 
@@ -921,7 +919,13 @@ public final class BaseClusterTopology {
                 throw new IllegalArgumentException("packed facts must contain exactly 2048 bytes");
             }
             byte[] copy = packed.clone();
-            return new PackedFacts(copy, fingerprint(copy));
+            return new PackedFacts(copy, -1, fingerprintPacked(copy));
+        }
+
+        static PackedFacts allAir() {
+            byte[] cells = new byte[CELL_COUNT];
+            Arrays.fill(cells, (byte) VOLUME_OPEN);
+            return new PackedFacts(null, VOLUME_OPEN, fingerprintCells(cells));
         }
 
         private static PackedFacts fromCells(byte[] cells, long fingerprint) {
@@ -930,37 +934,115 @@ public final class BaseClusterTopology {
                 packed[cell >>> 1] = (byte) ((cells[cell] & VALID_FLAGS)
                         | ((cells[cell + 1] & VALID_FLAGS) << 4));
             }
-            return new PackedFacts(packed, fingerprint);
+            return new PackedFacts(packed, -1, fingerprint);
+        }
+
+        int flags(int cell) {
+            if (uniformFlags >= 0) {
+                return uniformFlags;
+            }
+            int packed = Byte.toUnsignedInt(data[cell >>> 1]);
+            return (cell & 1) == 0 ? packed & VALID_FLAGS : packed >>> 4;
         }
 
         byte[] bytes() {
-            return data.clone();
+            if (data != null) {
+                return data.clone();
+            }
+            byte packed = (byte) (uniformFlags | (uniformFlags << 4));
+            byte[] expanded = new byte[PACKED_FACT_BYTES];
+            Arrays.fill(expanded, packed);
+            return expanded;
         }
 
         long fingerprint() {
             return fingerprint;
         }
 
-        Snapshot snapshot() {
-            byte[] cells = new byte[CELL_COUNT];
-            for (int cell = 0; cell < CELL_COUNT; cell += 2) {
-                int packed = Byte.toUnsignedInt(data[cell >>> 1]);
-                cells[cell] = (byte) (packed & VALID_FLAGS);
-                cells[cell + 1] = (byte) (packed >>> 4);
-            }
-            return new Snapshot(cells);
+        boolean isAllAir() {
+            return uniformFlags == VOLUME_OPEN;
         }
 
-        private static long fingerprint(byte[] data) {
-            long hash = 0xcbf29ce484222325L;
-            for (byte packed : data) {
-                int value = Byte.toUnsignedInt(packed);
-                hash ^= value & VALID_FLAGS;
-                hash *= 0x100000001b3L;
-                hash ^= value >>> 4;
-                hash *= 0x100000001b3L;
-            }
-            return hash;
+        int retainedBytes() {
+            return data == null ? 32 : 32 + data.length;
         }
+
+    }
+
+    private static long fingerprintCells(byte[] cells) {
+        long hash = 0xcbf29ce484222325L;
+        for (byte cell : cells) {
+            if ((cell & ~VALID_FLAGS) != 0) {
+                throw new IllegalArgumentException("snapshot contains unknown cell flags");
+            }
+            hash ^= Byte.toUnsignedInt(cell);
+            hash *= 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    private static long fingerprintPacked(byte[] data) {
+        long hash = 0xcbf29ce484222325L;
+        for (byte packed : data) {
+            int value = Byte.toUnsignedInt(packed);
+            hash ^= value & VALID_FLAGS;
+            hash *= 0x100000001b3L;
+            hash ^= value >>> 4;
+            hash *= 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    private static long signature(SectionPos section,
+                                  long revision,
+                                  long fingerprint,
+                                  GeometryKey geometry,
+                                  byte[] offsets,
+                                  long[] revisions,
+                                  long[] fingerprints) {
+        long hash = 0xcbf29ce484222325L;
+        hash = (hash ^ section.asLong()) * 0x100000001b3L;
+        hash = (hash ^ revision) * 0x100000001b3L;
+        hash = (hash ^ fingerprint) * 0x100000001b3L;
+        hash = (hash ^ geometry.hashCode()) * 0x100000001b3L;
+        for (int index = 0; index < offsets.length; index++) {
+            hash = (hash ^ Byte.toUnsignedInt(offsets[index])) * 0x100000001b3L;
+            hash = (hash ^ revisions[index]) * 0x100000001b3L;
+            hash = (hash ^ fingerprints[index]) * 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    static int haloIndex(int x, int y, int z) {
+        return (x + 1) * 9 + (y + 1) * 3 + z + 1;
+    }
+
+    static int haloX(int encoded) {
+        return encoded / 9 - 1;
+    }
+
+    static int haloY(int encoded) {
+        return encoded / 3 % 3 - 1;
+    }
+
+    static int haloZ(int encoded) {
+        return encoded % 3 - 1;
+    }
+
+    private record PrimitiveEdges(int[] offsets,
+                                  int[] targets,
+                                  long[] capabilities,
+                                  float[] lowerBounds) {
+        private static PrimitiveEdges empty(int componentCount) {
+            return new PrimitiveEdges(
+                    new int[componentCount + 1],
+                    new int[0],
+                    new long[0],
+                    new float[0]
+            );
+        }
+    }
+
+    private record HaloStamps(byte[] offsets, long[] revisions, long[] fingerprints) {
     }
 }

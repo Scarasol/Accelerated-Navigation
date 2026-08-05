@@ -264,11 +264,15 @@ class MacroSearchTest {
         }
 
         @Override
-        public MacroSearch.Expansion expand(MacroSearch.Endpoint from) {
-            return new MacroSearch.Expansion(
-                    edges.getOrDefault(from.id(), List.of()),
-                    dependencies.getOrDefault(from.id(), List.of())
-            );
+        public void expandInto(MacroSearch.Endpoint from,
+                               MacroSearch.ExpansionBuffer output) {
+            for (MacroSearch.Connection connection : edges.getOrDefault(from.id(), List.of())) {
+                output.add(connection);
+            }
+            for (MacroSearch.Dependency dependency :
+                    dependencies.getOrDefault(from.id(), List.of())) {
+                output.addDependency(dependency);
+            }
         }
 
         @Override

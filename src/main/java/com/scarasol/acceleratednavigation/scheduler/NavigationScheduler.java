@@ -30,7 +30,7 @@ public final class NavigationScheduler {
     private static final long TICK_HEADROOM_DEADLINE_NANOS = 45_000_000L;
     private static final long MIN_SLICE_NANOS = 500_000L;
     private static final long MAX_SLICE_NANOS = 1_000_000L;
-    private static final long MAX_DEFICIT_NANOS = TOKEN_CAP_NANOS * 2L;
+    private static final long AGING_INTERVAL_NANOS = 250_000_000L;
     private static final int MAX_EXPANSIONS_PER_SLICE = 64;
     private static final int MAX_PENDING_REQUESTS = 1_024;
 
@@ -38,19 +38,19 @@ public final class NavigationScheduler {
 
     private final MinecraftServer server;
     private final EnumMap<Priority, BandQueue> queues = new EnumMap<>(Priority.class);
-    private final EnumMap<Priority, Long> deficits = new EnumMap<>(Priority.class);
     private final Map<RequestKey, QueuedSearch<?>> pending = new LinkedHashMap<>();
+    private final ArrayList<ResourceKey<Level>> dimensionOrder = new ArrayList<>();
+    private final int[] dimensionCursors = new int[Priority.values().length];
 
     private long tickStartedNanos;
     private long requestSequence;
     private long tokensNanos;
-    private int bandCursor;
+    private boolean draining;
 
     private NavigationScheduler(MinecraftServer server) {
         this.server = server;
         for (Priority priority : Priority.values()) {
             queues.put(priority, new BandQueue());
-            deficits.put(priority, 0L);
         }
     }
 
@@ -83,14 +83,21 @@ public final class NavigationScheduler {
                                                   UUID owner,
                                                   Priority priority,
                                                   ResumableSearch<R> search) {
-        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS, false);
+        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS, false, true);
     }
 
     public <R> CompletableFuture<R> submitDependency(ResourceKey<Level> dimension,
                                                       UUID owner,
                                                       Priority priority,
                                                       ResumableSearch<R> search) {
-        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS, true);
+        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS, true, true);
+    }
+
+    public <R> CompletableFuture<R> submitPrewarm(ResourceKey<Level> dimension,
+                                                   UUID owner,
+                                                   ResumableSearch<R> search) {
+        return submit(dimension, owner, Priority.BACKGROUND, search,
+                MIN_SLICE_NANOS, false, false);
     }
 
     /**
@@ -111,7 +118,8 @@ public final class NavigationScheduler {
                 MIN_SLICE_NANOS,
                 Math.min(MAX_SLICE_NANOS, estimatedCostNanos)
         );
-        return submit(dimension, owner, priority, new AtomicSearch<>(task), startThreshold, false);
+        return submit(dimension, owner, priority, new AtomicSearch<>(task),
+                startThreshold, false, true);
     }
 
     public boolean cancel(ResourceKey<Level> dimension, UUID owner) {
@@ -170,6 +178,7 @@ public final class NavigationScheduler {
             return false;
         }
         request.dependency = true;
+        request.allowAging = true;
         promote(dimension, owner, priority);
         return true;
     }
@@ -194,14 +203,11 @@ public final class NavigationScheduler {
 
     public AdmissionCapacity admissionCapacity() {
         requireServerThread();
-        int background = 0;
         int dependency = 0;
         int parked = 0;
         for (QueuedSearch<?> request : pending.values()) {
             if (request.dependency) {
                 dependency++;
-            } else if (request.priority == Priority.BACKGROUND) {
-                background++;
             }
             if (request.parked) {
                 parked++;
@@ -209,7 +215,6 @@ public final class NavigationScheduler {
         }
         return new AdmissionCapacity(
                 Math.max(0, MAX_PENDING_REQUESTS - ordinaryRequestCount()),
-                background,
                 dependency,
                 pending.size(),
                 parked
@@ -221,7 +226,8 @@ public final class NavigationScheduler {
                                               Priority priority,
                                               ResumableSearch<R> search,
                                               long startThresholdNanos,
-                                              boolean dependency) {
+                                              boolean dependency,
+                                              boolean allowAging) {
         requireServerThread();
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(owner, "owner");
@@ -239,8 +245,7 @@ public final class NavigationScheduler {
         if (replaced != null) {
             cancelQueued(replaced);
         }
-        if (!dependency && ordinaryRequestCount() >= MAX_PENDING_REQUESTS
-                && (priority == Priority.BACKGROUND || !evictNewestBackgroundRequest())) {
+        if (!dependency && ordinaryRequestCount() >= MAX_PENDING_REQUESTS) {
             cancelSafely(search);
             return CompletableFuture.failedFuture(
                     new RejectedExecutionException("accelerated navigation queue is full")
@@ -254,7 +259,9 @@ public final class NavigationScheduler {
                 search,
                 startThresholdNanos,
                 new CompletableFuture<>(),
-                dependency
+                dependency,
+                System.nanoTime(),
+                allowAging
         );
         pending.put(key, request);
         enqueue(request);
@@ -274,114 +281,120 @@ public final class NavigationScheduler {
             return;
         }
 
+        long tickDeadlineNanos = tickStartedNanos + TICK_HEADROOM_DEADLINE_NANOS;
         long elapsedTickNanos = System.nanoTime() - tickStartedNanos;
-        tickStartedNanos = 0L;
         long headroomNanos = TICK_HEADROOM_DEADLINE_NANOS - elapsedTickNanos;
         long budgetNanos = Math.min(Math.max(0L, tokensNanos), headroomNanos);
         if (budgetNanos < MIN_SLICE_NANOS) {
+            tickStartedNanos = 0L;
             return;
         }
 
-        addDeficits(budgetNanos);
-        long schedulerDeadline = System.nanoTime() + budgetNanos;
-        int requestsWithoutProgress = 0;
-        while (!pending.isEmpty() && requestsWithoutProgress < pending.size()) {
-            long remaining = schedulerDeadline - System.nanoTime();
-            if (remaining < MIN_SLICE_NANOS) {
-                break;
-            }
+        long schedulerDeadline = Math.min(
+                System.nanoTime() + budgetNanos,
+                tickDeadlineNanos
+        );
+        try {
+            drain(schedulerDeadline, Integer.MAX_VALUE);
+        } finally {
+            tickStartedNanos = 0L;
+        }
+    }
 
-            Priority priority = nextEligibleBand();
-            if (priority == null) {
-                break;
-            }
-            QueuedSearch<?> request = queues.get(priority).poll();
-            if (request == null) {
-                deficits.put(priority, 0L);
-                requestsWithoutProgress++;
-                continue;
-            }
-            request.queued = false;
-            if (request.future.isDone() || pending.get(request.key) != request) {
-                if (pending.remove(request.key, request)) {
-                    cancelSafely(request.search);
+    private void drain(long schedulerDeadline, int maxSlices) {
+        if (draining) {
+            return;
+        }
+        draining = true;
+        try {
+            int slices = 0;
+            int requestsWithoutProgress = 0;
+            while (!pending.isEmpty() && requestsWithoutProgress < pending.size()) {
+                long remaining = schedulerDeadline - System.nanoTime();
+                if (remaining < MIN_SLICE_NANOS || slices >= maxSlices) {
+                    break;
                 }
-                continue;
-            }
 
-            long deficit = deficits.get(priority);
-            if (deficit < request.startThresholdNanos || remaining < request.startThresholdNanos) {
-                enqueue(request);
-                requestsWithoutProgress++;
-                continue;
-            }
+                QueuedSearch<?> request = takeNext(System.nanoTime());
+                if (request == null) {
+                    break;
+                }
+                request.queued = false;
+                if (request.future.isDone() || pending.get(request.key) != request) {
+                    if (pending.remove(request.key, request)) {
+                        cancelSafely(request.search);
+                    }
+                    continue;
+                }
 
-            long allowance = Math.min(MAX_SLICE_NANOS, Math.min(deficit, remaining));
-            long sliceStarted = System.nanoTime();
-            request.started = true;
-            ResumableSearch.Status status;
-            try {
-                status = Objects.requireNonNull(
-                        request.search.step(
-                                MAX_EXPANSIONS_PER_SLICE,
-                                Math.min(sliceStarted + allowance, schedulerDeadline)
-                        ),
-                        "search step returned null status"
-                );
-            } catch (Throwable failure) {
-                rethrowFatal(failure);
-                long used = chargeSlice(priority, sliceStarted);
-                pending.remove(request.key, request);
-                cancelSafely(request.search);
-                request.future.completeExceptionally(failure);
-                AcceleratedNavigation.LOGGER.error(
-                        "Navigation search for {} failed after {} ns",
-                        request.key.owner,
-                        used,
-                        failure
-                );
-                requestsWithoutProgress = 0;
-                continue;
-            }
+                if (remaining < request.startThresholdNanos) {
+                    enqueue(request);
+                    requestsWithoutProgress++;
+                    continue;
+                }
 
-            chargeSlice(priority, sliceStarted);
-            requestsWithoutProgress = 0;
-            if (status == ResumableSearch.Status.RUNNING) {
-                boolean parked;
+                long allowance = Math.min(MAX_SLICE_NANOS, remaining);
+                long sliceStarted = System.nanoTime();
+                request.started = true;
+                ResumableSearch.Status status;
                 try {
-                    parked = request.search.park(() -> wake(request));
+                    status = Objects.requireNonNull(
+                            request.search.step(
+                                    MAX_EXPANSIONS_PER_SLICE,
+                                    Math.min(sliceStarted + allowance, schedulerDeadline)
+                            ),
+                            "search step returned null status"
+                    );
                 } catch (Throwable failure) {
                     rethrowFatal(failure);
+                    long used = chargeSlice(sliceStarted);
                     pending.remove(request.key, request);
                     cancelSafely(request.search);
                     request.future.completeExceptionally(failure);
                     AcceleratedNavigation.LOGGER.error(
-                            "Navigation search parking for {} failed",
+                            "Navigation search for {} failed after {} ns",
                             request.key.owner,
+                            used,
                             failure
                     );
+                    requestsWithoutProgress = 0;
+                    slices++;
                     continue;
                 }
-                if (parked) {
-                    request.parked = true;
-                } else {
-                    enqueue(request);
+
+                chargeSlice(sliceStarted);
+                requestsWithoutProgress = 0;
+                slices++;
+                if (status == ResumableSearch.Status.RUNNING) {
+                    boolean parked;
+                    try {
+                        parked = request.search.park(() -> wake(request));
+                    } catch (Throwable failure) {
+                        rethrowFatal(failure);
+                        pending.remove(request.key, request);
+                        cancelSafely(request.search);
+                        request.future.completeExceptionally(failure);
+                        AcceleratedNavigation.LOGGER.error(
+                                "Navigation search parking for {} failed",
+                                request.key.owner,
+                                failure
+                        );
+                        continue;
+                    }
+                    if (parked) {
+                        request.parked = true;
+                    } else {
+                        enqueue(request);
+                    }
+                    continue;
                 }
-                continue;
+
+                pending.remove(request.key, request);
+                completeRequest(request, status);
             }
-
-            pending.remove(request.key, request);
-            completeRequest(request, status);
+        } finally {
+            draining = false;
         }
-    }
-
-    private void enqueue(QueuedSearch<?> request) {
-        if (request.queued || request.parked || request.future.isDone()
-                || pending.get(request.key) != request) {
-            return;
-        }
-        request.queued = true;
-        queues.get(request.priority).add(request);
     }
 
     private void wake(QueuedSearch<?> request) {
@@ -395,12 +408,41 @@ public final class NavigationScheduler {
         }
         request.parked = false;
         enqueue(request);
+        continueAfterWake();
     }
 
-    private long chargeSlice(Priority priority, long sliceStarted) {
+    /**
+     * Reuses the current tick's remaining budget for one bounded continuation.
+     * Wake callbacks never mint tokens or recursively drain the scheduler.
+     */
+    private void continueAfterWake() {
+        if (draining || tickStartedNanos == 0L || pending.isEmpty()) {
+            return;
+        }
+        long now = System.nanoTime();
+        long remainingHeadroom = tickStartedNanos + TICK_HEADROOM_DEADLINE_NANOS - now;
+        long budgetNanos = Math.min(tokensNanos, remainingHeadroom);
+        if (budgetNanos < MIN_SLICE_NANOS) {
+            return;
+        }
+        drain(Math.min(now + Math.min(MAX_SLICE_NANOS, budgetNanos),
+                tickStartedNanos + TICK_HEADROOM_DEADLINE_NANOS), 1);
+    }
+
+    private void enqueue(QueuedSearch<?> request) {
+        if (request.queued || request.parked || request.future.isDone()
+                || pending.get(request.key) != request) {
+            return;
+        }
+        request.queued = true;
+        if (!dimensionOrder.contains(request.key.dimension)) {
+            dimensionOrder.add(request.key.dimension);
+        }
+        queues.get(request.priority).add(request);
+    }
+
+    private long chargeSlice(long sliceStarted) {
         long used = Math.max(1L, System.nanoTime() - sliceStarted);
-        deficits.put(priority, deficits.get(priority) - used);
-        // Negative tokens deliberately carry atomic soft-task overruns forward.
         tokensNanos -= used;
         return used;
     }
@@ -412,56 +454,48 @@ public final class NavigationScheduler {
                 : null);
     }
 
-    private void addDeficits(long budgetNanos) {
-        int totalWeight = 0;
+    private QueuedSearch<?> takeNext(long now) {
+        int selectedRank = Integer.MAX_VALUE;
         for (Priority priority : Priority.values()) {
-            if (!queues.get(priority).isEmpty()) {
-                totalWeight += priority.weight;
+            for (ArrayDeque<QueuedSearch<?>> dimension
+                    : queues.get(priority).byDimension.values()) {
+                QueuedSearch<?> candidate = dimension.peekFirst();
+                if (candidate != null) {
+                    selectedRank = Math.min(selectedRank, effectiveRank(candidate, now));
+                }
             }
         }
-        if (totalWeight == 0) {
-            return;
+        if (selectedRank == Integer.MAX_VALUE || dimensionOrder.isEmpty()) {
+            return null;
         }
-        for (Priority priority : Priority.values()) {
-            if (queues.get(priority).isEmpty()) {
-                deficits.put(priority, 0L);
-                continue;
+        int cursor = dimensionCursors[selectedRank];
+        for (int offset = 0; offset < dimensionOrder.size(); offset++) {
+            int index = (cursor + offset) % dimensionOrder.size();
+            ResourceKey<Level> dimension = dimensionOrder.get(index);
+            QueuedSearch<?> selected = null;
+            for (Priority priority : Priority.values()) {
+                QueuedSearch<?> candidate = queues.get(priority).peek(dimension);
+                if (candidate != null && effectiveRank(candidate, now) == selectedRank
+                        && (selected == null || candidate.sequence < selected.sequence)) {
+                    selected = candidate;
+                }
             }
-            long share = budgetNanos * priority.weight / totalWeight;
-            deficits.put(
-                    priority,
-                    Math.min(MAX_DEFICIT_NANOS, deficits.get(priority) + share)
-            );
+            if (selected != null) {
+                dimensionCursors[selectedRank] = (index + 1) % dimensionOrder.size();
+                queues.get(selected.priority).removeFirst(selected);
+                return selected;
+            }
         }
+        throw new IllegalStateException("navigation queue is inconsistent");
     }
 
-    private Priority nextEligibleBand() {
-        Priority[] priorities = Priority.values();
-        for (int index = 0; index < priorities.length; index++) {
-            int candidateIndex = (bandCursor + index) % priorities.length;
-            Priority priority = priorities[candidateIndex];
-            if (!queues.get(priority).isEmpty() && deficits.get(priority) >= MIN_SLICE_NANOS) {
-                bandCursor = (candidateIndex + 1) % priorities.length;
-                return priority;
-            }
+    private static int effectiveRank(QueuedSearch<?> request, long now) {
+        int rank = request.priority.ordinal();
+        if (!request.allowAging) {
+            return rank;
         }
-        return null;
-    }
-
-    private boolean evictNewestBackgroundRequest() {
-        QueuedSearch<?> newest = null;
-        for (QueuedSearch<?> request : pending.values()) {
-            if (!request.dependency && request.priority == Priority.BACKGROUND
-                    && (newest == null || request.sequence > newest.sequence)) {
-                newest = request;
-            }
-        }
-        if (newest == null) {
-            return false;
-        }
-        pending.remove(newest.key, newest);
-        cancelQueued(newest);
-        return true;
+        long waited = Math.max(0L, now - request.enqueuedNanos);
+        return rank - (int) Math.min(rank, waited / AGING_INTERVAL_NANOS);
     }
 
     private int ordinaryRequestCount() {
@@ -516,29 +550,22 @@ public final class NavigationScheduler {
     }
 
     public enum Priority {
-        PLAYER_PURSUIT(8),
-        PLAYER_NEARBY(4),
-        ACTIVE(2),
-        BACKGROUND(1);
-
-        private final int weight;
-
-        Priority(int weight) {
-            this.weight = weight;
-        }
+        PLAYER_PURSUIT,
+        PLAYER_NEARBY,
+        ACTIVE,
+        BACKGROUND;
 
         public boolean higherThan(Priority other) {
-            return weight > Objects.requireNonNull(other, "other").weight;
+            return ordinal() < Objects.requireNonNull(other, "other").ordinal();
         }
     }
 
     public record AdmissionCapacity(int freeSlots,
-                                    int evictableBackgroundSlots,
                                     int dependencyRequests,
                                     int pendingRequests,
                                     int parkedRequests) {
         public AdmissionCapacity {
-            if (freeSlots < 0 || evictableBackgroundSlots < 0 || dependencyRequests < 0
+            if (freeSlots < 0 || dependencyRequests < 0
                     || pendingRequests < 0 || parkedRequests < 0) {
                 throw new IllegalArgumentException("navigation admission capacity cannot be negative");
             }
@@ -555,7 +582,9 @@ public final class NavigationScheduler {
         private final ResumableSearch<R> search;
         private final long startThresholdNanos;
         private final CompletableFuture<R> future;
+        private final long enqueuedNanos;
         private boolean dependency;
+        private boolean allowAging;
         private boolean queued;
         private boolean parked;
         private boolean started;
@@ -566,7 +595,9 @@ public final class NavigationScheduler {
                              ResumableSearch<R> search,
                              long startThresholdNanos,
                              CompletableFuture<R> future,
-                             boolean dependency) {
+                             boolean dependency,
+                             long enqueuedNanos,
+                             boolean allowAging) {
             this.sequence = sequence;
             this.key = key;
             this.priority = priority;
@@ -574,6 +605,8 @@ public final class NavigationScheduler {
             this.startThresholdNanos = startThresholdNanos;
             this.future = future;
             this.dependency = dependency;
+            this.enqueuedNanos = enqueuedNanos;
+            this.allowAging = allowAging;
         }
     }
 
@@ -622,7 +655,6 @@ public final class NavigationScheduler {
     private static final class BandQueue {
         private final Map<ResourceKey<Level>, ArrayDeque<QueuedSearch<?>>> byDimension =
                 new LinkedHashMap<>();
-        private final ArrayDeque<ResourceKey<Level>> dimensions = new ArrayDeque<>();
         private int size;
 
         private void add(QueuedSearch<?> request) {
@@ -630,31 +662,43 @@ public final class NavigationScheduler {
             if (dimensionQueue == null) {
                 dimensionQueue = new ArrayDeque<>();
                 byDimension.put(request.key.dimension, dimensionQueue);
-                dimensions.addLast(request.key.dimension);
             }
-            dimensionQueue.addLast(request);
+            if (dimensionQueue.isEmpty()
+                    || dimensionQueue.peekLast().sequence < request.sequence) {
+                dimensionQueue.addLast(request);
+            } else {
+                ArrayDeque<QueuedSearch<?>> reordered = new ArrayDeque<>(dimensionQueue.size() + 1);
+                boolean inserted = false;
+                for (QueuedSearch<?> queued : dimensionQueue) {
+                    if (!inserted && request.sequence < queued.sequence) {
+                        reordered.addLast(request);
+                        inserted = true;
+                    }
+                    reordered.addLast(queued);
+                }
+                if (!inserted) {
+                    reordered.addLast(request);
+                }
+                dimensionQueue.clear();
+                dimensionQueue.addAll(reordered);
+            }
             size++;
         }
 
-        private QueuedSearch<?> poll() {
-            while (!dimensions.isEmpty()) {
-                ResourceKey<Level> dimension = dimensions.removeFirst();
-                ArrayDeque<QueuedSearch<?>> dimensionQueue = byDimension.get(dimension);
-                if (dimensionQueue == null || dimensionQueue.isEmpty()) {
-                    byDimension.remove(dimension);
-                    continue;
-                }
-                QueuedSearch<?> request = dimensionQueue.removeFirst();
-                size--;
-                if (dimensionQueue.isEmpty()) {
-                    byDimension.remove(dimension);
-                } else {
-                    dimensions.addLast(dimension);
-                }
-                return request;
+        private QueuedSearch<?> peek(ResourceKey<Level> dimension) {
+            ArrayDeque<QueuedSearch<?>> queue = byDimension.get(dimension);
+            return queue == null ? null : queue.peekFirst();
+        }
+
+        private void removeFirst(QueuedSearch<?> request) {
+            ArrayDeque<QueuedSearch<?>> dimensionQueue = byDimension.get(request.key.dimension);
+            if (dimensionQueue == null || dimensionQueue.removeFirst() != request) {
+                throw new IllegalStateException("navigation dimension queue is inconsistent");
             }
-            size = 0;
-            return null;
+            size--;
+            if (dimensionQueue.isEmpty()) {
+                byDimension.remove(request.key.dimension);
+            }
         }
 
         private void remove(QueuedSearch<?> request) {
@@ -665,17 +709,11 @@ public final class NavigationScheduler {
             size--;
             if (dimensionQueue.isEmpty()) {
                 byDimension.remove(request.key.dimension);
-                dimensions.remove(request.key.dimension);
             }
-        }
-
-        private boolean isEmpty() {
-            return size == 0;
         }
 
         private void clear() {
             byDimension.clear();
-            dimensions.clear();
             size = 0;
         }
     }

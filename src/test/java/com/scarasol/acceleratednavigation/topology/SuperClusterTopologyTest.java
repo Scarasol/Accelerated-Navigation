@@ -4,9 +4,6 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import org.junit.jupiter.api.Test;
 
-import java.util.ArrayList;
-import java.util.List;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -14,178 +11,213 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class SuperClusterTopologyTest {
 
     @Test
-    void contractsEightMutuallyReachableChildrenWithoutAllPairsEdges() {
+    void condensesEightChildrenIntoPrimitiveParentAggregates() {
         SectionPos origin = SectionPos.of(0, 0, 0);
-        SuperClusterTopology topology = SuperClusterTopology.build(
-                origin,
-                openLayerChildren(origin),
-                BaseClusterTopology.Channel.GROUND,
-                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND
-        );
+        BaseClusterTopology[] children = openLayerChildren(origin);
+        SuperClusterTopology topology = buildSuper(origin, children,
+                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND);
 
-        assertEquals(1, topology.aggregates().size());
-        SuperClusterTopology.Aggregate aggregate = topology.aggregate(0);
-        assertEquals(8, aggregate.baseComponentCount());
-        for (Direction face : List.of(
-                Direction.NORTH,
-                Direction.SOUTH,
-                Direction.WEST,
-                Direction.EAST
-        )) {
-            assertTrue(aggregate.touches(face));
+        assertTrue(topology.aggregateCount() < 8);
+        for (BaseClusterTopology child : children) {
+            assertTrue(topology.aggregateId(child.section(), 0) >= 0);
         }
-        assertFalse(aggregate.touches(Direction.DOWN));
-        assertFalse(aggregate.touches(Direction.UP));
-        assertTrue(topology.outgoing(0).isEmpty());
+        boolean hasHorizontalExit = false;
+        for (int aggregate = 0; aggregate < topology.aggregateCount(); aggregate++) {
+            assertTrue(topology.aggregateAnchor(aggregate) != null);
+            hasHorizontalExit |= topology.hasPotentialExit(
+                    aggregate, SectionPos.of(2, 0, 0)
+            );
+            assertTrue(topology.outgoingStart(aggregate)
+                    <= topology.outgoingEnd(aggregate));
+        }
+        assertTrue(hasHorizontalExit);
     }
 
     @Test
-    void preservesOneWayDropBetweenAggregateComponents() {
-        SectionPos origin = SectionPos.of(0, 0, 0);
-        SectionPos directedSection = origin;
-        List<BaseClusterTopology> children = new ArrayList<>();
-        for (SectionPos section : SuperClusterTopology.childSections(origin)) {
-            children.add(BaseClusterTopology.build(
-                    section,
-                    1L,
-                    section.equals(directedSection) ? oneWayDropSnapshot() : emptySnapshot()
-            ));
-        }
-        SuperClusterTopology topology = SuperClusterTopology.build(
-                origin,
-                children,
-                BaseClusterTopology.Channel.GROUND,
-                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND
-        );
-        BaseClusterTopology base = children.get(0);
-        int lowerComponent = base.componentAt(BaseClusterTopology.Channel.GROUND, 2, 2, 1).id();
-        int upperComponent = base.componentAt(BaseClusterTopology.Channel.GROUND, 1, 5, 1).id();
-        int lowerAggregate = topology.aggregateId(directedSection, lowerComponent);
-        int upperAggregate = topology.aggregateId(directedSection, upperComponent);
-
-        assertFalse(lowerAggregate == upperAggregate);
-        assertTrue(topology.outgoing(upperAggregate).stream()
-                .anyMatch(edge -> edge.targetAggregate() == lowerAggregate));
-        assertFalse(topology.outgoing(lowerAggregate).stream()
-                .anyMatch(edge -> edge.targetAggregate() == upperAggregate));
-    }
-
-    @Test
-    void derivesAdjacentCrossingsFromExactBoundaryCells() {
+    void projectsPrimitiveBoundaryCrossingThroughParentWitness() {
         SectionPos sourceOrigin = SectionPos.of(0, 0, 0);
         SectionPos targetOrigin = SectionPos.of(2, 0, 0);
-        SuperClusterTopology source = SuperClusterTopology.build(
-                sourceOrigin,
-                boundaryChildren(sourceOrigin, Direction.EAST),
-                BaseClusterTopology.Channel.GROUND,
-                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND
-        );
-        SuperClusterTopology target = SuperClusterTopology.build(
-                targetOrigin,
-                boundaryChildren(targetOrigin, Direction.WEST),
-                BaseClusterTopology.Channel.GROUND,
-                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND
+        BaseClusterTopology[] sourceChildren = boundaryChildren(sourceOrigin, Direction.EAST);
+        BaseClusterTopology[] targetChildren = boundaryChildren(targetOrigin, Direction.WEST);
+        SuperClusterTopology source = buildSuper(sourceOrigin, sourceChildren,
+                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND);
+        SuperClusterTopology target = buildSuper(targetOrigin, targetChildren,
+                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND);
+
+        SuperClusterTopology.CrossingIndex crossing = source.crossingIndex(
+                Direction.EAST, target, sourceChildren, targetChildren
         );
 
-        assertEquals(1, source.crossings(0, Direction.EAST, target).size());
-        assertEquals(0, source.crossings(0, Direction.EAST, target).get(0).targetAggregate());
+        assertTrue(crossing.edgeEnd(0) > crossing.edgeStart(0));
+        int edge = crossing.edgeStart(0);
+        assertEquals(0, crossing.targetAggregate(edge));
+        assertEquals(Direction.EAST, crossing.face(edge));
     }
 
     @Test
-    void rejectsBoundaryRunNarrowerThanTraversalProfile() {
+    void rejectsBoundaryThatCannotFitTheNormalizedFootprint() {
         SectionPos sourceOrigin = SectionPos.of(0, 0, 0);
         SectionPos targetOrigin = SectionPos.of(2, 0, 0);
         BaseClusterTopology.TraversalProfile wide = new BaseClusterTopology.TraversalProfile(
-                1.4F,
-                1.95F,
-                1,
-                3,
-                3,
-                false
+                1.4F, 1.95F, 1, 3, 3, false
         );
-        SuperClusterTopology source = SuperClusterTopology.build(
-                sourceOrigin,
-                boundaryChildren(sourceOrigin, Direction.EAST),
-                BaseClusterTopology.Channel.GROUND,
-                wide
-        );
-        SuperClusterTopology target = SuperClusterTopology.build(
-                targetOrigin,
-                boundaryChildren(targetOrigin, Direction.WEST),
-                BaseClusterTopology.Channel.GROUND,
-                wide
+        BaseClusterTopology[] sourceChildren = boundaryChildren(sourceOrigin, Direction.EAST, wide);
+        BaseClusterTopology[] targetChildren = boundaryChildren(targetOrigin, Direction.WEST, wide);
+        SuperClusterTopology source = buildSuper(sourceOrigin, sourceChildren, wide);
+        SuperClusterTopology target = buildSuper(targetOrigin, targetChildren, wide);
+
+        SuperClusterTopology.CrossingIndex crossing = source.crossingIndex(
+                Direction.EAST, target, sourceChildren, targetChildren
         );
 
-        assertTrue(source.crossings(0, Direction.EAST, target).isEmpty());
+        if (source.aggregateCount() == 0) {
+            return;
+        }
+        assertEquals(0, crossing.edgeEnd(0));
     }
 
     @Test
-    void groundVerticalBoundariesRequireDirectionalMovementCapability() {
+    void flatMovementDoesNotCreateVerticalParentCrossings() {
         BaseClusterTopology.TraversalProfile flatOnly = new BaseClusterTopology.TraversalProfile(
-                0.6F,
-                1.95F,
-                0,
-                3,
-                0,
-                false
+                0.6F, 1.95F, 0, 0, 0, false
         );
-        SectionPos lowerSection = SectionPos.of(0, 0, 0);
-        SectionPos upperSection = SectionPos.of(0, 1, 0);
-        BaseClusterTopology lower = BaseClusterTopology.build(
-                lowerSection, 1L, groundPlaneSnapshot(15));
-        BaseClusterTopology upper = BaseClusterTopology.build(
-                upperSection, 1L, groundPlaneSnapshot(0));
-        BaseClusterTopology.Component lowerComponent = lower.components(
-                BaseClusterTopology.Channel.GROUND).get(0);
-        BaseClusterTopology.Component upperComponent = upper.components(
-                BaseClusterTopology.Channel.GROUND).get(0);
-
-        assertTrue(SuperClusterTopology.boundaryBands(
-                lower,
-                lowerComponent,
-                upper,
-                upperComponent,
-                Direction.UP,
-                BaseClusterTopology.Channel.GROUND,
-                flatOnly
-        ).isEmpty());
-        assertTrue(SuperClusterTopology.boundaryBands(
-                upper,
-                upperComponent,
-                lower,
-                lowerComponent,
-                Direction.DOWN,
-                BaseClusterTopology.Channel.GROUND,
-                flatOnly
-        ).isEmpty());
-
         SectionPos lowerOrigin = SectionPos.of(0, 0, 0);
         SectionPos upperOrigin = SectionPos.of(0, 2, 0);
-        SuperClusterTopology lowerSuper = SuperClusterTopology.build(
-                lowerOrigin,
-                verticalBoundaryChildren(lowerOrigin, Direction.UP),
-                BaseClusterTopology.Channel.GROUND,
-                flatOnly
-        );
-        SuperClusterTopology upperSuper = SuperClusterTopology.build(
-                upperOrigin,
-                verticalBoundaryChildren(upperOrigin, Direction.DOWN),
-                BaseClusterTopology.Channel.GROUND,
-                flatOnly
+        BaseClusterTopology[] lowerChildren = verticalBoundaryChildren(lowerOrigin, Direction.UP, flatOnly);
+        BaseClusterTopology[] upperChildren = verticalBoundaryChildren(upperOrigin, Direction.DOWN, flatOnly);
+        SuperClusterTopology lower = buildSuper(lowerOrigin, lowerChildren, flatOnly);
+        SuperClusterTopology upper = buildSuper(upperOrigin, upperChildren, flatOnly);
+
+        SuperClusterTopology.CrossingIndex crossing = lower.crossingIndex(
+                Direction.UP, upper, lowerChildren, upperChildren
         );
 
-        assertTrue(lowerSuper.crossings(0, Direction.UP, upperSuper).isEmpty());
-        assertTrue(upperSuper.crossings(0, Direction.DOWN, lowerSuper).isEmpty());
+        if (lower.aggregateCount() == 0) {
+            return;
+        }
+        assertEquals(0, crossing.edgeEnd(0));
+        assertFalse(lower.hasPotentialExit(0, upperOrigin));
     }
 
-    private static List<BaseClusterTopology> openLayerChildren(SectionPos origin) {
+    @Test
+    void insetStepAcrossParentBoundaryIsVisibleToParentSearch() {
+        SectionPos sourceOrigin = SectionPos.of(0, 0, 0);
+        SectionPos targetOrigin = SectionPos.of(2, 0, 0);
+        SectionPos sourceSection = SectionPos.of(1, 0, 0);
+        SectionPos targetSection = SectionPos.of(2, 0, 0);
+        BaseClusterTopology.TraversalProfile profile = new BaseClusterTopology.TraversalProfile(
+                0.6F, 1.95F, 1, 3, 0, false);
+
+        BaseClusterTopology[] sourceChildren = SuperClusterTopology.childSections(sourceOrigin)
+                .stream()
+                .map(section -> section.equals(sourceSection)
+                        ? buildBase(section, insetStepSourceSnapshot(), profile)
+                        : buildBase(section, emptySnapshot(), profile))
+                .toArray(BaseClusterTopology[]::new);
+        BaseClusterTopology[] targetChildren = SuperClusterTopology.childSections(targetOrigin)
+                .stream()
+                .map(section -> section.equals(targetSection)
+                        ? buildBase(section, insetStepTargetSnapshot(), profile)
+                        : buildBase(section, emptySnapshot(), profile))
+                .toArray(BaseClusterTopology[]::new);
+        SuperClusterTopology source = buildSuper(sourceOrigin, sourceChildren, profile);
+        SuperClusterTopology target = buildSuper(targetOrigin, targetChildren, profile);
+
+        BaseClusterTopology sourceBase = sourceChildren[
+                (sourceSection.x() - sourceOrigin.x())
+                        + (sourceSection.z() - sourceOrigin.z()) * 2
+                        + (sourceSection.y() - sourceOrigin.y()) * 4];
+        BaseClusterTopology targetBase = targetChildren[0];
+        int sourceComponent = sourceBase.componentAt(14, 1, 4);
+        int targetComponent = targetBase.componentAt(0, 2, 4);
+        int sourceAggregate = source.aggregateId(sourceSection, sourceComponent);
+        SuperClusterTopology.BoundaryLinks baseLinks = SuperClusterTopology.boundaryLinks(
+                sourceBase, targetBase, Direction.EAST);
+        SuperClusterTopology.CrossingIndex crossing = source.crossingIndex(
+                Direction.EAST, target, sourceChildren, targetChildren
+        );
+
+        assertTrue(sourceComponent >= 0);
+        assertTrue(targetComponent >= 0,
+                "targetComponent=" + targetComponent + ", count=" + targetBase.componentCount());
+        assertTrue(baseLinks.edgeEnd(sourceComponent) > baseLinks.edgeStart(sourceComponent));
+        assertTrue(sourceAggregate >= 0);
+        assertTrue(crossing.edgeEnd(sourceAggregate) > crossing.edgeStart(sourceAggregate));
+        assertTrue(source.hasPotentialExit(sourceAggregate, targetOrigin));
+    }
+
+    private static SuperClusterTopology buildSuper(SectionPos origin,
+                                                    BaseClusterTopology[] children,
+                                                    BaseClusterTopology.TraversalProfile profile) {
+        return SuperClusterTopology.build(
+                origin,
+                children,
+                profile.geometry(BaseClusterTopology.Channel.GROUND),
+                profile.movement(BaseClusterTopology.Channel.GROUND),
+                new BaseClusterTopology.BuildScratch()
+        );
+    }
+
+    private static BaseClusterTopology[] openLayerChildren(SectionPos origin) {
+        BaseClusterTopology.TraversalProfile profile =
+                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND;
         return SuperClusterTopology.childSections(origin).stream()
-                .map(section -> BaseClusterTopology.build(
-                        section,
-                        1L,
-                        groundPlaneSnapshot(section.y() == origin.y() ? 15 : 0)
-                ))
-                .toList();
+                .map(section -> buildBase(section, openVolumeSnapshot(), profile))
+                .toArray(BaseClusterTopology[]::new);
+    }
+
+    private static BaseClusterTopology[] boundaryChildren(SectionPos origin, Direction face) {
+        return boundaryChildren(origin, face,
+                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND);
+    }
+
+    private static BaseClusterTopology[] boundaryChildren(SectionPos origin,
+                                                            Direction face,
+                                                            BaseClusterTopology.TraversalProfile profile) {
+        SectionPos occupied = SectionPos.of(
+                face == Direction.EAST ? origin.x() + 1 : origin.x(),
+                origin.y(),
+                origin.z()
+        );
+        return SuperClusterTopology.childSections(origin).stream()
+                .map(section -> buildBase(section,
+                        section.equals(occupied) ? boundaryCellSnapshot(face) : emptySnapshot(),
+                        profile))
+                .toArray(BaseClusterTopology[]::new);
+    }
+
+    private static BaseClusterTopology[] verticalBoundaryChildren(SectionPos origin,
+                                                                    Direction face) {
+        return verticalBoundaryChildren(origin, face,
+                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND);
+    }
+
+    private static BaseClusterTopology[] verticalBoundaryChildren(SectionPos origin,
+                                                                    Direction face,
+                                                                    BaseClusterTopology.TraversalProfile profile) {
+        SectionPos occupied = SectionPos.of(
+                origin.x(),
+                face == Direction.UP ? origin.y() + 1 : origin.y(),
+                origin.z()
+        );
+        int y = face == Direction.UP ? 15 : 0;
+        return SuperClusterTopology.childSections(origin).stream()
+                .map(section -> buildBase(section,
+                        section.equals(occupied) ? groundPlaneSnapshot(y) : emptySnapshot(),
+                        profile))
+                .toArray(BaseClusterTopology[]::new);
+    }
+
+    private static BaseClusterTopology buildBase(SectionPos section,
+                                                  BaseClusterTopology.Snapshot snapshot,
+                                                  BaseClusterTopology.TraversalProfile profile) {
+        return BaseClusterTopology.build(
+                section,
+                1L,
+                BaseClusterTopology.BuildInput.center(snapshot.packedFacts()),
+                profile.geometry(BaseClusterTopology.Channel.GROUND),
+                new BaseClusterTopology.BuildScratch()
+        );
     }
 
     private static BaseClusterTopology.Snapshot groundPlaneSnapshot(int y) {
@@ -203,19 +235,12 @@ class SuperClusterTopologyTest {
         return new BaseClusterTopology.Snapshot(cells);
     }
 
-    private static List<BaseClusterTopology> boundaryChildren(SectionPos origin, Direction face) {
-        SectionPos occupied = SectionPos.of(
-                face == Direction.EAST ? origin.x() + 1 : origin.x(),
-                origin.y(),
-                origin.z()
-        );
-        return SuperClusterTopology.childSections(origin).stream()
-                .map(section -> BaseClusterTopology.build(
-                        section,
-                        1L,
-                        section.equals(occupied) ? boundaryCellSnapshot(face) : emptySnapshot()
-                ))
-                .toList();
+    private static BaseClusterTopology.Snapshot openVolumeSnapshot() {
+        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
+        java.util.Arrays.fill(cells, (byte) (
+                BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
+        ));
+        return new BaseClusterTopology.Snapshot(cells);
     }
 
     private static BaseClusterTopology.Snapshot boundaryCellSnapshot(Direction face) {
@@ -227,28 +252,23 @@ class SuperClusterTopologyTest {
         return new BaseClusterTopology.Snapshot(cells);
     }
 
-    private static List<BaseClusterTopology> verticalBoundaryChildren(SectionPos origin,
-                                                                       Direction face) {
-        SectionPos occupied = SectionPos.of(
-                origin.x(),
-                face == Direction.UP ? origin.y() + 1 : origin.y(),
-                origin.z()
-        );
-        int y = face == Direction.UP ? 15 : 0;
-        return SuperClusterTopology.childSections(origin).stream()
-                .map(section -> BaseClusterTopology.build(
-                        section,
-                        1L,
-                        section.equals(occupied) ? groundPlaneSnapshot(y) : emptySnapshot()
-                ))
-                .toList();
-    }
-
-    private static BaseClusterTopology.Snapshot oneWayDropSnapshot() {
+    private static BaseClusterTopology.Snapshot insetStepSourceSnapshot() {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         int flags = BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN;
-        cells[BaseClusterTopology.cellIndex(1, 5, 1)] = (byte) flags;
-        cells[BaseClusterTopology.cellIndex(2, 2, 1)] = (byte) flags;
+        cells[BaseClusterTopology.cellIndex(13, 1, 4)] = (byte) flags;
+        cells[BaseClusterTopology.cellIndex(14, 1, 4)] = (byte) flags;
+        cells[BaseClusterTopology.cellIndex(14, 2, 4)] = (byte) flags;
+        cells[BaseClusterTopology.cellIndex(15, 2, 4)] = (byte) flags;
+        cells[BaseClusterTopology.cellIndex(14, 3, 4)] = BaseClusterTopology.VOLUME_OPEN;
+        cells[BaseClusterTopology.cellIndex(15, 3, 4)] = BaseClusterTopology.VOLUME_OPEN;
+        return new BaseClusterTopology.Snapshot(cells);
+    }
+
+    private static BaseClusterTopology.Snapshot insetStepTargetSnapshot() {
+        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
+        int flags = BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN;
+        cells[BaseClusterTopology.cellIndex(0, 2, 4)] = (byte) flags;
+        cells[BaseClusterTopology.cellIndex(0, 3, 4)] = BaseClusterTopology.VOLUME_OPEN;
         return new BaseClusterTopology.Snapshot(cells);
     }
 

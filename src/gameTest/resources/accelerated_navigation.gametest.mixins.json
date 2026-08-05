@@ -5,7 +5,13 @@
   "compatibilityLevel": "JAVA_17",
   "mixins": [
     "MacroSearchMetricsProbeMixin",
-    "TopologyServiceBudgetProbeMixin"
+    "TopologyServiceBudgetProbeMixin",
+    "MacroQueryOrchestrationProbeMixin",
+    "MacroQueryLifecycleProbeMixin",
+    "MacroFlightLifecycleProbeMixin",
+    "NavigationSchedulerProbeMixin",
+    "BlockCollisionMetricsProbeMixin",
+    "SnapshotSearchProbeMixin"
   ],
   "injectors": {
     "defaultRequire": 1

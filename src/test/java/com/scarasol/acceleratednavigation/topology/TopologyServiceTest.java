@@ -16,6 +16,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -66,7 +67,9 @@ class TopologyServiceTest {
         assertTrue(TopologyService.navigationGeometryChanged(
                 drySlab.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
                 false,
+                true,
                 wetSlab.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
+                true,
                 true
         ));
     }
@@ -159,9 +162,89 @@ class TopologyServiceTest {
         }
     }
 
+    @Test
+    void topologyWorkerKeepsPurePrewarmBelowActiveWork() throws Exception {
+        TopologyTaskExecutor executor = new TopologyTaskExecutor(
+                "topology-strict-priority-test",
+                Thread.NORM_PRIORITY
+        );
+        CountDownLatch blockerStarted = new CountDownLatch(1);
+        CountDownLatch releaseBlocker = new CountDownLatch(1);
+        CountDownLatch completed = new CountDownLatch(2);
+        List<String> order = Collections.synchronizedList(new ArrayList<>());
+        try {
+            executor.submit(Level.OVERWORLD, NavigationScheduler.Priority.BACKGROUND, () -> {
+                blockerStarted.countDown();
+                await(releaseBlocker);
+            });
+            assertTrue(blockerStarted.await(2, TimeUnit.SECONDS));
+            executor.submit(
+                    Level.OVERWORLD,
+                    NavigationScheduler.Priority.BACKGROUND,
+                    () -> {
+                        order.add("prewarm");
+                        completed.countDown();
+                    },
+                    false
+            );
+            executor.submit(
+                    Level.OVERWORLD,
+                    NavigationScheduler.Priority.ACTIVE,
+                    () -> {
+                        order.add("active");
+                        completed.countDown();
+                    }
+            );
+            releaseBlocker.countDown();
+            assertTrue(completed.await(2, TimeUnit.SECONDS));
+            assertEquals(List.of("active", "prewarm"), order);
+        } finally {
+            releaseBlocker.countDown();
+            executor.shutdown();
+        }
+    }
+
+    @Test
+    void demandQueueSkipsIneligibleHeadWhenLaterDemandCanRun() throws Exception {
+        Class<?> demandQueue = Arrays.stream(TopologyService.class.getDeclaredClasses())
+                .filter(type -> type.getSimpleName().equals("DemandQueue"))
+                .findFirst()
+                .orElseThrow();
+        Method firstEligible = demandQueue.getDeclaredMethod(
+                "firstEligible",
+                Iterable.class,
+                java.util.function.Predicate.class
+        );
+        firstEligible.setAccessible(true);
+        ArrayDeque<String> candidates = new ArrayDeque<>(List.of("blocked", "ready"));
+        @SuppressWarnings("unchecked")
+        String selected = (String) firstEligible.invoke(
+                null,
+                candidates,
+                (java.util.function.Predicate<String>) candidate -> candidate.equals("ready")
+        );
+        assertEquals("ready", selected);
+    }
+
     private static int classify(BlockState state, boolean supportBelow) {
-        VoxelShape shape = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
-        return TopologyService.classifyCell(state, shape, supportBelow);
+        try {
+            Method method = TopologyService.class.getDeclaredMethod(
+                    "staticCellClassification",
+                    BlockState.class
+            );
+            method.setAccessible(true);
+            int flags = (int) method.invoke(null, state);
+            flags &= BaseClusterTopology.VOLUME_OPEN
+                    | BaseClusterTopology.GROUND_OPEN
+                    | BaseClusterTopology.FLUID
+                    | BaseClusterTopology.EXACT_REQUIRED;
+            if (supportBelow && (flags & BaseClusterTopology.VOLUME_OPEN) != 0) {
+                flags |= BaseClusterTopology.GROUND_OPEN;
+            }
+            return flags;
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("static cell classification is not available", failure);
+        }
     }
 
     private static boolean navigationGeometryChanged(BlockState oldState, BlockState newState) {
@@ -180,8 +263,10 @@ class TopologyServiceTest {
         return TopologyService.navigationGeometryChanged(
                 oldState.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
                 oldFluid,
+                !oldState.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).isEmpty(),
                 newState.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
-                newFluid
+                newFluid,
+                !newState.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).isEmpty()
         );
     }
 

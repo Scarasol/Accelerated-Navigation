@@ -35,6 +35,7 @@ public final class AcceleratedNavigation {
         modBus.addListener(this::onConfigReloaded);
 
         MinecraftForge.EVENT_BUS.addListener(this::onServerTick);
+        MinecraftForge.EVENT_BUS.addListener(this::onChunkLoad);
         MinecraftForge.EVENT_BUS.addListener(this::onChunkUnload);
         MinecraftForge.EVENT_BUS.addListener(this::onLevelSave);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopped);
@@ -72,9 +73,17 @@ public final class AcceleratedNavigation {
         }
     }
 
+    private void onChunkLoad(ChunkEvent.Load event) {
+        if (event.getLevel() instanceof net.minecraft.server.level.ServerLevel level) {
+            TopologyService.onChunkLoaded(level, event.getChunk().getPos());
+        }
+    }
+
     private void onLevelSave(LevelEvent.Save event) {
         if (event.getLevel() instanceof net.minecraft.server.level.ServerLevel level) {
             TopologyService.onLevelSave(level);
         }
     }
 }
+
+
