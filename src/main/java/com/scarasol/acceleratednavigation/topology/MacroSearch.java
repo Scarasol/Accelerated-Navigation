@@ -203,6 +203,32 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         dependenciesAvailable(List.of(Objects.requireNonNull(dependency, "dependency")));
     }
 
+    /**
+     * Marks a pending dependency as unavailable without reopening the blocked node.
+     * The node may still have another pending dependency; once those are resolved,
+     * the unavailable edge remains excluded and the ready frontier can continue.
+     */
+    void dependencyUnavailable(DependencyKey dependency) {
+        Objects.requireNonNull(dependency, "dependency");
+        Set<SearchNode> affected = waitingByDependency.remove(dependency);
+        if (affected == null || affected.isEmpty()) {
+            return;
+        }
+        for (SearchNode node : affected) {
+            if (!blockedNodes.contains(node) || !node.pendingDependencies.contains(dependency)) {
+                continue;
+            }
+            Set<DependencyKey> pending = new HashSet<>(node.pendingDependencies);
+            pending.remove(dependency);
+            Set<DependencyKey> unavailable = new HashSet<>(node.unavailableDependencies);
+            unavailable.add(dependency);
+            node.pendingDependencies = Set.copyOf(pending);
+            node.unavailableDependencies = Set.copyOf(unavailable);
+        }
+        waitingForTopology = false;
+        blockedSection = null;
+    }
+
     void dependenciesAvailable(Iterable<DependencyKey> dependencies) {
         Objects.requireNonNull(dependencies, "dependencies");
         Set<SearchNode> affectedNodes = new HashSet<>();
@@ -951,5 +977,4 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         }
     }
 }
-
 

@@ -23,6 +23,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -200,6 +201,43 @@ class TopologyServiceTest {
             assertEquals(List.of("active", "prewarm"), order);
         } finally {
             releaseBlocker.countDown();
+            executor.shutdown();
+        }
+    }
+
+    @Test
+    void continuationDoesNotLeaveForegroundWorkPinned() throws Exception {
+        TopologyTaskExecutor executor = new TopologyTaskExecutor(
+                "topology-continuation-accounting-test",
+                Thread.NORM_PRIORITY
+        );
+        CountDownLatch continuationComplete = new CountDownLatch(1);
+        CountDownLatch prewarmComplete = new CountDownLatch(1);
+        try {
+            AtomicInteger slices = new AtomicInteger();
+            executor.submitSearch(
+                    Level.OVERWORLD,
+                    NavigationScheduler.Priority.ACTIVE,
+                    TopologyTaskExecutor.WorkKind.QUICK_SEARCH,
+                    false,
+                    () -> {
+                        if (slices.getAndIncrement() == 0) {
+                            assertTrue(executor.requeueCurrent(
+                                    NavigationScheduler.Priority.ACTIVE,
+                                    TopologyTaskExecutor.WorkKind.LONG_SEARCH,
+                                    continuationComplete::countDown
+                            ));
+                        }
+                    }
+            );
+            assertTrue(continuationComplete.await(2, TimeUnit.SECONDS));
+            executor.submitPrewarm(
+                    Level.OVERWORLD,
+                    NavigationScheduler.Priority.BACKGROUND,
+                    prewarmComplete::countDown
+            );
+            assertTrue(prewarmComplete.await(2, TimeUnit.SECONDS));
+        } finally {
             executor.shutdown();
         }
     }

@@ -50,9 +50,7 @@ public abstract class MacroQueryOrchestrationProbeMixin {
         MacroSearchMetricsProbe.recordPendingDependencyPass();
     }
 
-    @Inject(method = "drainDependencyNotifications",
-            at = @At(value = "INVOKE",
-                    target = "Ljava/util/Set;copyOf(Ljava/util/Collection;)Ljava/util/Set;"))
+    @Inject(method = "drainDependencyNotifications", at = @At("HEAD"))
     private void acceleratedNavigation$recordDependencyCompletionBatch(
             long scheduledGeneration,
             CallbackInfo callback) {
@@ -70,9 +68,4 @@ public abstract class MacroQueryOrchestrationProbeMixin {
         }
     }
 
-    @Inject(method = "signalWakeup",
-            at = @At(value = "INVOKE", target = "Ljava/lang/Runnable;run()V"))
-    private void acceleratedNavigation$recordWake(CallbackInfo callback) {
-        MacroSearchMetricsProbe.recordQueryWake();
-    }
 }

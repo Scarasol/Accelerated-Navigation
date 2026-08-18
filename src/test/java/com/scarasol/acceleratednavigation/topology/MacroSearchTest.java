@@ -125,6 +125,31 @@ class MacroSearchTest {
     }
 
     @Test
+    void convertsPendingDependencyToUnavailableWithoutReopeningTheSameEdge() {
+        SectionPos unavailable = SectionPos.of(1, 0, 0);
+        TestGraph graph = new TestGraph(0, 3);
+        graph.edge(10, 0, 1, 1.0F);
+        graph.edge(11, 0, 2, 4.0F);
+        graph.edge(12, 2, 3, 1.0F);
+        graph.pending(1, unavailable);
+        MacroSearch search = new MacroSearch(graph, 1.0F);
+
+        search.step(64, Long.MAX_VALUE);
+        assertTrue(search.waitingForTopology());
+
+        graph.clearDependencies(1);
+        search.dependencyUnavailable(new MacroSearch.DependencyKey(
+                MacroSearch.DependencyKind.BASE_CLUSTER, unavailable));
+        runToCompletion(search);
+
+        assertEquals(MacroSearch.Status.SUCCEEDED, search.status());
+        assertEquals(List.of(11L, 12L), search.result().connections().stream()
+                .map(MacroSearch.Connection::id)
+                .toList());
+        assertEquals(0, search.metrics().reexpandedBlockedNodes());
+    }
+
+    @Test
     void reportsUnavailableOnlyAfterReadyGraphExhaustion() {
         SectionPos unavailable = SectionPos.of(1, 0, 0);
         TestGraph graph = new TestGraph(0, 2);
