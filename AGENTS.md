@@ -1,57 +1,54 @@
-# Accelerated Navigation Agent Rules
+# Accelerated Navigation 工程工作规则
 
-These rules apply to the whole repository. They define how work is performed, not the
-architecture that a future change must implement.
+本文件适用于整个仓库，只规定工程工作方式，不代替具体功能的活动需求与设计文档。
 
-## Sources Of Truth
+本文件是强制阶段路由入口。Codex 自动加载本文件后，必须根据当前工作阶段读取 `docs/agent-process/` 中对应的完整规则，并识别、完整读取本轮适用的技能说明；阶段文件和适用技能都不是可选参考。不得只读取本文件后开始实质工作，也不得默认一次读取全部四个阶段文件或所有技能。
 
-1. Current production source and runtime entry points describe what the product does now.
-2. A user-approved active specification describes the intended change.
-3. Accepted ADRs describe durable decisions and their rationale.
-4. Tests, benchmarks, and reports are evidence. They do not define production reachability or
-   justify an otherwise unused representation.
-5. Plans, handoffs, recovered conversations, and superseded designs are context only unless the
-   user explicitly promotes them to the active specification.
+## 阶段规则文件
 
-When sources disagree, inspect the production source and surface the conflict. Do not silently
-force code to match a stale document.
+- 需求确认：`docs/agent-process/01-requirements.md`
+- 实现：`docs/agent-process/02-implementation.md`
+- 审计：`docs/agent-process/03-audit.md`
+- 测试：`docs/agent-process/04-testing.md`
 
-## Before A Substantial Change
+每个阶段文件是该阶段流程、开始条件、交付物、禁止事项和用户审核门的持久化规则来源。适用技能也是本轮规则来源，负责它所覆盖的专门流程、领域约束、工具使用和验证要求；技能与阶段文件共同生效，不能互相替代。具体任务的阶段状态和用户批准原文只在该轮活动需求与设计文档、实现记录、审计卷宗或测试报告中维护；本入口和四个阶段范式文件不保存状态副本，避免两份状态不一致。
 
-- Run the user-invoked `grill-me` skill for a new feature, architecture change, or broad rewrite.
-- Discover facts from the repository, Minecraft sources, and primary references instead of asking
-  the user factual questions that can be answered directly.
-- Put each material design decision to the user one at a time with a recommended answer.
-- Do not implement the proposal until the user confirms that shared understanding has been reached.
-- Record the approved target in a dedicated specification. Record only durable, accepted
-  architectural decisions as ADRs.
+## 每个回合必须执行的自动路由
 
-## Implementation Discipline
+在回答实质问题、检查仓库、制定方案、修改文件、运行编译或执行测试之前，必须依次完成：
 
-- Start from a real Forge, Mixin, Navigation, or public integration entry point and preserve a
-  production-reachable vertical slice.
-- Keep one canonical representation for each fact. Every derived representation must name its
-  production consumer, identity, invalidators, lifetime, and bounded cost.
-- Prefer a deep module with a small interface over pass-through coordinators and speculative seams.
-  One implementation does not justify an abstraction intended for hypothetical alternatives.
-- When replacing behavior, remove superseded production paths, state, metrics, codecs, and tests.
-  Do not retain obsolete production code solely for compatibility with old tests.
-- Keep changes within the approved specification. New infrastructure, caches, queues, workers, or
-  compatibility layers require an explicit demonstrated need.
-- Do not describe a feature as implemented until a production caller can reach it.
+1. 根据用户最新请求、活动需求与设计文档、持久化实现记录或审计卷宗，确定当前工作属于哪个阶段。
+2. 完整读取对应阶段文件。读取输出被截断时，必须按明确行段继续读取到文件末尾。
+3. 根据用户是否点名技能以及任务是否符合技能说明，识别本轮全部适用技能；完整读取每个适用技能的 `SKILL.md` 和其中明确要求的相关资源。读取被截断时继续到文件末尾，不能只依赖技能名称或简介。
+4. 合并当前阶段规则与适用技能规则。发生冲突时遵守系统、开发者和用户当前明确指令的优先级；技能不得覆盖用户明确要求、扩大操作授权或绕过阶段审核门。无法消解的冲突必须先报告并停止相关实质工作。
+5. 在 commentary 中告诉用户本回合读取了哪个阶段文件、使用哪些技能以及各自适用原因。没有适用技能时也要以阶段文件为准继续工作，不得虚构技能要求。
+6. 只有完成阶段文件和全部适用技能的读取与冲突检查后，才能执行该阶段的任何实质工作。
 
-## White-Box Review
+这套选择由 Codex 在每个回合自动执行，不要求用户重复提醒。聊天摘要、计划、交接说明或模型记忆不能代替阶段文件和适用技能的本轮完整读取。
 
-- Review the complete affected production source, not only the diff and not only test behavior.
-- Trace runtime entry points, callers, canonical and derived data, retained state, publication,
-  invalidation, failure, shutdown, replacement, loop bounds, allocations, and resource limits.
-- Search production and test source for remaining consumers of replaced APIs and representations.
-- Compilation and tests are useful feedback but cannot override an unresolved structural finding.
-- Follow the validation policy agreed in the active specification or current user instruction.
+### 阶段判定
 
-## Documentation
+- 讨论新需求、问题诊断、候选方案、架构、模块边界、线程、状态所有权、数据表示、持久化、缓存、队列、资源上限、失败语义、代码量预估或测试方案时，读取需求确认规则。
+- 按已经批准的活动设计修改生产或测试源码、删除旧模块、处理编译错误或形成模块实现记录时，读取实现规则。
+- 对已经实现并编译的模块进行白盒审计、结构审计、设计一致性检查、安全冗余检查、历史兼容检查、残留检查、代码量归因或系统级复核时，读取审计规则。
+- 执行单元测试、GameTest、真实地形测试、性能运行、压力测试、日志统计、历史数据对比或形成测试报告时，读取测试规则。
+- 仅维护本套工程工作规则时，读取所有将被修改的阶段文件；这不构成产品开发阶段的自动跃迁。
+- 同一请求同时包含多个阶段时，只能从尚未完成且最早的阶段开始。只有前一阶段文件规定的用户审核门已经明确通过，才能在后续回合读取并进入下一阶段。
+- 无法确定阶段时，选择更早的阶段。不得用不确定性绕过需求确认、实现记录或审计授权门。
 
-- Keep current architecture descriptions separate from proposed changes.
-- Keep unapproved or rolled-back plans clearly marked as historical proposals.
-- Keep performance reports bound to the exact source that produced them.
-- Avoid layered override sections. Rewrite or archive stale material when a decision changes.
+### 中断、压缩和“继续”
+
+- 新回合、上下文压缩、中断恢复或工作交接后，必须重新读取本入口、当前阶段文件和本轮适用技能，并从持久化活动文档、实现记录或审计卷宗恢复状态。
+- “继续”“按你的来”或类似表述只允许继续持久化记录中尚未完成的当前阶段，不表示用户批准了阶段结论，也不允许跨越用户审核门。
+- 持久化记录与聊天摘要冲突时，以当前生产源码、用户已批准的活动规格和阶段文件规定的证据为准；先向用户报告冲突，不得静默选择摘要。
+- 对应阶段文件或适用技能缺失、无法完整读取或规则之间发生无法消解的冲突时，停止相关实质工作并报告，不得凭记忆补全规则。
+
+## 共同授权边界
+
+四个阶段分别由用户审核。审核只以对话中用户明确写出的批准原文为准；对其他事项的批准不自动视为当前阶段通过。
+
+阶段之间使用真实对话回合作为授权边界：完成当前阶段规定的交付后必须结束当前回合；在用户明确批准前，不得进入下一阶段。助手写入的状态、报告、脚本、测试结果或台账不能代替用户授权。
+
+技能只能约束已获授权范围内的工作，不能自行授予修改、测试、联网、Git、子智能体、外部写入或跨阶段行动的权限。
+
+未经用户在当前回合明确授权，不得使用 Git 或子智能体。

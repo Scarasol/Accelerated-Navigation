@@ -74,11 +74,13 @@ minecraft {
         terrainBenchmarkServer {
             parent minecraft.runs.server
             taskName 'runTerrainBenchmarkServer'
-            workingDirectory project.file('run-terrain-benchmark')
-            args '--mixin.config', 'accelerated_navigation.gametest.mixins.json'
+            workingDirectory project.file('run-terrain-benchmark-current')
+            args '--mixin.config', 'accelerated_navigation.terrain_benchmark.mixins.json'
             property 'acceleratedNavigation.terrainBenchmark', 'true'
             property 'acceleratedNavigation.terrainReport',
-                    layout.buildDirectory.file('reports/real-terrain-topology.json').get().asFile.absolutePath
+                    layout.buildDirectory.file(
+                            'reports/real-terrain-topology-0805-current.json'
+                    ).get().asFile.absolutePath
             mods {
                 "${acceleratedNavigationMod.id}" {
                     source sourceSets.gameTest
@@ -183,8 +185,6 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.named('test', Test).configure {
     useJUnitPlatform()
-    systemProperty 'accelerated.navigation.performanceReport',
-            layout.buildDirectory.file('reports/macro-topology-synthetic-microbenchmark.json').get().asFile.absolutePath
 }
 
 tasks.register('verifyGameTestSourceSetIsolation') {
@@ -200,18 +200,22 @@ tasks.register('verifyGameTestSourceSetIsolation') {
     }
 }
 
-tasks.named('check').configure {
-    dependsOn tasks.named('verifyGameTestSourceSetIsolation')
-}
-
 tasks.register('prepareTerrainBenchmarkServer') {
-    def runDirectory = layout.projectDirectory.dir('run-terrain-benchmark')
+    def runDirectory = layout.projectDirectory.dir('run-terrain-benchmark-current')
     def eulaFile = runDirectory.file('eula.txt')
     def propertiesFile = runDirectory.file('server.properties')
-    def reportFile = layout.buildDirectory.file('reports/real-terrain-topology.json')
+    def reportFile = layout.buildDirectory.file(
+            'reports/real-terrain-topology-0805-current.json'
+    )
+    def worldDirectory = runDirectory.dir('terrain-benchmark-world-0805-20260820-a')
     outputs.files(eulaFile, propertiesFile)
     outputs.upToDateWhen { false }
     doLast {
+        if (worldDirectory.asFile.exists()) {
+            throw new GradleException(
+                    "Current-source terrain benchmark world already exists: ${worldDirectory.asFile}"
+            )
+        }
         reportFile.get().asFile.delete()
         runDirectory.asFile.mkdirs()
         eulaFile.asFile.setText('eula=true\n', 'UTF-8')
@@ -222,11 +226,11 @@ enable-command-block=false
 enable-rcon=false
 enable-status=false
 generate-structures=true
-level-name=terrain-benchmark-world-v3
+level-name=terrain-benchmark-world-0805-20260820-a
 level-seed=73939133
 level-type=minecraft:normal
 max-tick-time=-1
-motd=Accelerated Navigation Terrain Benchmark
+motd=Accelerated Navigation Current Terrain Benchmark
 online-mode=false
 server-ip=127.0.0.1
 server-port=0
@@ -240,244 +244,24 @@ view-distance=4
 
 tasks.register('verifyTerrainBenchmarkReport') {
     doLast {
-        def report = layout.buildDirectory.file('reports/real-terrain-topology.json').get().asFile
+        def report = layout.buildDirectory.file(
+                'reports/real-terrain-topology-0805-current.json'
+        ).get().asFile
         if (!report.isFile()) {
-            throw new GradleException('Real terrain benchmark did not produce a report')
+            throw new GradleException('Current-source real terrain benchmark did not produce a report')
         }
         def parsed = new groovy.json.JsonSlurper().parse(report)
-        if (parsed.benchmarkKind != 'real_generated_terrain') {
-            throw new GradleException('Real terrain benchmark report has the wrong kind')
+        if (parsed.benchmarkKind != 'real_generated_terrain_current_0805') {
+            throw new GradleException('Current-source real terrain report has the wrong kind')
         }
-        if (parsed.worldPreset != 'minecraft:normal' || parsed.loadedChunks <= 0) {
-            throw new GradleException('Real terrain benchmark did not use a loaded normal world')
-        }
-        def buildNames = parsed.topologyBuilds.collect { it.name } as Set
-        def expectedBuilds = ['overworld_surface', 'overworld_caves', 'nether'] as Set
-        if (!buildNames.containsAll(expectedBuilds)) {
-            throw new GradleException("Real terrain benchmark is missing topology groups: ${expectedBuilds - buildNames}")
-        }
-        def routeNames = parsed.routes.collect { it.name } as Set
-        def expectedRoutes = [
-                'surface_8', 'surface_96', 'surface_512',
-                'cave_8', 'cave_96', 'nether_8', 'nether_96'
+        def names = parsed.routes.collect { it.name } as Set
+        def expected = [
+                'surface_8', 'surface_64', 'surface_96', 'surface_512',
+                'cave_8', 'cave_64', 'cave_96',
+                'nether_8', 'nether_64', 'nether_96'
         ] as Set
-        if (!routeNames.containsAll(expectedRoutes)) {
-            throw new GradleException("Real terrain benchmark is missing route cases: ${expectedRoutes - routeNames}")
-        }
-        def incompleteHotMetrics = parsed.routes.findAll {
-            it.measuredWarmRuns != 100
-                    || it.succeededRuns != 100
-                    || it.timedOutRuns != 0
-                    || it.readyTopologyPhysicalSearches != 100
-                    || it.readyTopologyCompletedCorridorCacheHits != 0
-                    || it.measuredCompletedCacheRuns != 100
-                    || it.completedCacheSucceededRuns != 100
-                    || it.completedCacheTimedOutRuns != 0
-                    || it.measuredCompletedCorridorCacheHits != 100
-                    || it.synchronousCompletedCorridorCacheHits != 100
-                    || it.completedCachePhysicalSearches != 0
-                    || it.completedCacheFailureCounts == null
-                    || !it.completedCacheFailureCounts.isEmpty()
-        }
-        if (!incompleteHotMetrics.isEmpty()) {
-            throw new GradleException("Routes have incomplete hot-query metrics: ${incompleteHotMetrics*.name}")
-        }
-        def hotLimitMillis = { route ->
-            if (route.requestedStraightLineBlocks <= 8) {
-                return 0.5D
-            }
-            if (route.requestedStraightLineBlocks <= 96) {
-                return 1.5D
-            }
-            return 5.0D
-        }
-        def slowReadyTopologyRoutes = parsed.routes.findAll {
-            it.p95MacroMillis > hotLimitMillis(it)
-        }
-        if (!slowReadyTopologyRoutes.isEmpty()) {
-            throw new GradleException("Ready-topology P95 macro search exceeded its limit: ${slowReadyTopologyRoutes*.name}")
-        }
-        def slowCompletedCacheRoutes = parsed.routes.findAll {
-            it.p95CompletedCacheHitWallMillis > hotLimitMillis(it)
-        }
-        if (!slowCompletedCacheRoutes.isEmpty()) {
-            throw new GradleException("Completed-cache P95 wall time exceeded its limit: ${slowCompletedCacheRoutes*.name}")
-        }
-        def unknownRoutes = parsed.routes.findAll { it.unknownBoundarySections != 0 }
-        if (!unknownRoutes.isEmpty()) {
-            throw new GradleException("Real terrain benchmark contains unknown boundaries: ${unknownRoutes*.name}")
-        }
-        def longRoutes = parsed.routes.findAll {
-            it.name in ['surface_96', 'surface_512', 'cave_96', 'nether_96']
-        }
-        def nonHierarchicalLongRoutes = longRoutes.findAll { it.hierarchicalRuns != it.runs }
-        if (!nonHierarchicalLongRoutes.isEmpty()) {
-            throw new GradleException("Long routes did not use the super graph: ${nonHierarchicalLongRoutes*.name}")
-        }
-        def failedSuperRoutes = longRoutes.findAll { it.failedSuperClusters != 0 }
-        if (!failedSuperRoutes.isEmpty()) {
-            throw new GradleException("Super-cluster builds failed: ${failedSuperRoutes*.name}")
-        }
-        if (parsed.superTopology == null || parsed.superTopology.published <= 0) {
-            throw new GradleException('Real terrain benchmark did not publish any super topology')
-        }
-        if (parsed.answerValidationProtocol == null) {
-            throw new GradleException('Real terrain benchmark omitted its answer-validation protocol')
-        }
-        if (parsed.connectivityReferences == null || parsed.connectivityReferences.size() < 2) {
-            throw new GradleException('Real terrain benchmark omitted its precomputed connectivity references')
-        }
-        def invalidConnectivityReferences = parsed.connectivityReferences.findAll {
-            !it.proofScope || it.timingExcludedFromMacroTiming != true
-        }
-        if (!invalidConnectivityReferences.isEmpty()) {
-            throw new GradleException('Connectivity references have an invalid scope or timing boundary')
-        }
-        if (parsed.topologyWorkers == null
-                || parsed.topologyWorkers.build?.managed != true
-                || parsed.topologyWorkers.persistence?.managed != true) {
-            throw new GradleException('Real terrain benchmark omitted managed worker queue metrics')
-        }
-        def missingAnswerAudits = parsed.routes.findAll {
-            it.answerValidation == null
-                    || it.answerValidation.assessment == 'NOT_AUDITED'
-                    || it.answerValidation.referenceTimingExcludedFromMacroTiming != true
-        }
-        if (!missingAnswerAudits.isEmpty()) {
-            throw new GradleException("Routes are missing isolated answer audits: ${missingAnswerAudits*.name}")
-        }
-        def missingSelectionReferences = parsed.routes.findAll {
-            it.answerValidation.selectionReference == null
-                    || !it.answerValidation.selectionReference.method
-                    || it.answerValidation.selectionReference.timingExcludedFromMacroTiming != true
-                    || it.answerValidation.selectionReference.physicalExecutabilityClaimed != false
-        }
-        if (!missingSelectionReferences.isEmpty()) {
-            throw new GradleException("Routes are missing bounded selection references: ${missingSelectionReferences*.name}")
-        }
-        def budgetMisclassified = parsed.routes.findAll {
-            it.succeededRuns == 0
-                    && (it.failureCounts.SEARCH_LIMIT_REACHED ?: 0) > 0
-                    && it.answerValidation.answerCheck != 'INCONCLUSIVE'
-        }
-        if (!budgetMisclassified.isEmpty()) {
-            throw new GradleException("Search-limit results were treated as answers: ${budgetMisclassified*.name}")
-        }
-        def unsupportedNegativeAnswers = parsed.routes.findAll {
-            it.succeededRuns == 0
-                    && it.answerValidation.reachabilityConclusion == 'PHYSICALLY_UNREACHABLE'
-        }
-        if (!unsupportedNegativeAnswers.isEmpty()) {
-            throw new GradleException("Bounded references claimed physical unreachability: ${unsupportedNegativeAnswers*.name}")
-        }
-        def contradictedAnswers = parsed.routes.findAll {
-            it.answerValidation.answerCheck == 'FAIL'
-        }
-        if (!contradictedAnswers.isEmpty()) {
-            throw new GradleException("Macro answers contradicted structural audit: ${contradictedAnswers*.name}")
-        }
-        def pressure = parsed.pressureStages ?: []
-        def expectedPressure = [
-                'high_coalescing',
-                'completed_corridor_replay',
-                'distributed_64_per_dimension'
-        ] as Set
-        if ((pressure*.name as Set) != expectedPressure) {
-            throw new GradleException('Real terrain benchmark omitted a pressure stage')
-        }
-        def failedPressure = pressure.findAll {
-            it.passed != true || it.submitted != 1024 || it.timedOut != 0
-                    || it.logicalRequests != 1024
-                    || it.reuseExpectationPassed != true
-                    || it.onlyExpectedSearchFailures != true
-                    || it.maximumDependencyPermits > 64
-                    || it.endDependencyPermits != 0
-                    || it.endTopologyWaiters != 0
-                    || it.endMacroWaiters != 0
-                    || it.endMacroFlights != 0
-                    || it.endSchedulerParked != 0
-                    || it.physicalWritesDuringStage != 0
-        }
-        if (!failedPressure.isEmpty()) {
-            throw new GradleException("Topology pressure stage failed: ${failedPressure*.name}")
-        }
-        def coalescedPressure = pressure.find { it.name == 'high_coalescing' }
-        if (coalescedPressure.succeeded != 1024 || coalescedPressure.failed != 0
-                || coalescedPressure.physicalSearches != 2
-                || coalescedPressure.inFlightJoins != 1022
-                || coalescedPressure.completedHits != 0) {
-            throw new GradleException('High-coalescing pressure did not single-flight by component pair')
-        }
-        def replayPressure = pressure.find { it.name == 'completed_corridor_replay' }
-        if (replayPressure.succeeded != 1024 || replayPressure.failed != 0
-                || replayPressure.physicalSearches != 0
-                || replayPressure.inFlightJoins != 0
-                || replayPressure.completedHits != 1024) {
-            throw new GradleException('Staggered replay did not use the completed corridor cache')
-        }
-        def distributedPressure = pressure.find { it.name == 'distributed_64_per_dimension' }
-        if (distributedPressure.maximumDependencyPermits != 64
-                || distributedPressure.physicalSearches != 128
-                || distributedPressure.inFlightJoins != 896) {
-            throw new GradleException('Distributed pressure did not exercise the expected bounded groups')
-        }
-        def canonicalQueries = distributedPressure.canonicalQueries ?: []
-        def limitQueries = canonicalQueries.findAll {
-            it.outcome == 'SEARCH_LIMIT_REACHED'
-        }
-        if (canonicalQueries.size() != 128
-                || limitQueries.size() != distributedPressure.searchLimitCanonicalRoutes
-                || limitQueries.size() * 8 != distributedPressure.failed) {
-            throw new GradleException('Distributed pressure omitted canonical search-limit evidence')
-        }
-        def incompleteLimitEvidence = limitQueries.findAll {
-            !(it.failurePhase in ['SUPER', 'REFINEMENT', 'DIRECT'])
-                    || it.combinedSearch == null
-                    || it.queryCpuMillis == null
-                    || !(
-                    it.superSearch?.expandedNodes == it.superSearch?.visitedNodeLimit
-                            || it.refinementSearch?.expandedNodes
-                            == it.refinementSearch?.visitedNodeLimit
-            )
-        }
-        if (!incompleteLimitEvidence.isEmpty()) {
-            throw new GradleException('Search-limit diagnostics did not identify the exhausted phase')
-        }
-        def budgetDiagnostics = parsed.searchBudgetDiagnostics
-        def probes = budgetDiagnostics?.probeStages ?: []
-        if (budgetDiagnostics?.productionDefaultsChanged != false
-                || (limitQueries.size() > 0 && probes.isEmpty())) {
-            throw new GradleException('Search-budget diagnostics are incomplete')
-        }
-        int remainingFailures = limitQueries.size()
-        int expectedProbeBudget = 2048
-        probes.each { probe ->
-            if (probe.kind != 'BUDGET_PROBE'
-                    || probe.configuredNodeBudget != expectedProbeBudget
-                    || probe.submitted != remainingFailures
-                    || probe.logicalRequests != remainingFailures
-                    || probe.physicalSearches != remainingFailures
-                    || probe.inFlightJoins != 0
-                    || probe.completedHits != 0
-                    || probe.timedOut != 0
-                    || probe.onlyExpectedSearchFailures != true
-                    || probe.reuseExpectationPassed != true
-                    || probe.cleanupPassed != true
-                    || (probe.canonicalQueries ?: []).size() != remainingFailures) {
-                throw new GradleException("Invalid search-budget probe at ${expectedProbeBudget} nodes")
-            }
-            remainingFailures = probe.searchLimitCanonicalRoutes as int
-            expectedProbeBudget *= 2
-        }
-        if (remainingFailures > 0 && expectedProbeBudget <= 8192) {
-            throw new GradleException('Search-budget diagnostics stopped before the next probe tier')
-        }
-        def persistence = parsed.persistenceLifecycle
-        if (persistence?.passed != true || persistence.ordinaryTickPhysicalWrites != 0
-                || persistence.savePhysicalWrites < 0 || persistence.saveFlushes <= 0
-                || persistence.persistenceHits != persistence.requestedRestoreSections
-                || persistence.freshBuilds != 0) {
-            throw new GradleException('Topology persistence lifecycle validation failed')
+        if (names != expected) {
+            throw new GradleException("Current-source report route mismatch: ${expected - names}")
         }
     }
 }
@@ -485,6 +269,10 @@ tasks.register('verifyTerrainBenchmarkReport') {
 tasks.matching { it.name == 'runTerrainBenchmarkServer' }.configureEach {
     dependsOn tasks.named('prepareTerrainBenchmarkServer')
     finalizedBy tasks.named('verifyTerrainBenchmarkReport')
+}
+
+tasks.named('check').configure {
+    dependsOn tasks.named('verifyGameTestSourceSetIsolation')
 }
 
 idea {

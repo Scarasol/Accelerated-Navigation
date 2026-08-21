@@ -209,18 +209,18 @@ class SuperClusterTopologyTest {
     }
 
     private static BaseClusterTopology buildBase(SectionPos section,
-                                                  BaseClusterTopology.Snapshot snapshot,
+                                                   BaseClusterTopology.PackedFacts facts,
                                                   BaseClusterTopology.TraversalProfile profile) {
         return BaseClusterTopology.build(
                 section,
                 1L,
-                BaseClusterTopology.BuildInput.center(snapshot.packedFacts()),
+                BaseClusterTopology.BuildInput.center(facts),
                 profile.geometry(BaseClusterTopology.Channel.GROUND),
                 new BaseClusterTopology.BuildScratch()
         );
     }
 
-    private static BaseClusterTopology.Snapshot groundPlaneSnapshot(int y) {
+    private static BaseClusterTopology.PackedFacts groundPlaneSnapshot(int y) {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         int flags = BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN;
         for (int z = 0; z < BaseClusterTopology.SIDE; z++) {
@@ -232,27 +232,27 @@ class SuperClusterTopologyTest {
                 }
             }
         }
-        return new BaseClusterTopology.Snapshot(cells);
+        return BaseClusterTopology.PackedFacts.fromCells(cells);
     }
 
-    private static BaseClusterTopology.Snapshot openVolumeSnapshot() {
+    private static BaseClusterTopology.PackedFacts openVolumeSnapshot() {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         java.util.Arrays.fill(cells, (byte) (
                 BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
         ));
-        return new BaseClusterTopology.Snapshot(cells);
+        return BaseClusterTopology.PackedFacts.fromCells(cells);
     }
 
-    private static BaseClusterTopology.Snapshot boundaryCellSnapshot(Direction face) {
+    private static BaseClusterTopology.PackedFacts boundaryCellSnapshot(Direction face) {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         int x = face == Direction.EAST ? 15 : 0;
         int flags = BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN;
         cells[BaseClusterTopology.cellIndex(x, 2, 4)] = (byte) flags;
         cells[BaseClusterTopology.cellIndex(x, 3, 4)] = BaseClusterTopology.VOLUME_OPEN;
-        return new BaseClusterTopology.Snapshot(cells);
+        return BaseClusterTopology.PackedFacts.fromCells(cells);
     }
 
-    private static BaseClusterTopology.Snapshot insetStepSourceSnapshot() {
+    private static BaseClusterTopology.PackedFacts insetStepSourceSnapshot() {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         int flags = BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN;
         cells[BaseClusterTopology.cellIndex(13, 1, 4)] = (byte) flags;
@@ -261,18 +261,18 @@ class SuperClusterTopologyTest {
         cells[BaseClusterTopology.cellIndex(15, 2, 4)] = (byte) flags;
         cells[BaseClusterTopology.cellIndex(14, 3, 4)] = BaseClusterTopology.VOLUME_OPEN;
         cells[BaseClusterTopology.cellIndex(15, 3, 4)] = BaseClusterTopology.VOLUME_OPEN;
-        return new BaseClusterTopology.Snapshot(cells);
+        return BaseClusterTopology.PackedFacts.fromCells(cells);
     }
 
-    private static BaseClusterTopology.Snapshot insetStepTargetSnapshot() {
+    private static BaseClusterTopology.PackedFacts insetStepTargetSnapshot() {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         int flags = BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN;
         cells[BaseClusterTopology.cellIndex(0, 2, 4)] = (byte) flags;
         cells[BaseClusterTopology.cellIndex(0, 3, 4)] = BaseClusterTopology.VOLUME_OPEN;
-        return new BaseClusterTopology.Snapshot(cells);
+        return BaseClusterTopology.PackedFacts.fromCells(cells);
     }
 
-    private static BaseClusterTopology.Snapshot emptySnapshot() {
-        return new BaseClusterTopology.Snapshot(new byte[BaseClusterTopology.CELL_COUNT]);
+    private static BaseClusterTopology.PackedFacts emptySnapshot() {
+        return BaseClusterTopology.PackedFacts.fromCells(new byte[BaseClusterTopology.CELL_COUNT]);
     }
 }

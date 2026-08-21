@@ -22,7 +22,7 @@ class BaseClusterTopologyTest {
 
         BaseClusterTopology topology = build(
                 SectionPos.of(2, -1, 4),
-                new BaseClusterTopology.Snapshot(cells),
+                BaseClusterTopology.PackedFacts.fromCells(cells),
                 BaseClusterTopology.Channel.GROUND,
                 false
         );
@@ -45,7 +45,7 @@ class BaseClusterTopologyTest {
 
         BaseClusterTopology topology = build(
                 SectionPos.of(0, 0, 0),
-                new BaseClusterTopology.Snapshot(cells),
+                BaseClusterTopology.PackedFacts.fromCells(cells),
                 BaseClusterTopology.Channel.GROUND,
                 false
         );
@@ -61,7 +61,7 @@ class BaseClusterTopologyTest {
         center[BaseClusterTopology.cellIndex(0, 8, 8)] = (byte) (
                 BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
         );
-        BaseClusterTopology.Snapshot centerSnapshot = new BaseClusterTopology.Snapshot(center);
+        BaseClusterTopology.PackedFacts centerFacts = BaseClusterTopology.PackedFacts.fromCells(center);
         BaseClusterTopology.GeometryKey geometry = new BaseClusterTopology.GeometryKey(
                 BaseClusterTopology.Channel.GROUND, 1, 1, false
         );
@@ -69,12 +69,12 @@ class BaseClusterTopologyTest {
                 SectionPos.of(0, 0, 0),
                 1L,
                 new BaseClusterTopology.BuildInput(
-                        centerSnapshot.packedFacts(),
+                        centerFacts,
                         new byte[]{(byte) BaseClusterTopology.haloIndex(-1, 0, 0)},
                         new BaseClusterTopology.PackedFacts[]{
-                                new BaseClusterTopology.Snapshot(
+                                BaseClusterTopology.PackedFacts.fromCells(
                                         new byte[BaseClusterTopology.CELL_COUNT]
-                                ).packedFacts()
+                                )
                         },
                         new long[]{1L},
                         new long[]{2L}
@@ -101,10 +101,10 @@ class BaseClusterTopologyTest {
                 SectionPos.of(0, 0, 0),
                 1L,
                 new BaseClusterTopology.BuildInput(
-                        new BaseClusterTopology.Snapshot(center).packedFacts(),
+                        BaseClusterTopology.PackedFacts.fromCells(center),
                         new byte[]{(byte) BaseClusterTopology.haloIndex(-1, 0, 0)},
                         new BaseClusterTopology.PackedFacts[]{
-                                new BaseClusterTopology.Snapshot(west).packedFacts()
+                                BaseClusterTopology.PackedFacts.fromCells(west)
                         },
                         new long[]{1L},
                         new long[]{2L}
@@ -125,7 +125,7 @@ class BaseClusterTopologyTest {
                         | BaseClusterTopology.FLUID
         );
         cells[BaseClusterTopology.cellIndex(4, 4, 4)] = BaseClusterTopology.VOLUME_OPEN;
-        BaseClusterTopology.Snapshot snapshot = new BaseClusterTopology.Snapshot(cells);
+        BaseClusterTopology.PackedFacts snapshot = BaseClusterTopology.PackedFacts.fromCells(cells);
 
         assertEquals(0, build(SectionPos.of(0, 0, 0), snapshot,
                 BaseClusterTopology.Channel.GROUND, false).componentCount());
@@ -137,7 +137,7 @@ class BaseClusterTopologyTest {
     void packedSnapshotIsCopiedAndHasStableFingerprint() {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         java.util.Arrays.fill(cells, (byte) BaseClusterTopology.VOLUME_OPEN);
-        BaseClusterTopology.Snapshot snapshot = new BaseClusterTopology.Snapshot(cells);
+        BaseClusterTopology.PackedFacts snapshot = BaseClusterTopology.PackedFacts.fromCells(cells);
         long fingerprint = snapshot.fingerprint();
         cells[0] = 0;
 
@@ -162,7 +162,7 @@ class BaseClusterTopologyTest {
     }
 
     private static BaseClusterTopology build(SectionPos section,
-                                               BaseClusterTopology.Snapshot snapshot,
+                                                BaseClusterTopology.PackedFacts snapshot,
                                                BaseClusterTopology.Channel channel,
                                                boolean acceptsFluid) {
         BaseClusterTopology.GeometryKey geometry = new BaseClusterTopology.GeometryKey(
@@ -171,7 +171,7 @@ class BaseClusterTopologyTest {
         return BaseClusterTopology.build(
                 section,
                 1L,
-                BaseClusterTopology.BuildInput.center(snapshot.packedFacts()),
+                BaseClusterTopology.BuildInput.center(snapshot),
                 geometry,
                 new BaseClusterTopology.BuildScratch()
         );

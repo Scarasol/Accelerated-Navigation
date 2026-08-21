@@ -12,37 +12,42 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
 
-/** Chunk-coalesced topology facts backed by Minecraft's crash-resistant RegionFile. */
-public final class TopologyStore implements AutoCloseable {
+/** Versioned section facts backed by Minecraft's crash-resistant RegionFile. */
+final class TopologyStore implements AutoCloseable {
 
     private static final int MAGIC = 0x414E544F;
-    private static final int SCHEMA_VERSION = 3;
-    private static final int ALGORITHM_VERSION = 2;
+    private static final int SCHEMA_VERSION = 4;
     private static final int MAX_SECTIONS_PER_CHUNK = 1_024;
     private static final int MAX_DECODED_CHUNKS = 256;
     private static final int MAX_OPEN_REGIONS = 256;
     private static final int MAX_FOREGROUND_BURST = 16;
+    private static final long CLOSE_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(30L);
 
     private final Object monitor = new Object();
     private final Path root;
-    private final LinkedHashMap<ChunkKey, ChunkImage> decoded =
+    private final LinkedHashMap<ChunkKey, DecodedChunk> decoded =
             new LinkedHashMap<>(64, 0.75F, true);
-    private final Map<ChunkKey, CompletableFuture<ChunkImage>> loads = new HashMap<>();
+    private final Map<ChunkKey, CompletableFuture<ChunkLoad>> loads = new HashMap<>();
     private final Map<ChunkKey, PendingChunk> pending = new HashMap<>();
+    private final Map<ResourceKey<Level>, Integer> dirtyChunksByDimension = new HashMap<>();
+    private final Set<ResourceKey<Level>> requestedFlushes = new HashSet<>();
+    private final Set<ResourceKey<Level>> queuedFlushes = new HashSet<>();
     private final ArrayDeque<IoTask> foreground = new ArrayDeque<>();
     private final ArrayDeque<IoTask> background = new ArrayDeque<>();
     private final LinkedHashMap<RegionKey, RegionFile> regions =
@@ -50,23 +55,23 @@ public final class TopologyStore implements AutoCloseable {
     private final Thread worker;
 
     private boolean accepting = true;
-    private boolean stopWorker;
+    private boolean closing;
     private int foregroundBurst;
-    private int pendingHighWatermark;
-    private volatile int openRegionCount;
-    private long generation;
-    private long submittedTasks;
-    private long completedTasks;
-    private long totalQueueWaitNanos;
-    private long maximumQueueWaitNanos;
-    private long physicalReads;
-    private long coalescedReads;
-    private long physicalWrites;
-    private long flushes;
+    private int highestPendingChunks;
+    private int highestQueuedTasks;
+    private long readRequests;
+    private long recordsFound;
+    private long recordsMissing;
+    private long readFailures;
+    private long writeRequests;
+    private long recordsWritten;
+    private long recordsCoalesced;
     private long writeFailures;
-    private long droppedChunks;
+    private long saveRequests;
+    private long flushes;
+    private long flushFailures;
 
-    public TopologyStore(Path root) throws IOException {
+    TopologyStore(Path root) throws IOException {
         this.root = Objects.requireNonNull(root, "root");
         Files.createDirectories(root);
         worker = new Thread(this::runWorker, "accelerated-navigation-topology-io");
@@ -75,66 +80,133 @@ public final class TopologyStore implements AutoCloseable {
         worker.start();
     }
 
-    CompletableFuture<Optional<BaseClusterTopology.PackedFacts>> read(
-            ResourceKey<Level> dimension,
-            SectionPos section) {
+    CompletableFuture<ReadResult> read(ResourceKey<Level> dimension, SectionPos section) {
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(section, "section");
         ChunkKey key = new ChunkKey(dimension, new ChunkPos(section.x(), section.z()));
         int sectionY = section.y();
-        CompletableFuture<ChunkImage> load;
+        CompletableFuture<ChunkLoad> load;
         synchronized (monitor) {
             ensureAccepting();
-            PendingChunk dirty = pending.get(key);
-            if (dirty != null) {
-                dirty.unloaded = false;
-                BaseClusterTopology.PackedFacts facts = dirty.latest(sectionY);
-                if (facts != null) {
-                    return CompletableFuture.completedFuture(Optional.of(facts));
-                }
-            }
-            ChunkImage cached = decoded.get(key);
+            readRequests++;
+            ChunkLoad cached = decodedLoadLocked(key);
             if (cached != null) {
-                return CompletableFuture.completedFuture(Optional.ofNullable(cached.sections.get(sectionY)));
+                ReadResult result = latestLocked(key, sectionY, cached);
+                recordReadLocked(result);
+                return CompletableFuture.completedFuture(result);
             }
             load = loads.get(key);
             if (load == null) {
                 load = new CompletableFuture<>();
                 loads.put(key, load);
-                CompletableFuture<ChunkImage> expected = load;
+                CompletableFuture<ChunkLoad> expected = load;
                 enqueueLocked(foreground, () -> loadChunk(key, expected));
-            } else {
-                coalescedReads++;
             }
         }
-        return load.thenApply(image -> Optional.ofNullable(latest(key, sectionY, image)));
+        return load.thenApply(image -> {
+            synchronized (monitor) {
+                ReadResult result = latestLocked(key, sectionY, image);
+                recordReadLocked(result);
+                return result;
+            }
+        });
     }
 
-    void markDirty(ResourceKey<Level> dimension,
-                   SectionPos section,
-                   BaseClusterTopology.PackedFacts facts) {
+    CompletableFuture<UpdateResult> writeFull(ResourceKey<Level> dimension,
+                                              SectionPos section,
+                                              long version,
+                                              BaseClusterTopology.PackedFacts facts) {
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(section, "section");
-        Objects.requireNonNull(facts, "facts");
+        SectionRecord record = new SectionRecord(version, facts);
+        CompletableFuture<UpdateResult> result = new CompletableFuture<>();
+        CompletableFuture<UpdateResult> superseded = null;
         synchronized (monitor) {
             ensureAccepting();
+            writeRequests++;
             ChunkKey key = new ChunkKey(dimension, new ChunkPos(section.x(), section.z()));
-            PendingChunk dirty = pending.computeIfAbsent(key, ignored -> new PendingChunk());
-            long now = System.nanoTime();
-            SectionUpdate replaced = dirty.updates.put(
-                    section.y(),
-                    new SectionUpdate(++generation, now, facts)
-            );
-            if (replaced != null && replaced.enqueuedNanos == dirty.oldestUpdateNanos) {
-                dirty.refreshOldestUpdate();
-            } else if (dirty.oldestUpdateNanos == 0L) {
-                dirty.oldestUpdateNanos = now;
+            PendingChunk chunk = pendingChunkLocked(key);
+            PendingSection previous = chunk.sections.get(section.y());
+            if (previous != null) {
+                superseded = previous.completion;
+                recordsCoalesced++;
             }
-            pendingHighWatermark = Math.max(pendingHighWatermark, pending.size());
-            if (dirty.unloaded) {
-                dirty.writeRequested = true;
-                scheduleWriteLocked(key, dirty);
+            chunk.sections.put(section.y(), new PendingSection(
+                    new FullMutation(record), result));
+            scheduleWriteLocked(key, chunk);
+        }
+        if (superseded != null) {
+            superseded.complete(UpdateResult.coalesced());
+        }
+        return result;
+    }
+
+    CompletableFuture<UpdateResult> mergeDelta(ResourceKey<Level> dimension,
+                                               SectionPos section,
+                                               SectionDelta delta) {
+        Objects.requireNonNull(dimension, "dimension");
+        Objects.requireNonNull(section, "section");
+        Objects.requireNonNull(delta, "delta");
+        CompletableFuture<UpdateResult> result = new CompletableFuture<>();
+        CompletableFuture<UpdateResult> superseded = null;
+        synchronized (monitor) {
+            ensureAccepting();
+            writeRequests++;
+            ChunkKey key = new ChunkKey(dimension, new ChunkPos(section.x(), section.z()));
+            PendingChunk chunk = pendingChunkLocked(key);
+            PendingSection previous = chunk.sections.get(section.y());
+            Mutation mutation;
+            if (previous == null) {
+                long expected = chunk.inFlightTargetVersion(section.y());
+                if (expected >= 0L && expected != delta.originalVersion) {
+                    removePendingChunkIfIdleLocked(key, chunk);
+                    writeFailures++;
+                    return CompletableFuture.completedFuture(UpdateResult.versionMismatch());
+                }
+                mutation = new DeltaMutation(delta);
+            } else {
+                mutation = appendDelta(previous.mutation, delta);
+                if (mutation == null) {
+                    writeFailures++;
+                    return CompletableFuture.completedFuture(UpdateResult.versionMismatch());
+                }
             }
+            if (previous != null) {
+                superseded = previous.completion;
+                recordsCoalesced++;
+            }
+            chunk.sections.put(section.y(), new PendingSection(mutation, result));
+            scheduleWriteLocked(key, chunk);
+        }
+        if (superseded != null) {
+            superseded.complete(UpdateResult.coalesced());
+        }
+        return result;
+    }
+
+    private static Mutation appendDelta(Mutation previous, SectionDelta next) {
+        if (previous.targetVersion() != next.originalVersion) {
+            return null;
+        }
+        if (previous instanceof FullMutation full) {
+            return new FullMutation(new SectionRecord(
+                    next.newVersion,
+                    full.record.facts.withChanges(next.cells)));
+        }
+        DeltaMutation delta = (DeltaMutation) previous;
+        Map<Integer, Byte> merged = new HashMap<>(delta.delta.cells);
+        merged.putAll(next.cells);
+        return new DeltaMutation(new SectionDelta(
+                delta.delta.originalVersion, next.newVersion, merged));
+    }
+
+    void requestSave(ResourceKey<Level> dimension) {
+        Objects.requireNonNull(dimension, "dimension");
+        synchronized (monitor) {
+            ensureAccepting();
+            saveRequests++;
+            requestedFlushes.add(dimension);
+            scheduleFlushIfReadyLocked(dimension);
         }
     }
 
@@ -147,262 +219,288 @@ public final class TopologyStore implements AutoCloseable {
             }
             ChunkKey key = new ChunkKey(dimension, chunk);
             PendingChunk dirty = pending.get(key);
-            if (dirty != null) {
-                dirty.unloaded = true;
-                dirty.writeRequested = true;
-                scheduleWriteLocked(key, dirty);
+            if (dirty == null) {
+                decoded.remove(key);
+                return;
             }
-        }
-    }
-
-    CompletableFuture<Void> save(ResourceKey<Level> dimension) {
-        Objects.requireNonNull(dimension, "dimension");
-        List<CompletableFuture<Void>> writes = new ArrayList<>();
-        synchronized (monitor) {
-            ensureAccepting();
-            for (Map.Entry<ChunkKey, PendingChunk> entry : pending.entrySet()) {
-                if (entry.getKey().dimension.equals(dimension) && !entry.getValue().updates.isEmpty()) {
-                    writes.add(requestWriteLocked(entry.getKey(), entry.getValue()));
-                }
-            }
-        }
-        return settle(writes).thenCompose(ignored -> submitForeground(() -> flush(dimension)));
-    }
-
-    Metrics metrics() {
-        synchronized (monitor) {
-            long now = System.nanoTime();
-            long oldest = 0L;
-            for (PendingChunk chunk : pending.values()) {
-                if (chunk.oldestUpdateNanos != 0L) {
-                    oldest = Math.max(oldest, now - chunk.oldestUpdateNanos);
-                }
-            }
-            return new Metrics(
-                    foreground.size() + background.size(),
-                    submittedTasks,
-                    completedTasks,
-                    totalQueueWaitNanos,
-                    maximumQueueWaitNanos,
-                    physicalReads,
-                    coalescedReads,
-                    physicalWrites,
-                    flushes,
-                    pending.size(),
-                    pendingHighWatermark,
-                    oldest,
-                    writeFailures,
-                    droppedChunks,
-                    decoded.size(),
-                    loads.size(),
-                    openRegionCount
-            );
+            dirty.unloaded = true;
+            scheduleWriteLocked(key, dirty);
         }
     }
 
     @Override
     public void close() {
-        List<CompletableFuture<Void>> writes = new ArrayList<>();
         synchronized (monitor) {
-            if (!accepting) {
-                return;
-            }
-            accepting = false;
-            for (Map.Entry<ChunkKey, PendingChunk> entry : pending.entrySet()) {
-                if (!entry.getValue().updates.isEmpty()) {
-                    entry.getValue().unloaded = true;
-                    writes.add(requestWriteLocked(entry.getKey(), entry.getValue()));
-                }
-            }
-        }
-        CompletableFuture<Void> closeFuture = settle(writes)
-                .thenCompose(ignored -> retryClosingWrites())
-                .thenCompose(ignored -> submitForeground(this::flushAndCloseRegions));
-        try {
-            closeFuture.join();
-        } catch (CompletionException failure) {
-            AcceleratedNavigation.LOGGER.error("Could not close macro topology store", failure.getCause());
-        } finally {
-            synchronized (monitor) {
-                stopWorker = true;
+            if (!closing) {
+                accepting = false;
+                closing = true;
                 monitor.notifyAll();
             }
-            try {
-                worker.join();
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            }
         }
-    }
-
-    private CompletableFuture<Void> retryClosingWrites() {
-        List<CompletableFuture<Void>> retries = new ArrayList<>();
-        synchronized (monitor) {
-            for (Map.Entry<ChunkKey, PendingChunk> entry : pending.entrySet()) {
-                if (!entry.getValue().updates.isEmpty()) {
-                    retries.add(requestWriteLocked(entry.getKey(), entry.getValue()));
-                }
-            }
-        }
-        return settle(retries);
-    }
-
-    private BaseClusterTopology.PackedFacts latest(ChunkKey key, int sectionY, ChunkImage fallback) {
-        synchronized (monitor) {
-            PendingChunk dirty = pending.get(key);
-            if (dirty != null) {
-                BaseClusterTopology.PackedFacts facts = dirty.latest(sectionY);
-                if (facts != null) {
-                    return facts;
-                }
-            }
-            ChunkImage cached = decoded.get(key);
-            return (cached == null ? fallback : cached).sections.get(sectionY);
-        }
-    }
-
-    private void loadChunk(ChunkKey key, CompletableFuture<ChunkImage> result) {
-        ChunkImage image;
         try {
-            synchronized (monitor) {
-                image = decoded.get(key);
-            }
-            if (image == null) {
-                image = readChunk(key);
-            }
-        } catch (IOException failure) {
-            synchronized (monitor) {
-                loads.remove(key, result);
-            }
-            result.completeExceptionally(failure);
-            return;
+            worker.join(CLOSE_WAIT_MILLIS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         }
+        if (worker.isAlive()) {
+            AcceleratedNavigation.LOGGER.error(
+                    "Timed out while closing macro topology persistence after {} ms",
+                    CLOSE_WAIT_MILLIS);
+        }
+    }
+
+    TopologyService.PersistenceMetrics metrics() {
         synchronized (monitor) {
-            loads.remove(key, result);
-            cacheDecodedLocked(key, image);
+            return new TopologyService.PersistenceMetrics(
+                    pending.size(),
+                    highestPendingChunks,
+                    loads.size(),
+                    foreground.size(),
+                    background.size(),
+                    highestQueuedTasks,
+                    decoded.size(),
+                    readRequests,
+                    recordsFound,
+                    recordsMissing,
+                    readFailures,
+                    writeRequests,
+                    recordsWritten,
+                    recordsCoalesced,
+                    writeFailures,
+                    saveRequests,
+                    flushes,
+                    flushFailures,
+                    accepting,
+                    closing
+            );
         }
-        result.complete(image);
     }
 
-    private CompletableFuture<Void> requestWriteLocked(ChunkKey key, PendingChunk dirty) {
-        CompletableFuture<Void> result = new CompletableFuture<>();
-        long target = dirty.latestGeneration();
-        if (target <= dirty.writtenGeneration) {
-            result.complete(null);
-            return result;
+    private PendingChunk pendingChunkLocked(ChunkKey key) {
+        PendingChunk chunk = pending.get(key);
+        if (chunk != null) {
+            chunk.unloaded = false;
+            return chunk;
         }
-        dirty.waiters.add(new WriteWaiter(target, result));
-        dirty.writeRequested = true;
-        scheduleWriteLocked(key, dirty);
-        return result;
+        chunk = new PendingChunk();
+        pending.put(key, chunk);
+        highestPendingChunks = Math.max(highestPendingChunks, pending.size());
+        dirtyChunksByDimension.merge(key.dimension, 1, Integer::sum);
+        return chunk;
     }
 
-    private void scheduleWriteLocked(ChunkKey key, PendingChunk dirty) {
-        if (dirty.writeInFlight || !dirty.writeRequested || dirty.updates.isEmpty()) {
+    private void scheduleWriteLocked(ChunkKey key, PendingChunk chunk) {
+        if (chunk.inFlight != null || chunk.sections.isEmpty()) {
             return;
         }
-        dirty.writeRequested = false;
-        dirty.writeInFlight = true;
-        long target = dirty.latestGeneration();
-        Map<Integer, SectionUpdate> updates = Map.copyOf(dirty.updates);
-        enqueueLocked(background, () -> writeChunk(key, dirty, target, updates));
+        Map<Integer, PendingSection> batch = Map.copyOf(chunk.sections);
+        chunk.sections.clear();
+        chunk.inFlight = batch;
+        enqueueLocked(background, () -> writeChunk(key, chunk, batch));
     }
 
     private void writeChunk(ChunkKey key,
                             PendingChunk expected,
-                            long target,
-                            Map<Integer, SectionUpdate> updates) {
-        ChunkImage base;
-        try {
-            synchronized (monitor) {
-                base = decoded.get(key);
-            }
-            if (base == null) {
+                            Map<Integer, PendingSection> batch) {
+        ChunkLoad base;
+        synchronized (monitor) {
+            base = decodedLoadLocked(key);
+        }
+        if (base == null) {
+            try {
                 base = readChunk(key);
+            } catch (IOException | RuntimeException failure) {
+                completeWrite(key, expected, batch, null,
+                        uniformStatuses(batch, UpdateStatus.IO_FAILURE), failure);
+                return;
             }
-            Map<Integer, BaseClusterTopology.PackedFacts> merged =
-                    new LinkedHashMap<>(base.sections);
-            updates.forEach((sectionY, update) -> merged.put(sectionY, update.facts));
-            ChunkImage image = new ChunkImage(Map.copyOf(merged));
-            synchronized (monitor) {
-                if (pending.get(key) == expected) {
-                    expected.currentImage = image;
+        }
+        Map<Integer, UpdateStatus> statuses = new HashMap<>();
+        ChunkImage image = null;
+        Throwable writeFailure = null;
+        try {
+            Map<Integer, SectionRecord> merged = base.status == ChunkStatus.PRESENT
+                    ? new LinkedHashMap<>(base.image.sections) : new LinkedHashMap<>();
+            boolean changed = false;
+            for (Map.Entry<Integer, PendingSection> entry : batch.entrySet()) {
+                Applied applied = apply(entry.getValue().mutation,
+                        merged.get(entry.getKey()), base.status);
+                statuses.put(entry.getKey(), applied.status);
+                if (applied.record != null) {
+                    merged.put(entry.getKey(), applied.record);
+                    changed = true;
                 }
             }
-            writeChunkRecord(key, image);
-            completeWrite(key, expected, target, image, null);
+            if (changed) {
+                image = new ChunkImage(Map.copyOf(merged));
+                writeChunkRecord(key, image);
+                statuses.replaceAll((ignored, status) -> status == null
+                        ? UpdateStatus.WRITTEN : status);
+            }
         } catch (IOException | RuntimeException failure) {
-            completeWrite(key, expected, target, null, failure);
+            image = null;
+            // Keep semantic mismatches already discovered; every unfinished mutation failed persistence.
+            for (Integer sectionY : batch.keySet()) {
+                statuses.compute(sectionY, (ignored, status) -> status == null
+                        ? UpdateStatus.IO_FAILURE : status);
+            }
+            writeFailure = failure;
         }
+        completeWrite(key, expected, batch, image, statuses, writeFailure);
+    }
+
+    private static Applied apply(Mutation mutation,
+                                 SectionRecord base,
+                                 ChunkStatus chunkStatus) {
+        if (mutation instanceof FullMutation full) {
+            return new Applied(full.record, null);
+        }
+        DeltaMutation pending = (DeltaMutation) mutation;
+        if (base == null) {
+            return new Applied(null, chunkStatus == ChunkStatus.CORRUPT
+                    ? UpdateStatus.CORRUPT : UpdateStatus.BASE_MISSING);
+        }
+        if (base.version != pending.delta.originalVersion) {
+            return new Applied(null, UpdateStatus.VERSION_MISMATCH);
+        }
+        return new Applied(new SectionRecord(
+                pending.delta.newVersion,
+                base.facts.withChanges(pending.delta.cells)), null);
+    }
+
+    private static Map<Integer, UpdateStatus> uniformStatuses(
+            Map<Integer, PendingSection> batch,
+            UpdateStatus status) {
+        Map<Integer, UpdateStatus> statuses = new HashMap<>();
+        batch.keySet().forEach(sectionY -> statuses.put(sectionY, status));
+        return statuses;
     }
 
     private void completeWrite(ChunkKey key,
                                PendingChunk expected,
-                               long target,
+                               Map<Integer, PendingSection> batch,
                                ChunkImage image,
+                               Map<Integer, UpdateStatus> statuses,
                                Throwable failure) {
-        List<CompletableFuture<Void>> completed = new ArrayList<>();
+        List<Completion> completions = new ArrayList<>();
         synchronized (monitor) {
-            PendingChunk dirty = pending.get(key);
-            if (dirty != expected) {
+            expected.inFlight = null;
+            if (image != null) {
+                if (!expected.unloaded) {
+                    cacheDecodedLocked(key, ChunkLoad.present(image));
+                }
+            }
+            if (failure != null) {
+                AcceleratedNavigation.LOGGER.warn(
+                        "Could not persist macro topology chunk {}", key, failure);
+            }
+            for (Map.Entry<Integer, PendingSection> entry : batch.entrySet()) {
+                UpdateStatus status = statuses.get(entry.getKey());
+                UpdateResult result = new UpdateResult(status, failure);
+                if (status == UpdateStatus.WRITTEN) recordsWritten++;
+                else writeFailures++;
+                completions.add(new Completion(entry.getValue().completion, result));
+            }
+            scheduleWriteLocked(key, expected);
+            removePendingChunkIfIdleLocked(key, expected);
+        }
+        completions.forEach(Completion::complete);
+    }
+
+    private void removePendingChunkIfIdleLocked(ChunkKey key, PendingChunk chunk) {
+        if (chunk.inFlight != null || !chunk.sections.isEmpty()
+                || !pending.remove(key, chunk)) {
+            return;
+        }
+        dirtyChunksByDimension.computeIfPresent(key.dimension, (ignored, count) ->
+                count == 1 ? null : count - 1);
+        if (chunk.unloaded) {
+            decoded.remove(key);
+        }
+        scheduleFlushIfReadyLocked(key.dimension);
+    }
+
+    private void scheduleFlushIfReadyLocked(ResourceKey<Level> dimension) {
+        if (!requestedFlushes.contains(dimension)
+                || dirtyChunksByDimension.containsKey(dimension)
+                || !queuedFlushes.add(dimension)) {
+            return;
+        }
+        enqueueLocked(background, () -> runRequestedFlush(dimension));
+    }
+
+    private void runRequestedFlush(ResourceKey<Level> dimension) {
+        synchronized (monitor) {
+            queuedFlushes.remove(dimension);
+            if (dirtyChunksByDimension.containsKey(dimension)
+                    || !requestedFlushes.remove(dimension)) {
                 return;
             }
-            dirty.writeInFlight = false;
-            dirty.currentImage = null;
-            if (failure == null) {
-                physicalWrites++;
-                dirty.failedAttempts = 0;
-                dirty.writtenGeneration = Math.max(dirty.writtenGeneration, target);
-                dirty.updates.entrySet().removeIf(entry -> entry.getValue().generation <= target);
-                dirty.refreshOldestUpdate();
-                cacheDecodedLocked(key, image);
-            } else {
-                writeFailures++;
-                dirty.failedAttempts++;
-                AcceleratedNavigation.LOGGER.warn("Could not persist macro topology chunk {}", key, failure);
-                if (dirty.unloaded && dirty.failedAttempts >= 2) {
-                    dirty.updates.entrySet().removeIf(entry -> entry.getValue().generation <= target);
-                    dirty.refreshOldestUpdate();
-                    droppedChunks++;
-                }
-            }
-            Iterator<WriteWaiter> iterator = dirty.waiters.iterator();
-            while (iterator.hasNext()) {
-                WriteWaiter waiter = iterator.next();
-                if (waiter.generation <= target) {
-                    iterator.remove();
-                    completed.add(waiter.future);
-                }
-            }
-            if (dirty.updates.isEmpty() && !dirty.writeInFlight) {
-                pending.remove(key, dirty);
-            } else if (dirty.writeRequested && (failure == null
-                    || dirty.latestGeneration() > target)) {
-                scheduleWriteLocked(key, dirty);
-            }
         }
-        for (CompletableFuture<Void> future : completed) {
-            if (failure == null) {
-                future.complete(null);
-            } else {
-                future.completeExceptionally(failure);
-            }
+        int failures = flush(dimension);
+        synchronized (monitor) {
+            flushes++;
+            flushFailures += failures;
         }
     }
 
-    private ChunkImage readChunk(ChunkKey key) throws IOException {
-        synchronized (monitor) {
-            physicalReads++;
+    private void loadChunk(ChunkKey key, CompletableFuture<ChunkLoad> result) {
+        ChunkLoad load;
+        try {
+            load = readChunk(key);
+        } catch (IOException | RuntimeException failure) {
+            synchronized (monitor) {
+                loads.remove(key, result);
+            }
+            result.complete(ChunkLoad.ioFailure(failure));
+            return;
         }
+        synchronized (monitor) {
+            loads.remove(key, result);
+            cacheDecodedLocked(key, load);
+        }
+        result.complete(load);
+    }
+
+    private ReadResult latestLocked(ChunkKey key, int sectionY, ChunkLoad load) {
+        if (load.status == ChunkStatus.IO_FAILURE) {
+            return ReadResult.ioFailure(load.failure);
+        }
+        SectionRecord record = load.status == ChunkStatus.PRESENT
+                ? load.image.sections.get(sectionY) : null;
+        PendingChunk dirty = pending.get(key);
+        if (dirty != null) {
+            record = applyForRead(record, load.status,
+                    dirty.inFlight == null ? null : dirty.inFlight.get(sectionY));
+            record = applyForRead(record, load.status, dirty.sections.get(sectionY));
+        }
+        if (record != null) {
+            return ReadResult.found(record);
+        }
+        return load.status == ChunkStatus.CORRUPT
+                ? ReadResult.corrupt() : ReadResult.missing();
+    }
+
+    private static SectionRecord applyForRead(SectionRecord base,
+                                              ChunkStatus status,
+                                              PendingSection pending) {
+        if (pending == null) {
+            return base;
+        }
+        Applied applied = apply(pending.mutation, base, status);
+        return applied.record;
+    }
+
+    private ChunkLoad readChunk(ChunkKey key) throws IOException {
         RegionFile region = region(key);
         try (DataInputStream input = region.getChunkDataInputStream(key.chunk)) {
             if (input == null) {
-                return ChunkImage.EMPTY;
+                return ChunkLoad.missing();
             }
             try {
-                return decodeChunk(input);
+                return ChunkLoad.present(decodeChunk(input));
             } catch (EOFException | IllegalArgumentException corrupt) {
-                return ChunkImage.EMPTY;
+                return ChunkLoad.corrupt();
             }
         }
     }
@@ -410,23 +508,29 @@ public final class TopologyStore implements AutoCloseable {
     private static ChunkImage decodeChunk(DataInputStream input) throws IOException {
         if (input.readInt() != MAGIC
                 || input.readInt() != SCHEMA_VERSION
-                || input.readInt() != ALGORITHM_VERSION) {
-            return ChunkImage.EMPTY;
+                || input.readInt() != BaseClusterTopology.FACTS_ALGORITHM_VERSION) {
+            throw new IllegalArgumentException("unsupported topology facts format");
         }
         int sectionCount = input.readInt();
         if (sectionCount < 0 || sectionCount > MAX_SECTIONS_PER_CHUNK) {
-            return ChunkImage.EMPTY;
+            throw new IllegalArgumentException("invalid topology section count");
         }
-        Map<Integer, BaseClusterTopology.PackedFacts> sections = new LinkedHashMap<>();
+        Map<Integer, SectionRecord> sections = new LinkedHashMap<>();
         for (int index = 0; index < sectionCount; index++) {
             int sectionY = input.readInt();
+            long version = input.readLong();
             byte[] packed = new byte[BaseClusterTopology.PACKED_FACT_BYTES];
             input.readFully(packed);
-            if (sections.put(sectionY, BaseClusterTopology.PackedFacts.fromBytes(packed)) != null) {
-                return ChunkImage.EMPTY;
+            SectionRecord record = new SectionRecord(
+                    version, BaseClusterTopology.PackedFacts.fromBytes(packed));
+            if (sections.put(sectionY, record) != null) {
+                throw new IllegalArgumentException("duplicate topology section");
             }
         }
-        return input.read() == -1 ? new ChunkImage(Map.copyOf(sections)) : ChunkImage.EMPTY;
+        if (input.read() != -1) {
+            throw new IllegalArgumentException("trailing topology record data");
+        }
+        return new ChunkImage(Map.copyOf(sections));
     }
 
     private void writeChunkRecord(ChunkKey key, ChunkImage image) throws IOException {
@@ -437,62 +541,59 @@ public final class TopologyStore implements AutoCloseable {
         try (DataOutputStream output = region.getChunkDataOutputStream(key.chunk)) {
             output.writeInt(MAGIC);
             output.writeInt(SCHEMA_VERSION);
-            output.writeInt(ALGORITHM_VERSION);
+            output.writeInt(BaseClusterTopology.FACTS_ALGORITHM_VERSION);
             output.writeInt(image.sections.size());
-            for (Map.Entry<Integer, BaseClusterTopology.PackedFacts> section
-                    : image.sections.entrySet()) {
+            for (Map.Entry<Integer, SectionRecord> section : image.sections.entrySet()) {
                 output.writeInt(section.getKey());
-                output.write(section.getValue().bytes());
+                output.writeLong(section.getValue().version);
+                output.write(section.getValue().facts.bytes());
             }
         }
     }
 
-    private void flush(ResourceKey<Level> dimension) {
+    private int flush(ResourceKey<Level> dimension) {
+        int failures = 0;
         for (Map.Entry<RegionKey, RegionFile> entry : regions.entrySet()) {
             if (!entry.getKey().dimension.equals(dimension.location())) {
                 continue;
             }
             try {
                 entry.getValue().flush();
-                synchronized (monitor) {
-                    flushes++;
-                }
             } catch (IOException failure) {
+                failures++;
                 AcceleratedNavigation.LOGGER.warn(
                         "Could not flush macro topology for {}",
-                        dimension.location(),
-                        failure
-                );
+                        dimension.location(), failure);
             }
         }
+        return failures;
     }
 
-    private void flushAndCloseRegions() {
+    private int flushAndCloseRegions() {
+        int failures = 0;
         for (Map.Entry<RegionKey, RegionFile> entry : regions.entrySet()) {
             try {
                 entry.getValue().flush();
-                synchronized (monitor) {
-                    flushes++;
-                }
             } catch (IOException failure) {
-                AcceleratedNavigation.LOGGER.warn("Could not flush macro topology region {}", entry.getKey(), failure);
+                failures++;
+                AcceleratedNavigation.LOGGER.warn(
+                        "Could not flush macro topology region {}", entry.getKey(), failure);
             }
             try {
                 entry.getValue().close();
             } catch (IOException failure) {
-                AcceleratedNavigation.LOGGER.warn("Could not close macro topology region {}", entry.getKey(), failure);
+                failures++;
+                AcceleratedNavigation.LOGGER.warn(
+                        "Could not close macro topology region {}", entry.getKey(), failure);
             }
         }
         regions.clear();
-        openRegionCount = 0;
+        return failures;
     }
 
     private RegionFile region(ChunkKey chunk) throws IOException {
-        RegionKey key = new RegionKey(
-                chunk.dimension.location(),
-                chunk.chunk.getRegionX(),
-                chunk.chunk.getRegionZ()
-        );
+        RegionKey key = new RegionKey(chunk.dimension.location(),
+                chunk.chunk.getRegionX(), chunk.chunk.getRegionZ());
         RegionFile open = regions.get(key);
         if (open != null) {
             return open;
@@ -507,11 +608,8 @@ public final class TopologyStore implements AutoCloseable {
         Files.createDirectories(directory);
         RegionFile created = new RegionFile(
                 directory.resolve("r." + key.regionX + "." + key.regionZ + ".mca"),
-                directory,
-                false
-        );
+                directory, false);
         regions.put(key, created);
-        openRegionCount = regions.size();
         return created;
     }
 
@@ -526,80 +624,82 @@ public final class TopologyStore implements AutoCloseable {
         return directory;
     }
 
-    private void cacheDecodedLocked(ChunkKey key, ChunkImage image) {
-        decoded.put(key, image);
+    private void cacheDecodedLocked(ChunkKey key, ChunkLoad load) {
+        if (load.status == ChunkStatus.IO_FAILURE) {
+            return;
+        }
+        decoded.put(key, DecodedChunk.capture(load));
         while (decoded.size() > MAX_DECODED_CHUNKS) {
             decoded.remove(decoded.entrySet().iterator().next().getKey());
         }
     }
 
-    private CompletableFuture<Void> submitForeground(IoOperation operation) {
-        CompletableFuture<Void> result = new CompletableFuture<>();
-        synchronized (monitor) {
-            enqueueLocked(foreground, () -> {
-                try {
-                    operation.run();
-                    result.complete(null);
-                } catch (Throwable failure) {
-                    result.completeExceptionally(failure);
-                }
-            });
-        }
-        return result;
+    private ChunkLoad decodedLoadLocked(ChunkKey key) {
+        DecodedChunk cached = decoded.get(key);
+        if (cached == null) return null;
+        ChunkLoad load = cached.resolve();
+        if (load == null) decoded.remove(key);
+        return load;
     }
 
     private void enqueueLocked(ArrayDeque<IoTask> queue, Runnable command) {
-        queue.addLast(new IoTask(System.nanoTime(), command));
-        submittedTasks++;
+        queue.addLast(new IoTask(command));
+        highestQueuedTasks = Math.max(highestQueuedTasks,
+                foreground.size() + background.size());
         monitor.notifyAll();
     }
 
     private void runWorker() {
-        while (true) {
-            IoTask task;
-            synchronized (monitor) {
-                while (foreground.isEmpty() && background.isEmpty() && !stopWorker) {
-                    try {
-                        monitor.wait();
-                    } catch (InterruptedException ignored) {
-                        if (stopWorker) {
-                            return;
+        try {
+            while (true) {
+                IoTask task;
+                synchronized (monitor) {
+                    while (foreground.isEmpty() && background.isEmpty() && !closing) {
+                        try {
+                            monitor.wait();
+                        } catch (InterruptedException ignored) {
+                            if (closing) {
+                                break;
+                            }
                         }
                     }
+                    if (foreground.isEmpty() && background.isEmpty() && closing) {
+                        break;
+                    }
+                    if (!foreground.isEmpty()
+                            && (background.isEmpty()
+                            || foregroundBurst < MAX_FOREGROUND_BURST)) {
+                        task = foreground.removeFirst();
+                        foregroundBurst++;
+                    } else {
+                        task = background.removeFirst();
+                        foregroundBurst = 0;
+                    }
                 }
-                if (foreground.isEmpty() && background.isEmpty() && stopWorker) {
-                    return;
+                try {
+                    task.command.run();
+                } catch (VirtualMachineError | ThreadDeath fatal) {
+                    throw fatal;
+                } catch (Throwable failure) {
+                    AcceleratedNavigation.LOGGER.error(
+                            "Unhandled macro topology I/O task failure", failure);
                 }
-                if (!foreground.isEmpty()
-                        && (background.isEmpty() || foregroundBurst < MAX_FOREGROUND_BURST)) {
-                    task = foreground.removeFirst();
-                    foregroundBurst++;
-                } else {
-                    task = background.removeFirst();
-                    foregroundBurst = 0;
-                }
-                long waited = Math.max(0L, System.nanoTime() - task.enqueuedNanos);
-                totalQueueWaitNanos += waited;
-                maximumQueueWaitNanos = Math.max(maximumQueueWaitNanos, waited);
             }
-            try {
-                task.command.run();
-            } catch (VirtualMachineError | ThreadDeath fatal) {
-                throw fatal;
-            } catch (Throwable failure) {
-                AcceleratedNavigation.LOGGER.error("Unhandled macro topology I/O task failure", failure);
-            } finally {
-                synchronized (monitor) {
-                    completedTasks++;
-                }
+        } finally {
+            int failures = flushAndCloseRegions();
+            synchronized (monitor) {
+                flushes++;
+                flushFailures += failures;
             }
         }
     }
 
-    private static CompletableFuture<Void> settle(List<CompletableFuture<Void>> futures) {
-        return CompletableFuture.allOf(futures.stream()
-                .map(future -> future.exceptionally(ignored -> null))
-                .toArray(CompletableFuture[]::new));
+    private void recordReadLocked(ReadResult result) {
+        switch (result.status) {
+            case FOUND -> recordsFound++;
+            case MISSING -> recordsMissing++;
+            case CORRUPT, IO_FAILURE -> readFailures++;
+        }
     }
 
     private void ensureAccepting() {
@@ -608,53 +708,137 @@ public final class TopologyStore implements AutoCloseable {
         }
     }
 
-    record Metrics(int queuedTasks,
-                   long submittedTasks,
-                   long completedTasks,
-                   long totalQueueWaitNanos,
-                   long maximumQueueWaitNanos,
-                   long physicalReads,
-                   long coalescedReads,
-                   long physicalWrites,
-                   long flushes,
-                   int pendingChunks,
-                   int pendingHighWatermark,
-                   long oldestPendingNanos,
-                   long writeFailures,
-                   long droppedChunks,
-                   int decodedChunks,
-                   int inFlightLoads,
-                   int openRegions) {
+    enum ReadStatus {
+        FOUND,
+        MISSING,
+        CORRUPT,
+        IO_FAILURE
+    }
+
+    record SectionRecord(long version, BaseClusterTopology.PackedFacts facts) {
+        SectionRecord {
+            if (version < 0L) {
+                throw new IllegalArgumentException("facts version cannot be negative");
+            }
+            Objects.requireNonNull(facts, "facts");
+        }
+    }
+
+    record SectionDelta(long originalVersion,
+                        long newVersion,
+                        Map<Integer, Byte> cells) {
+        SectionDelta {
+            if (originalVersion < 0L || newVersion <= originalVersion) {
+                throw new IllegalArgumentException("facts delta versions are not increasing");
+            }
+            Objects.requireNonNull(cells, "cells");
+            if (cells.isEmpty()) {
+                throw new IllegalArgumentException("facts delta cannot be empty");
+            }
+            cells.forEach((cell, flags) -> {
+                if (cell < 0 || cell >= BaseClusterTopology.CELL_COUNT) {
+                    throw new IllegalArgumentException("facts delta cell is outside the section");
+                }
+                Objects.requireNonNull(flags, "facts delta flags");
+                int value = Byte.toUnsignedInt(flags);
+                int valid = BaseClusterTopology.VOLUME_OPEN
+                        | BaseClusterTopology.GROUND_OPEN
+                        | BaseClusterTopology.FLUID
+                        | BaseClusterTopology.EXACT_REQUIRED;
+                if ((value & ~valid) != 0) {
+                    throw new IllegalArgumentException("facts delta contains unknown flags");
+                }
+            });
+            cells = Map.copyOf(cells);
+        }
+    }
+
+    record ReadResult(ReadStatus status, SectionRecord record, Throwable failure) {
+        private static ReadResult found(SectionRecord record) {
+            return new ReadResult(ReadStatus.FOUND, record, null);
+        }
+
+        private static ReadResult missing() {
+            return new ReadResult(ReadStatus.MISSING, null, null);
+        }
+
+        private static ReadResult corrupt() {
+            return new ReadResult(ReadStatus.CORRUPT, null, null);
+        }
+
+        private static ReadResult ioFailure(Throwable failure) {
+            return new ReadResult(ReadStatus.IO_FAILURE, null,
+                    Objects.requireNonNull(failure, "failure"));
+        }
+    }
+
+    enum UpdateStatus {
+        WRITTEN,
+        COALESCED,
+        BASE_MISSING,
+        VERSION_MISMATCH,
+        CORRUPT,
+        IO_FAILURE
+    }
+
+    record UpdateResult(UpdateStatus status, Throwable failure) {
+        private static UpdateResult versionMismatch() {
+            return new UpdateResult(UpdateStatus.VERSION_MISMATCH, null);
+        }
+
+        private static UpdateResult coalesced() {
+            return new UpdateResult(UpdateStatus.COALESCED, null);
+        }
+
+        boolean accepted() {
+            return status == UpdateStatus.WRITTEN || status == UpdateStatus.COALESCED;
+        }
+    }
+
+    private enum ChunkStatus {
+        PRESENT,
+        MISSING,
+        CORRUPT,
+        IO_FAILURE
+    }
+
+    private sealed interface Mutation permits FullMutation, DeltaMutation {
+        long targetVersion();
+    }
+
+    private record FullMutation(SectionRecord record) implements Mutation {
+        @Override
+        public long targetVersion() {
+            return record.version;
+        }
+    }
+
+    private record DeltaMutation(SectionDelta delta) implements Mutation {
+        @Override
+        public long targetVersion() {
+            return delta.newVersion;
+        }
     }
 
     private static final class PendingChunk {
-        private final Map<Integer, SectionUpdate> updates = new HashMap<>();
-        private final List<WriteWaiter> waiters = new ArrayList<>();
-        private ChunkImage currentImage;
+        private final Map<Integer, PendingSection> sections = new HashMap<>();
+        private Map<Integer, PendingSection> inFlight;
         private boolean unloaded;
-        private boolean writeRequested;
-        private boolean writeInFlight;
-        private int failedAttempts;
-        private long writtenGeneration;
-        private long oldestUpdateNanos;
 
-        private BaseClusterTopology.PackedFacts latest(int sectionY) {
-            SectionUpdate update = updates.get(sectionY);
-            if (update != null) {
-                return update.facts;
-            }
-            return currentImage == null ? null : currentImage.sections.get(sectionY);
+        private long inFlightTargetVersion(int sectionY) {
+            PendingSection section = inFlight == null ? null : inFlight.get(sectionY);
+            return section == null ? -1L : section.mutation.targetVersion();
         }
+    }
 
-        private long latestGeneration() {
-            return updates.values().stream().mapToLong(update -> update.generation).max().orElse(0L);
-        }
+    private static final class PendingSection {
+        private final Mutation mutation;
+        private final CompletableFuture<UpdateResult> completion;
 
-        private void refreshOldestUpdate() {
-            oldestUpdateNanos = updates.values().stream()
-                    .mapToLong(update -> update.enqueuedNanos)
-                    .min()
-                    .orElse(0L);
+        private PendingSection(Mutation mutation,
+                               CompletableFuture<UpdateResult> completion) {
+            this.mutation = mutation;
+            this.completion = completion;
         }
     }
 
@@ -668,23 +852,78 @@ public final class TopologyStore implements AutoCloseable {
     private record RegionKey(ResourceLocation dimension, int regionX, int regionZ) {
     }
 
-    private record ChunkImage(Map<Integer, BaseClusterTopology.PackedFacts> sections) {
+    private record ChunkImage(Map<Integer, SectionRecord> sections) {
         private static final ChunkImage EMPTY = new ChunkImage(Map.of());
     }
 
-    private record SectionUpdate(long generation,
-                                 long enqueuedNanos,
-                                 BaseClusterTopology.PackedFacts facts) {
+    private record ChunkLoad(ChunkStatus status, ChunkImage image, Throwable failure) {
+        private static ChunkLoad present(ChunkImage image) {
+            return new ChunkLoad(ChunkStatus.PRESENT, image, null);
+        }
+
+        private static ChunkLoad missing() {
+            return new ChunkLoad(ChunkStatus.MISSING, ChunkImage.EMPTY, null);
+        }
+
+        private static ChunkLoad corrupt() {
+            return new ChunkLoad(ChunkStatus.CORRUPT, ChunkImage.EMPTY, null);
+        }
+
+        private static ChunkLoad ioFailure(Throwable failure) {
+            return new ChunkLoad(ChunkStatus.IO_FAILURE, ChunkImage.EMPTY, failure);
+        }
     }
 
-    private record WriteWaiter(long generation, CompletableFuture<Void> future) {
+    /** The I/O cache does not become a second strong owner of runtime facts. */
+    private static final class DecodedChunk {
+        private final ChunkStatus status;
+        private final Map<Integer, WeakSectionRecord> sections;
+
+        private DecodedChunk(ChunkStatus status, Map<Integer, WeakSectionRecord> sections) {
+            this.status = status;
+            this.sections = sections;
+        }
+
+        private static DecodedChunk capture(ChunkLoad load) {
+            if (load.status != ChunkStatus.PRESENT) {
+                return new DecodedChunk(load.status, Map.of());
+            }
+            Map<Integer, WeakSectionRecord> records = new LinkedHashMap<>();
+            load.image.sections.forEach((sectionY, record) -> records.put(
+                    sectionY, new WeakSectionRecord(
+                            record.version, new WeakReference<>(record.facts))));
+            return new DecodedChunk(load.status, Map.copyOf(records));
+        }
+
+        private ChunkLoad resolve() {
+            if (status == ChunkStatus.MISSING) return ChunkLoad.missing();
+            if (status == ChunkStatus.CORRUPT) return ChunkLoad.corrupt();
+            if (status != ChunkStatus.PRESENT) return null;
+            Map<Integer, SectionRecord> records = new LinkedHashMap<>();
+            for (Map.Entry<Integer, WeakSectionRecord> entry : sections.entrySet()) {
+                BaseClusterTopology.PackedFacts facts = entry.getValue().facts.get();
+                if (facts == null) return null;
+                records.put(entry.getKey(), new SectionRecord(
+                        entry.getValue().version, facts));
+            }
+            return ChunkLoad.present(new ChunkImage(Map.copyOf(records)));
+        }
     }
 
-    private record IoTask(long enqueuedNanos, Runnable command) {
+    private record WeakSectionRecord(long version,
+                                     WeakReference<BaseClusterTopology.PackedFacts> facts) {
     }
 
-    @FunctionalInterface
-    private interface IoOperation {
-        void run() throws Exception;
+    private record Applied(SectionRecord record, UpdateStatus status) {
+    }
+
+    private record Completion(CompletableFuture<UpdateResult> future,
+                              UpdateResult result) {
+        private void complete() {
+            future.complete(result);
+        }
+    }
+
+    private record IoTask(Runnable command) {
     }
 }

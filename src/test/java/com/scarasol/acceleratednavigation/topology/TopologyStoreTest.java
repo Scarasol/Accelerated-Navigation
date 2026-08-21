@@ -37,15 +37,16 @@ class TopologyStoreTest {
         BaseClusterTopology.PackedFacts lowerFacts = facts(1);
         BaseClusterTopology.PackedFacts upperFacts = facts(11);
         try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
-            store.markDirty(Level.OVERWORLD, lower, lowerFacts);
-            store.markDirty(Level.OVERWORLD, upper, upperFacts);
-            store.save(Level.OVERWORLD).join();
-            assertEquals(1L, store.metrics().physicalWrites());
+            store.writeFull(Level.OVERWORLD, lower, 1L, lowerFacts).join();
+            store.writeFull(Level.OVERWORLD, upper, 1L, upperFacts).join();
         }
         try (TopologyStore reopened = new TopologyStore(temporaryDirectory)) {
-            assertFacts(lowerFacts, reopened.read(Level.OVERWORLD, lower).join().orElseThrow());
-            assertFacts(upperFacts, reopened.read(Level.OVERWORLD, upper).join().orElseThrow());
-            assertEquals(1L, reopened.metrics().physicalReads());
+            assertEquals(TopologyStore.ReadStatus.FOUND,
+                    reopened.read(Level.OVERWORLD, lower).join().status());
+            assertEquals(TopologyStore.ReadStatus.FOUND,
+                    reopened.read(Level.OVERWORLD, upper).join().status());
+            assertFacts(lowerFacts, reopened.read(Level.OVERWORLD, lower).join().record().facts());
+            assertFacts(upperFacts, reopened.read(Level.OVERWORLD, upper).join().record().facts());
         }
     }
 
@@ -56,12 +57,11 @@ class TopologyStoreTest {
         BaseClusterTopology.PackedFacts replacement = facts(13);
         BaseClusterTopology.PackedFacts siblingFacts = facts(4);
         try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
-            store.markDirty(Level.OVERWORLD, first, facts(2));
-            store.markDirty(Level.OVERWORLD, sibling, siblingFacts);
-            store.markDirty(Level.OVERWORLD, first, replacement);
-            assertFacts(replacement, store.read(Level.OVERWORLD, first).join().orElseThrow());
-            assertFacts(siblingFacts, store.read(Level.OVERWORLD, sibling).join().orElseThrow());
-            assertEquals(0L, store.metrics().physicalWrites());
+            store.writeFull(Level.OVERWORLD, first, 1L, facts(2));
+            store.writeFull(Level.OVERWORLD, sibling, 1L, siblingFacts);
+            store.writeFull(Level.OVERWORLD, first, 2L, replacement);
+            assertFacts(replacement, store.read(Level.OVERWORLD, first).join().record().facts());
+            assertFacts(siblingFacts, store.read(Level.OVERWORLD, sibling).join().record().facts());
             store.unload(Level.OVERWORLD, new ChunkPos(0, 0));
         }
     }
@@ -80,9 +80,11 @@ class TopologyStoreTest {
         }
         SectionPos section = SectionPos.of(0, 0, 0);
         try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
-            assertFalse(store.read(Level.OVERWORLD, section).join().isPresent());
-            store.markDirty(Level.OVERWORLD, section, facts(1));
-            assertTrue(store.read(Level.OVERWORLD, section).join().isPresent());
+            assertEquals(TopologyStore.ReadStatus.CORRUPT,
+                    store.read(Level.OVERWORLD, section).join().status());
+            store.writeFull(Level.OVERWORLD, section, 1L, facts(1));
+            assertEquals(TopologyStore.ReadStatus.FOUND,
+                    store.read(Level.OVERWORLD, section).join().status());
         }
     }
 
@@ -93,7 +95,7 @@ class TopologyStoreTest {
                         | BaseClusterTopology.GROUND_OPEN
                         | BaseClusterTopology.FLUID
                         | BaseClusterTopology.EXACT_REQUIRED);
-        return new BaseClusterTopology.Snapshot(cells).packedFacts();
+        return BaseClusterTopology.PackedFacts.fromCells(cells);
     }
 
     private static void assertFacts(BaseClusterTopology.PackedFacts expected,

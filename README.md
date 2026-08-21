@@ -13,17 +13,28 @@ Hazard or its surface-path node types.
   scheduled as an atomic soft-budget task.
 - Entity types listed by exact registry ID in `bypassEntityIds` retain their
   original navigation without macro planning or scheduler interception.
-- The scheduler owns request lifecycle, priority, fairness, queue pressure and
-  server-tick budget. It does not know Minecraft `Path`, Fungal surface nodes,
-  collision geometry or movement execution.
+- The main-thread scheduler remains the execution boundary for future detailed
+  path refinement. Macro graph construction and macro search use their own two
+  worker executor and do not consume the server-tick budget.
 - Synchronous reachability queries keep their original final-result contract.
   Incomplete A* frontier paths are not exposed as executable paths.
 
 ## Current split
 
-The module now contains the neutral resumable-search contract, strict and soft
-scheduling channels, weighted deficit round-robin fairness, cross-dimension
-rotation, exception isolation and exact-ID bypass policy.
+The module contains the neutral resumable-search contract, the retained
+main-thread scheduler for detailed navigation, exception isolation and the
+exact-ID bypass policy. Macro topology has a separate ownership model:
+
+- The server thread observes chunk generation and block changes, validates
+  persisted section facts, performs exceptional fact recovery, publishes
+  immutable fact versions and validates final macro results.
+- One topology runtime owns all derived graphs, dependency waits, active
+  references, completed corridors and macro searches.
+- Two topology workers share one foreground order. Graph builds are serial;
+  one worker may search while the other builds. Idle prewarm is admitted only
+  when no foreground work exists.
+- One low-priority persistence worker reads, coalesces, writes and flushes
+  versioned section facts.
 
 The base and second macro-topology layers are implemented:
 
@@ -39,43 +50,34 @@ The base and second macro-topology layers are implemented:
   neither rescan blocks nor build all-pairs entrance edges. Profile-filtered
   component labels are prepared on their outer faces so cross-cluster queries
   use fixed boundary scans instead of component Cartesian products.
-- Long queries select a super-cluster corridor and then run a time-sliced base
-  refinement constrained to that corridor. Only the resulting base-component
-  corridor is returned.
-- Main-thread section snapshots, one low-priority topology worker, immutable
-  publication and revision checks.
-- Sidecar persistence through Minecraft `RegionFile`, bounded decoding and
-  corruption fallback.
+- Long queries select a super-cluster corridor and then run node-bounded local
+  recovery for that corridor. Only the resulting base-component corridor is
+  returned.
+- Four-bit-per-cell immutable section facts produced from chunk-generation and
+  block-change events. Normal chunk loading reads versioned persistence rather
+  than rescanning blocks; a full section scan is reserved for failed
+  persistence validation.
+- Persistence through Minecraft `RegionFile`, bounded weak decoding and
+  corruption recovery.
 - Block-change invalidation, boundary-neighbor invalidation and chunk-unload
   eviction without forcing chunk loads.
 - Lazy query-graph indexing, so short searches do not scan unrelated cached
   sections.
-- Isolated JUnit and GameTest coverage, including short/medium/long timing and
-  cluster-build resource reports.
+- Isolated JUnit and GameTest source sets cover pure graph algorithms,
+  persistence behavior, collision fact classification and the production
+  macro-request boundary.
 
-## Terrain benchmarks
+The current production architecture and ownership boundaries are documented in
+[`docs/accelerated-navigation-architecture/README.md`](docs/accelerated-navigation-architecture/README.md).
 
-`./gradlew runTerrainBenchmarkServer` starts a
-test-only dedicated server with the fixed seed `73939133` and the normal world
-preset. It loads real Overworld surface, underground cave and Nether chunks,
-then records section snapshot/build cost and 8, 96 and 512 block route queries
-in `build/reports/real-terrain-topology.json`. Chunk generation/load, macro
-search and a single first-window vanilla refinement probe are timed separately.
-Before any measured query, the test-only harness indexes directed strongly
-connected components in the published base graph and chooses endpoints from one
-component. This preselection is excluded from macro timing and proves only base
-structural reachability; it is not reported as complete physical execution.
-Super-cluster worker build, high-level expansion and constrained base refinement
-are reported separately. Build-worker and persistence-worker queue waits,
-promotions and cancellations are also reported separately. The macro timing
-always reports zero concrete Navigation calls. Missing loaded
-topology, unavailable chunks, structural disconnection and timeout are distinct
-outcomes rather than being collapsed into unreachable.
+## Validation
 
-`./gradlew test` still writes
-`build/reports/macro-topology-synthetic-microbenchmark.json`. That report is a
-deterministic graph-scaling microbenchmark only. It contains no generated
-terrain and must not be used as evidence of real-world route performance.
+`./gradlew test` runs the JUnit source set. `./gradlew runGameTestServer` runs
+the Forge GameTest source set against the production request boundary. The
+current build does not contain a real-terrain benchmark task or a synthetic
+performance-report generator; files under `docs/reports` are historical
+evidence tied to the source and harness described by each report, not results
+regenerated by the current test tasks.
 
 The previous experimental global `PathNavigation.createPath` redirection was
 not migrated because it returned incomplete paths from a synchronous API and

@@ -8,6 +8,7 @@ import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.ZeroBitStorage;
 
 import java.util.Arrays;
+import java.util.Map;
 import java.util.Objects;
 
 /** One immutable macro traversal view for a section generation and normalized geometry. */
@@ -16,6 +17,7 @@ public final class BaseClusterTopology {
     public static final int SIDE = 16;
     public static final int CELL_COUNT = SIDE * SIDE * SIDE;
     static final int PACKED_FACT_BYTES = CELL_COUNT / 2;
+    static final int FACTS_ALGORITHM_VERSION = 3;
     public static final int VOLUME_OPEN = 1;
     public static final int GROUND_OPEN = 1 << 1;
     public static final int FLUID = 1 << 2;
@@ -591,10 +593,6 @@ public final class BaseClusterTopology {
         return (cell >>> 4) & 15;
     }
 
-    private static int faceIndex(int u, int v) {
-        return (v << 4) | u;
-    }
-
     private static final Direction[] HORIZONTAL_DIRECTIONS = {
             Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST
     };
@@ -641,7 +639,7 @@ public final class BaseClusterTopology {
                                    int maxDrop,
                                    boolean acceptsFluid) {
         public static final TraversalProfile DEFAULT_GROUND =
-                new TraversalProfile(0.6F, 1.95F, 1, 3, 3, false);
+                new TraversalProfile(0.6F, 1.95F, 1, 0, 3, false);
 
         public TraversalProfile {
             if (!Float.isFinite(width) || width <= 0.0F
@@ -875,34 +873,9 @@ public final class BaseClusterTopology {
         }
     }
 
-    public static final class Snapshot {
-        private final byte[] cells;
-        private final long fingerprint;
-
-        public Snapshot(byte[] cells) {
-            Objects.requireNonNull(cells, "cells");
-            if (cells.length != CELL_COUNT) {
-                throw new IllegalArgumentException("snapshot must contain exactly 4096 cells");
-            }
-            this.cells = cells.clone();
-            this.fingerprint = fingerprintCells(this.cells);
-        }
-
-        public int flags(int index) {
-            return Byte.toUnsignedInt(cells[index]);
-        }
-
-        PackedFacts packedFacts() {
-            return PackedFacts.fromCells(cells, fingerprint);
-        }
-
-        public long fingerprint() {
-            return fingerprint;
-        }
-    }
-
     /** Compact persistent form of the four structural flags for each cell. */
     static final class PackedFacts {
+        private static final PackedFacts ALL_AIR = createAllAir();
         private final byte[] data;
         private final int uniformFlags;
         private final long fingerprint;
@@ -923,9 +896,21 @@ public final class BaseClusterTopology {
         }
 
         static PackedFacts allAir() {
+            return ALL_AIR;
+        }
+
+        private static PackedFacts createAllAir() {
             byte[] cells = new byte[CELL_COUNT];
             Arrays.fill(cells, (byte) VOLUME_OPEN);
             return new PackedFacts(null, VOLUME_OPEN, fingerprintCells(cells));
+        }
+
+        static PackedFacts fromCells(byte[] cells) {
+            Objects.requireNonNull(cells, "cells");
+            if (cells.length != CELL_COUNT) {
+                throw new IllegalArgumentException("facts must contain exactly 4096 cells");
+            }
+            return fromCells(cells, fingerprintCells(cells));
         }
 
         private static PackedFacts fromCells(byte[] cells, long fingerprint) {
@@ -955,12 +940,60 @@ public final class BaseClusterTopology {
             return expanded;
         }
 
-        long fingerprint() {
-            return fingerprint;
+        byte[] cells() {
+            byte[] cells = new byte[CELL_COUNT];
+            if (uniformFlags >= 0) {
+                Arrays.fill(cells, (byte) uniformFlags);
+                return cells;
+            }
+            for (int cell = 0; cell < CELL_COUNT; cell++) {
+                cells[cell] = (byte) flags(cell);
+            }
+            return cells;
         }
 
-        boolean isAllAir() {
-            return uniformFlags == VOLUME_OPEN;
+        PackedFacts withChanges(Map<Integer, Byte> changes) {
+            Objects.requireNonNull(changes, "changes");
+            if (changes.isEmpty()) {
+                return this;
+            }
+            byte[] cells = cells();
+            boolean changed = false;
+            for (Map.Entry<Integer, Byte> entry : changes.entrySet()) {
+                int cell = entry.getKey();
+                int flags = Byte.toUnsignedInt(entry.getValue());
+                if (cell < 0 || cell >= CELL_COUNT) {
+                    throw new IllegalArgumentException("cell index is outside the section");
+                }
+                if ((flags & ~VALID_FLAGS) != 0) {
+                    throw new IllegalArgumentException("cell contains unknown fact flags");
+                }
+                if (cells[cell] != (byte) flags) {
+                    cells[cell] = (byte) flags;
+                    changed = true;
+                }
+            }
+            return changed ? fromCells(cells) : this;
+        }
+
+        boolean contentEquals(PackedFacts other) {
+            Objects.requireNonNull(other, "other");
+            if (this == other) {
+                return true;
+            }
+            if (fingerprint != other.fingerprint) {
+                return false;
+            }
+            for (int cell = 0; cell < CELL_COUNT; cell++) {
+                if (flags(cell) != other.flags(cell)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        long fingerprint() {
+            return fingerprint;
         }
 
         int retainedBytes() {

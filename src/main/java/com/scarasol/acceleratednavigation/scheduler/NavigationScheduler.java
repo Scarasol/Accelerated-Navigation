@@ -83,21 +83,7 @@ public final class NavigationScheduler {
                                                   UUID owner,
                                                   Priority priority,
                                                   ResumableSearch<R> search) {
-        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS, false, true);
-    }
-
-    public <R> CompletableFuture<R> submitDependency(ResourceKey<Level> dimension,
-                                                      UUID owner,
-                                                      Priority priority,
-                                                      ResumableSearch<R> search) {
-        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS, true, true);
-    }
-
-    public <R> CompletableFuture<R> submitPrewarm(ResourceKey<Level> dimension,
-                                                   UUID owner,
-                                                   ResumableSearch<R> search) {
-        return submit(dimension, owner, Priority.BACKGROUND, search,
-                MIN_SLICE_NANOS, false, false);
+        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS);
     }
 
     /**
@@ -118,8 +104,7 @@ public final class NavigationScheduler {
                 MIN_SLICE_NANOS,
                 Math.min(MAX_SLICE_NANOS, estimatedCostNanos)
         );
-        return submit(dimension, owner, priority, new AtomicSearch<>(task),
-                startThreshold, false, true);
+        return submit(dimension, owner, priority, new AtomicSearch<>(task), startThreshold);
     }
 
     public boolean cancel(ResourceKey<Level> dimension, UUID owner) {
@@ -165,69 +150,11 @@ public final class NavigationScheduler {
         return true;
     }
 
-    public boolean qualifyDependency(ResourceKey<Level> dimension,
-                                     UUID owner,
-                                     Priority priority) {
-        requireServerThread();
-        Objects.requireNonNull(priority, "priority");
-        QueuedSearch<?> request = pending.get(new RequestKey(
-                Objects.requireNonNull(dimension, "dimension"),
-                Objects.requireNonNull(owner, "owner")
-        ));
-        if (request == null) {
-            return false;
-        }
-        request.dependency = true;
-        request.allowAging = true;
-        promote(dimension, owner, priority);
-        return true;
-    }
-
-    public boolean releaseDependency(ResourceKey<Level> dimension, UUID owner) {
-        requireServerThread();
-        QueuedSearch<?> request = pending.get(new RequestKey(
-                Objects.requireNonNull(dimension, "dimension"),
-                Objects.requireNonNull(owner, "owner")
-        ));
-        if (request == null) {
-            return false;
-        }
-        request.dependency = false;
-        if (!request.started && ordinaryRequestCount() > MAX_PENDING_REQUESTS) {
-            pending.remove(request.key, request);
-            cancelQueued(request);
-            return false;
-        }
-        return true;
-    }
-
-    public AdmissionCapacity admissionCapacity() {
-        requireServerThread();
-        int dependency = 0;
-        int parked = 0;
-        for (QueuedSearch<?> request : pending.values()) {
-            if (request.dependency) {
-                dependency++;
-            }
-            if (request.parked) {
-                parked++;
-            }
-        }
-        return new AdmissionCapacity(
-                Math.max(0, MAX_PENDING_REQUESTS - ordinaryRequestCount()),
-                dependency,
-                pending.size(),
-                parked
-        );
-    }
-
     private <R> CompletableFuture<R> submit(ResourceKey<Level> dimension,
                                              UUID owner,
-                                              Priority priority,
+                                             Priority priority,
                                               ResumableSearch<R> search,
-                                              long startThresholdNanos,
-                                              boolean dependency,
-                                              boolean allowAging) {
+                                             long startThresholdNanos) {
         requireServerThread();
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(owner, "owner");
@@ -245,7 +172,7 @@ public final class NavigationScheduler {
         if (replaced != null) {
             cancelQueued(replaced);
         }
-        if (!dependency && ordinaryRequestCount() >= MAX_PENDING_REQUESTS) {
+        if (pending.size() >= MAX_PENDING_REQUESTS) {
             cancelSafely(search);
             return CompletableFuture.failedFuture(
                     new RejectedExecutionException("accelerated navigation queue is full")
@@ -259,9 +186,7 @@ public final class NavigationScheduler {
                 search,
                 startThresholdNanos,
                 new CompletableFuture<>(),
-                dependency,
-                System.nanoTime(),
-                allowAging
+                System.nanoTime()
         );
         pending.put(key, request);
         enqueue(request);
@@ -335,7 +260,6 @@ public final class NavigationScheduler {
 
                 long allowance = Math.min(MAX_SLICE_NANOS, remaining);
                 long sliceStarted = System.nanoTime();
-                request.started = true;
                 ResumableSearch.Status status;
                 try {
                     status = Objects.requireNonNull(
@@ -491,21 +415,8 @@ public final class NavigationScheduler {
 
     private static int effectiveRank(QueuedSearch<?> request, long now) {
         int rank = request.priority.ordinal();
-        if (!request.allowAging) {
-            return rank;
-        }
         long waited = Math.max(0L, now - request.enqueuedNanos);
         return rank - (int) Math.min(rank, waited / AGING_INTERVAL_NANOS);
-    }
-
-    private int ordinaryRequestCount() {
-        int count = 0;
-        for (QueuedSearch<?> request : pending.values()) {
-            if (!request.dependency) {
-                count++;
-            }
-        }
-        return count;
     }
 
     private void cancelQueued(QueuedSearch<?> request) {
@@ -560,18 +471,6 @@ public final class NavigationScheduler {
         }
     }
 
-    public record AdmissionCapacity(int freeSlots,
-                                    int dependencyRequests,
-                                    int pendingRequests,
-                                    int parkedRequests) {
-        public AdmissionCapacity {
-            if (freeSlots < 0 || dependencyRequests < 0
-                    || pendingRequests < 0 || parkedRequests < 0) {
-                throw new IllegalArgumentException("navigation admission capacity cannot be negative");
-            }
-        }
-    }
-
     private record RequestKey(ResourceKey<Level> dimension, UUID owner) {
     }
 
@@ -583,11 +482,8 @@ public final class NavigationScheduler {
         private final long startThresholdNanos;
         private final CompletableFuture<R> future;
         private final long enqueuedNanos;
-        private boolean dependency;
-        private boolean allowAging;
         private boolean queued;
         private boolean parked;
-        private boolean started;
 
         private QueuedSearch(long sequence,
                              RequestKey key,
@@ -595,18 +491,14 @@ public final class NavigationScheduler {
                              ResumableSearch<R> search,
                              long startThresholdNanos,
                              CompletableFuture<R> future,
-                             boolean dependency,
-                             long enqueuedNanos,
-                             boolean allowAging) {
+                             long enqueuedNanos) {
             this.sequence = sequence;
             this.key = key;
             this.priority = priority;
             this.search = search;
             this.startThresholdNanos = startThresholdNanos;
             this.future = future;
-            this.dependency = dependency;
             this.enqueuedNanos = enqueuedNanos;
-            this.allowAging = allowAging;
         }
     }
 

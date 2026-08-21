@@ -8,7 +8,9 @@
   },
   "minVersion": "0.8",
   "mixins": [
-    "LevelChunkTopologyMixin"
+    "ChunkSerializerTopologyMixin",
+    "LevelChunkTopologyMixin",
+    "ProtoChunkTopologyMixin"
   ],
   "client": []
 }

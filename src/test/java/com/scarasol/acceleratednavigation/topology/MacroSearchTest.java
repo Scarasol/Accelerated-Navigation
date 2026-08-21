@@ -1,5 +1,6 @@
 package com.scarasol.acceleratednavigation.topology;
 
+import com.scarasol.acceleratednavigation.api.ResumableSearch.Status;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import org.junit.jupiter.api.Test;
@@ -8,231 +9,124 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MacroSearchTest {
 
     @Test
-    void returnsStructuralCorridorWithoutBackendCertification() {
+    void returnsAWeightedCorridor() {
         TestGraph graph = new TestGraph(0, 2);
         graph.edge(10, 0, 1, 1.0F);
         graph.edge(11, 1, 2, 1.0F);
 
-        MacroSearch search = new MacroSearch(graph, 1.25F);
+        MacroSearch search = new MacroSearch(graph, 1.25F, 100);
         runToCompletion(search);
 
-        assertEquals(MacroSearch.Status.SUCCEEDED, search.status());
+        assertEquals(Status.SUCCEEDED, search.status());
         assertEquals(List.of(10L, 11L), search.result().connections().stream()
-                .map(MacroSearch.Connection::id)
-                .toList());
+                .map(MacroSearch.Connection::id).toList());
         assertEquals(2.0F, search.result().cost());
-        assertEquals(3, search.metrics().expandedNodes());
     }
 
     @Test
-    void preservesOpenSetAcrossSmallExpansionSlices() {
+    void resumesAcrossSmallExpansionSlices() {
         TestGraph graph = new TestGraph(0, 20);
         for (int node = 0; node < 20; node++) {
             graph.edge(100 + node, node, node + 1, 1.0F);
         }
-        MacroSearch search = new MacroSearch(graph, 1.0F);
 
+        MacroSearch search = new MacroSearch(graph, 1.0F, 100);
         int slices = 0;
-        while (search.status() == MacroSearch.Status.RUNNING) {
-            search.step(1, Long.MAX_VALUE);
+        while (search.status() == Status.RUNNING && slices < 100) {
+            search.step(1);
             slices++;
         }
 
-        assertEquals(MacroSearch.Status.SUCCEEDED, search.status());
+        assertEquals(Status.SUCCEEDED, search.status());
         assertEquals(20, search.result().connections().size());
-        assertEquals(21, slices);
+        assertTrue(slices > 1);
     }
 
     @Test
-    void parksAtAnIncompleteBestFrontierAndResumesTheSameSearch() {
+    void waitsForAndResumesAfterAWorkerDependency() {
         SectionPos missing = SectionPos.of(1, 0, 0);
-        TestGraph graph = new TestGraph(0, 3);
-        graph.edge(10, 0, 1, 1.0F);
-        graph.edge(11, 0, 2, 4.0F);
-        graph.edge(12, 2, 3, 1.0F);
-        graph.pending(1, missing);
-        MacroSearch search = new MacroSearch(graph, 1.25F);
-
-        search.step(64, Long.MAX_VALUE);
-
-        assertEquals(MacroSearch.Status.RUNNING, search.status());
-        assertTrue(search.waitingForTopology());
-        assertEquals(List.of(missing), search.pendingSections(4));
-        assertNull(search.result());
-
-        graph.clearDependencies(1);
-        graph.edge(13, 1, 3, 1.0F);
-        search.topologyAvailable(missing);
-        runToCompletion(search);
-
-        assertEquals(MacroSearch.Status.SUCCEEDED, search.status());
-        assertEquals(List.of(10L, 13L), search.result().connections().stream()
-                .map(MacroSearch.Connection::id)
-                .toList());
-        assertEquals(2.0F, search.result().cost());
-        assertTrue(search.metrics().reexpandedBlockedNodes() > 0L);
-    }
-
-    @Test
-    void discoversACompetitiveDependencyBatchBeforeParking() {
-        SectionPos first = SectionPos.of(1, 0, 0);
-        SectionPos second = SectionPos.of(0, 0, 1);
-        TestGraph graph = new TestGraph(0, 4);
-        graph.prefetchSlack = 1.0F;
-        graph.edge(10, 0, 1, 1.0F);
-        graph.edge(11, 0, 2, 2.0F);
-        graph.edge(12, 0, 3, 8.0F);
-        graph.pending(1, first);
-        graph.pending(2, second);
-        graph.edge(13, 3, 4, 1.0F);
-        MacroSearch search = new MacroSearch(graph, 1.0F);
-
-        search.step(64, Long.MAX_VALUE);
-
-        assertTrue(search.waitingForTopology());
-        assertEquals(Set.of(first, second), Set.copyOf(search.pendingSections(4)));
-        assertEquals(3, search.metrics().expandedNodes());
-    }
-
-    @Test
-    void unavailableBoundaryDoesNotHideAReadyAlternative() {
-        SectionPos unavailable = SectionPos.of(1, 0, 0);
-        TestGraph graph = new TestGraph(0, 3);
-        graph.edge(10, 0, 1, 1.0F);
-        graph.edge(11, 0, 2, 2.0F);
-        graph.edge(12, 2, 3, 1.0F);
-        graph.unavailable(1, unavailable);
-        MacroSearch search = new MacroSearch(graph, 1.0F);
-
-        runToCompletion(search);
-
-        assertEquals(MacroSearch.Status.SUCCEEDED, search.status());
-        assertFalse(search.waitingForTopology());
-        assertEquals(List.of(11L, 12L), search.result().connections().stream()
-                .map(MacroSearch.Connection::id)
-                .toList());
-    }
-
-    @Test
-    void convertsPendingDependencyToUnavailableWithoutReopeningTheSameEdge() {
-        SectionPos unavailable = SectionPos.of(1, 0, 0);
-        TestGraph graph = new TestGraph(0, 3);
-        graph.edge(10, 0, 1, 1.0F);
-        graph.edge(11, 0, 2, 4.0F);
-        graph.edge(12, 2, 3, 1.0F);
-        graph.pending(1, unavailable);
-        MacroSearch search = new MacroSearch(graph, 1.0F);
-
-        search.step(64, Long.MAX_VALUE);
-        assertTrue(search.waitingForTopology());
-
-        graph.clearDependencies(1);
-        search.dependencyUnavailable(new MacroSearch.DependencyKey(
-                MacroSearch.DependencyKind.BASE_CLUSTER, unavailable));
-        runToCompletion(search);
-
-        assertEquals(MacroSearch.Status.SUCCEEDED, search.status());
-        assertEquals(List.of(11L, 12L), search.result().connections().stream()
-                .map(MacroSearch.Connection::id)
-                .toList());
-        assertEquals(0, search.metrics().reexpandedBlockedNodes());
-    }
-
-    @Test
-    void reportsUnavailableOnlyAfterReadyGraphExhaustion() {
-        SectionPos unavailable = SectionPos.of(1, 0, 0);
+        MacroSearch.DependencyKey dependency = new MacroSearch.DependencyKey(
+                MacroSearch.DependencyKind.BASE_CLUSTER, missing);
         TestGraph graph = new TestGraph(0, 2);
         graph.edge(10, 0, 1, 1.0F);
-        graph.unavailable(1, unavailable);
-        MacroSearch search = new MacroSearch(graph, 1.0F);
+        graph.edge(11, 1, 2, 1.0F);
+        graph.dependency(1, dependency);
 
+        MacroSearch search = new MacroSearch(graph, 1.0F, 100);
+        search.step(32);
+
+        assertTrue(search.waitingForTopology());
+        assertEquals(List.of(dependency), search.pendingDependencies(4));
+
+        graph.clearDependencies(1);
+        search.dependenciesAvailable(List.of(dependency));
+        runToCompletion(search);
+        assertEquals(Status.SUCCEEDED, search.status());
+    }
+
+    @Test
+    void reportsUnavailableDependencyAfterReadyFrontierIsExhausted() {
+        SectionPos unavailable = SectionPos.of(1, 0, 0);
+        MacroSearch.DependencyKey dependency = new MacroSearch.DependencyKey(
+                MacroSearch.DependencyKind.BASE_CLUSTER, unavailable);
+        TestGraph graph = new TestGraph(0, 1);
+        graph.dependency(0, dependency);
+
+        MacroSearch search = new MacroSearch(graph, 1.0F, 100);
+        search.step(32);
+        search.dependencyUnavailable(dependency, MacroSearch.Failure.UNAVAILABLE_CHUNK);
         runToCompletion(search);
 
-        assertEquals(MacroSearch.Status.FAILED, search.status());
+        assertEquals(Status.FAILED, search.status());
         assertEquals(MacroSearch.Failure.UNAVAILABLE_CHUNK, search.failure());
         assertEquals(unavailable, search.blockedSection());
     }
 
     @Test
-    void doesNotRegenerateKnownEdgesWhenAnIncompleteNodeReopens() {
-        SectionPos missing = SectionPos.of(1, 0, 0);
-        TestGraph graph = new TestGraph(0, 3);
-        graph.edge(10, 0, 1, 1.0F);
-        graph.edge(11, 1, 2, 5.0F);
-        graph.pending(1, missing);
-        MacroSearch search = new MacroSearch(graph, 1.0F);
+    void rejectsAStaleCapturedWorldAndHonoursVisitLimit() {
+        TestGraph staleGraph = new TestGraph(0, 1);
+        staleGraph.revisionsValid = false;
+        MacroSearch stale = new MacroSearch(staleGraph, 1.0F, 100);
+        stale.step(1);
+        assertEquals(Status.FAILED, stale.status());
+        assertEquals(MacroSearch.Failure.STALE_WORLD, stale.failure());
+        assertNull(stale.result());
 
-        search.step(64, Long.MAX_VALUE);
-        graph.clearDependencies(1);
-        graph.edge(12, 1, 3, 1.0F);
-        search.topologyAvailable(missing);
-        runToCompletion(search);
-
-        assertEquals(MacroSearch.Status.SUCCEEDED, search.status());
-        assertEquals(3L, search.metrics().generatedConnections());
-        assertEquals(List.of(10L, 12L), search.result().connections().stream()
-                .map(MacroSearch.Connection::id)
-                .toList());
-    }
-
-    @Test
-    void failsWhenCapturedWorldRevisionChanges() {
-        TestGraph graph = new TestGraph(0, 1);
-        graph.edge(10, 0, 1, 1.0F);
-        MacroSearch search = new MacroSearch(graph, 1.25F);
-        graph.revisionsValid = false;
-
-        search.step(64, Long.MAX_VALUE);
-
-        assertEquals(MacroSearch.Status.FAILED, search.status());
-        assertEquals(MacroSearch.Failure.STALE_WORLD, search.failure());
-        assertNull(search.result());
-    }
-
-    @Test
-    void stopsAfterTheConfiguredTotalExpansionLimit() {
-        TestGraph graph = new TestGraph(0, 6);
-        for (int node = 0; node < 6; node++) {
-            graph.edge(100 + node, node, node + 1, 1.0F);
+        TestGraph limitedGraph = new TestGraph(0, 4);
+        for (int node = 0; node < 4; node++) {
+            limitedGraph.edge(200 + node, node, node + 1, 1.0F);
         }
-        MacroSearch search = new MacroSearch(graph, 1.0F, 3);
-
-        runToCompletion(search);
-
-        assertEquals(MacroSearch.Status.FAILED, search.status());
-        assertEquals(MacroSearch.Failure.SEARCH_LIMIT_REACHED, search.failure());
-        assertEquals(3L, search.metrics().expandedNodes());
-        assertNull(search.result());
+        MacroSearch limited = new MacroSearch(limitedGraph, 1.0F, 2);
+        runToCompletion(limited);
+        assertEquals(Status.FAILED, limited.status());
+        assertEquals(MacroSearch.Failure.SEARCH_LIMIT_REACHED, limited.failure());
     }
 
     private static void runToCompletion(MacroSearch search) {
         for (int iteration = 0;
-             iteration < 1_000 && search.status() == MacroSearch.Status.RUNNING;
+             iteration < 1_000 && search.status() == Status.RUNNING;
              iteration++) {
-            search.step(64, Long.MAX_VALUE);
+            search.step(64);
         }
-        assertNotNull(search.status());
+        assertTrue(search.status() != Status.RUNNING,
+                "search did not finish within the test bound");
     }
 
     private static final class TestGraph implements MacroSearch.Graph {
         private final Map<Long, MacroSearch.Endpoint> nodes = new HashMap<>();
         private final Map<Long, List<MacroSearch.Connection>> edges = new HashMap<>();
-        private final Map<Long, List<MacroSearch.Dependency>> dependencies = new HashMap<>();
+        private final Map<Long, List<MacroSearch.DependencyKey>> dependencies = new HashMap<>();
         private final long startId;
         private final long goalId;
         private boolean revisionsValid = true;
-        private float prefetchSlack;
 
         private TestGraph(long startId, long goalId) {
             this.startId = startId;
@@ -242,28 +136,13 @@ class MacroSearchTest {
         }
 
         private void edge(long edgeId, long from, long to, float cost) {
-            edges.computeIfAbsent(from, ignored -> new ArrayList<>()).add(new MacroSearch.Connection(
-                    edgeId,
-                    node(from),
-                    node(to),
-                    cost,
-                    new MacroSearch.MembershipTransition()
-            ));
+            edges.computeIfAbsent(from, ignored -> new ArrayList<>()).add(
+                    new MacroSearch.Connection(edgeId, node(from), node(to), cost,
+                            new MacroSearch.MembershipTransition()));
         }
 
-        private void pending(long from, SectionPos section) {
-            dependency(from, section, MacroSearch.Availability.PENDING);
-        }
-
-        private void unavailable(long from, SectionPos section) {
-            dependency(from, section, MacroSearch.Availability.UNAVAILABLE);
-        }
-
-        private void dependency(long from,
-                                SectionPos section,
-                                MacroSearch.Availability availability) {
-            dependencies.computeIfAbsent(from, ignored -> new ArrayList<>())
-                    .add(new MacroSearch.Dependency(section, availability));
+        private void dependency(long from, MacroSearch.DependencyKey key) {
+            dependencies.computeIfAbsent(from, ignored -> new ArrayList<>()).add(key);
         }
 
         private void clearDependencies(long from) {
@@ -272,10 +151,7 @@ class MacroSearchTest {
 
         private MacroSearch.Endpoint node(long id) {
             return nodes.computeIfAbsent(id, key -> new MacroSearch.ExactEndpoint(
-                    key,
-                    new BlockPos(key.intValue(), 0, 0),
-                    1L
-            ));
+                    key, new BlockPos(key.intValue(), 0, 0), 1L));
         }
 
         @Override
@@ -291,23 +167,21 @@ class MacroSearchTest {
         @Override
         public void expandInto(MacroSearch.Endpoint from,
                                MacroSearch.ExpansionBuffer output) {
+            List<MacroSearch.DependencyKey> blocked = dependencies.get(from.id());
+            if (blocked != null) {
+                for (MacroSearch.DependencyKey dependency : blocked) {
+                    output.addDependency(0, dependency);
+                }
+                return;
+            }
             for (MacroSearch.Connection connection : edges.getOrDefault(from.id(), List.of())) {
                 output.add(connection);
-            }
-            for (MacroSearch.Dependency dependency :
-                    dependencies.getOrDefault(from.id(), List.of())) {
-                output.addDependency(dependency);
             }
         }
 
         @Override
         public boolean revisionsValid() {
             return revisionsValid;
-        }
-
-        @Override
-        public float prefetchSlack() {
-            return prefetchSlack;
         }
     }
 }

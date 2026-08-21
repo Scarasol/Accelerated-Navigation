@@ -12,7 +12,7 @@ import java.util.List;
 import java.util.Objects;
 
 /** Immutable 2x2x2 SCC condensation. Published state contains stamps and primitive arrays only. */
-public final class SuperClusterTopology {
+final class SuperClusterTopology {
 
     public static final int CHILDREN_PER_AXIS = 2;
     private static final int CHILD_COUNT = 8;
@@ -829,11 +829,6 @@ public final class SuperClusterTopology {
             this.costs = costs;
             this.witnesses = witnesses;
             this.primitiveFaces = primitiveFaces;
-        }
-
-        private static CrossingIndex empty(int sourceCount) {
-            return new CrossingIndex(new int[sourceCount + 1], new int[0], new float[0],
-                    new long[0], new byte[0]);
         }
 
         private static CrossingIndex from(int sourceCount,

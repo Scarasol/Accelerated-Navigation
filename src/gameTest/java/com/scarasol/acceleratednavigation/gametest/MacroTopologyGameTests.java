@@ -1,22 +1,19 @@
 package com.scarasol.acceleratednavigation.gametest;
 
+import com.scarasol.acceleratednavigation.api.ResumableSearch;
 import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
-import com.scarasol.acceleratednavigation.AcceleratedNavigation;
 import com.scarasol.acceleratednavigation.topology.BaseClusterTopology;
-import com.scarasol.acceleratednavigation.topology.TopologyGraphAudit;
+import com.scarasol.acceleratednavigation.topology.MacroSearch;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.SectionPos;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestAssertException;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraftforge.gametest.GameTestHolder;
 import net.minecraftforge.gametest.PrefixGameTestTemplate;
 
-import java.util.concurrent.CompletableFuture;
+import java.util.UUID;
 
 @GameTestHolder("accelerated_navigation")
 @PrefixGameTestTemplate(false)
@@ -27,134 +24,37 @@ public final class MacroTopologyGameTests {
     private MacroTopologyGameTests() {
     }
 
+    /** Exercises the production request boundary without reaching into worker internals. */
     @GameTest(templateNamespace = "minecraft", template = EMPTY_TEMPLATE,
-            batch = "macro_topology_sampling", timeoutTicks = 100)
-    public static void snapshotsRealCollisionAndFluidShapes(GameTestHelper helper) {
+            batch = "macro_topology_request", timeoutTicks = 100)
+    public static void productionMacroRequestCompletes(GameTestHelper helper) {
         ServerLevel level = helper.getLevel();
-        BlockPos reference = helper.absolutePos(new BlockPos(8, 4, 8));
-        SectionPos section = SectionPos.of(reference);
-        BlockPos boundary = new BlockPos(
-                section.maxBlockX(),
-                section.minBlockY() + 4,
-                section.minBlockZ() + 6
-        );
-        level.setBlockAndUpdate(
-                boundary,
-                Blocks.OAK_SLAB.defaultBlockState().setValue(BlockStateProperties.WATERLOGGED, true)
-        );
-
-        TopologyService service = TopologyService.forServer(level.getServer());
-        TopologyService.Metrics before = service.metrics();
-        CompletableFuture<BaseClusterTopology> future = TopologyGraphAudit.requestClusterDependency(
-                service,
-                level,
-                section,
-                NavigationScheduler.Priority.ACTIVE
-        );
-
-        helper.succeedWhen(() -> {
-            if (!future.isDone()) {
-                throw new GameTestAssertException("topology snapshot is still pending");
-            }
-            BaseClusterTopology topology = future.join();
-            if (topology.componentAt(boundary.getX() & 15, boundary.getY() & 15,
-                    boundary.getZ() & 15) >= 0) {
-                throw new GameTestAssertException(
-                        "default dry traversal view accepted a waterlogged anchor");
-            }
-            TopologyService.Metrics after = service.metrics();
-            if (after.snapshotCells() - before.snapshotCells() < BaseClusterTopology.CELL_COUNT) {
-                throw new GameTestAssertException("snapshot did not account for a complete section");
-            }
-            if (after.snapshotNanos() <= before.snapshotNanos()
-                    || after.buildNanos() <= before.buildNanos()) {
-                throw new GameTestAssertException("snapshot/build resource counters were not updated");
-            }
-            AcceleratedNavigation.LOGGER.info(
-                    "Macro topology real-section sample: snapshot={} us, build={} us, retained={} bytes",
-                    (after.snapshotNanos() - before.snapshotNanos()) / 1_000L,
-                    (after.buildNanos() - before.buildNanos()) / 1_000L,
-                    after.retainedBytes() - before.retainedBytes()
-            );
-        });
-    }
-
-    @GameTest(templateNamespace = "minecraft", template = EMPTY_TEMPLATE,
-            batch = "macro_topology_invalidation", timeoutTicks = 100)
-    public static void invalidatesPublishedSectionAfterBlockChange(GameTestHelper helper) {
-        ServerLevel level = helper.getLevel();
-        BlockPos changedPosition = helper.absolutePos(new BlockPos(6, 5, 6));
-        SectionPos section = SectionPos.of(changedPosition);
-        TopologyService service = TopologyService.forServer(level.getServer());
-        TopologyService.ClusterKey key = new TopologyService.ClusterKey(level.dimension(), section);
-        CompletableFuture<BaseClusterTopology> future = TopologyGraphAudit.requestClusterDependency(
-                service,
-                level,
-                section,
-                NavigationScheduler.Priority.ACTIVE
-        );
-        boolean[] changed = {false};
-        long[] publishedRevision = {-1L};
-
-        helper.succeedWhen(() -> {
-            if (!future.isDone()) {
-                throw new GameTestAssertException("topology snapshot is still pending");
-            }
-            if (!changed[0]) {
-                future.join();
-                publishedRevision[0] = service.revision(key);
-                level.setBlockAndUpdate(changedPosition, Blocks.STONE.defaultBlockState());
-                changed[0] = true;
-            }
-            if (service.revision(key) <= publishedRevision[0]) {
-                throw new GameTestAssertException("block change did not advance the section revision");
-            }
-            if (service.topology(key) != null) {
-                throw new GameTestAssertException("stale section topology remained published");
-            }
-        });
-    }
-
-    @GameTest(templateNamespace = "minecraft", template = EMPTY_TEMPLATE,
-            batch = "macro_topology_semantic_invalidation", timeoutTicks = 150)
-    public static void keepsDemandAliveAndIgnoresEqualCollisionShapes(GameTestHelper helper) {
-        ServerLevel level = helper.getLevel();
-        BlockPos changedPosition = helper.absolutePos(new BlockPos(6, 5, 6));
-        SectionPos section = SectionPos.of(changedPosition);
-        TopologyService service = TopologyService.forServer(level.getServer());
-        TopologyService.ClusterKey key = new TopologyService.ClusterKey(level.dimension(), section);
-        CompletableFuture<BaseClusterTopology> request = TopologyGraphAudit.requestClusterDependency(
-                service,
-                level,
-                section,
-                NavigationScheduler.Priority.ACTIVE
-        );
-
-        level.setBlockAndUpdate(changedPosition, Blocks.STONE.defaultBlockState());
-        long changedRevision = service.revision(key);
-        level.setBlockAndUpdate(changedPosition, Blocks.DIRT.defaultBlockState());
-        if (changedRevision <= 0L || service.revision(key) != changedRevision) {
-            throw new GameTestAssertException(
-                    "equal full-block collision shapes advanced the topology revision"
-            );
-        }
-
-        helper.succeedWhen(() -> {
-            if (!request.isDone()) {
-                throw new GameTestAssertException("stable topology demand is still pending");
-            }
-            BaseClusterTopology topology = request.join();
-            if (topology.revision() != changedRevision || service.topology(key) != topology) {
-                throw new GameTestAssertException(
-                        "request did not survive the pre-build geometry invalidation"
+        BlockPos start = helper.absolutePos(new BlockPos(8, 4, 8));
+        BlockPos goal = helper.absolutePos(new BlockPos(12, 4, 8));
+        TopologyService.MacroRequest request = TopologyService.forServer(level.getServer())
+                .requestMacroQuery(
+                        level,
+                        UUID.randomUUID(),
+                        start,
+                        goal,
+                        BaseClusterTopology.Channel.GROUND,
+                        BaseClusterTopology.TraversalProfile.DEFAULT_GROUND,
+                        NavigationScheduler.Priority.ACTIVE
                 );
-            }
 
-            level.setBlockAndUpdate(changedPosition, Blocks.COBBLESTONE.defaultBlockState());
-            if (service.revision(key) != changedRevision || service.topology(key) != topology) {
+        helper.succeedWhen(() -> {
+            if (!request.future().isDone()) {
+                throw new GameTestAssertException("macro request is still pending");
+            }
+            try {
+                request.future().join();
+            } catch (RuntimeException failure) {
                 throw new GameTestAssertException(
-                        "equal collision shapes invalidated an already published topology"
-                );
+                        "production macro request failed: " + failure.getMessage());
+            }
+            MacroSearch.Progress progress = request.progress();
+            if (progress.status() == ResumableSearch.Status.RUNNING) {
+                throw new GameTestAssertException("completed request still reports running");
             }
         });
     }

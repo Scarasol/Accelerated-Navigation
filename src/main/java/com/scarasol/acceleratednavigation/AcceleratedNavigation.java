@@ -9,6 +9,7 @@ import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.level.ChunkEvent;
 import net.minecraftforge.event.level.LevelEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
+import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.common.Mod;
@@ -38,6 +39,7 @@ public final class AcceleratedNavigation {
         MinecraftForge.EVENT_BUS.addListener(this::onChunkLoad);
         MinecraftForge.EVENT_BUS.addListener(this::onChunkUnload);
         MinecraftForge.EVENT_BUS.addListener(this::onLevelSave);
+        MinecraftForge.EVENT_BUS.addListener(this::onServerStopping);
         MinecraftForge.EVENT_BUS.addListener(this::onServerStopped);
     }
 
@@ -62,6 +64,10 @@ public final class AcceleratedNavigation {
         }
     }
 
+    private void onServerStopping(ServerStoppingEvent event) {
+        TopologyService.beginStopping(event.getServer());
+    }
+
     private void onServerStopped(ServerStoppedEvent event) {
         TopologyService.shutdown(event.getServer());
         NavigationScheduler.shutdown(event.getServer());
@@ -69,13 +75,13 @@ public final class AcceleratedNavigation {
 
     private void onChunkUnload(ChunkEvent.Unload event) {
         if (event.getLevel() instanceof net.minecraft.server.level.ServerLevel level) {
-            TopologyService.onChunkUnloaded(level, event.getChunk().getPos());
+            TopologyService.onChunkUnloaded(level, event.getChunk());
         }
     }
 
     private void onChunkLoad(ChunkEvent.Load event) {
         if (event.getLevel() instanceof net.minecraft.server.level.ServerLevel level) {
-            TopologyService.onChunkLoaded(level, event.getChunk().getPos());
+            TopologyService.onChunkLoaded(level, event.getChunk());
         }
     }
 
@@ -85,5 +91,3 @@ public final class AcceleratedNavigation {
         }
     }
 }
-
-

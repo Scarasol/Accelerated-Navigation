@@ -1,8 +1,7 @@
 package com.scarasol.acceleratednavigation.topology;
 
-import com.scarasol.acceleratednavigation.api.ResumableSearch;
+import com.scarasol.acceleratednavigation.api.ResumableSearch.Status;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
@@ -21,7 +20,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /** Resumable Weighted A* over an already-built structural component graph. */
-public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> {
+public final class MacroSearch {
 
     public static final float DEFAULT_WEIGHT = 1.25F;
 
@@ -32,8 +31,6 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
     private final Long2ObjectOpenHashMap<SearchNode> nodes = new Long2ObjectOpenHashMap<>();
     private final Set<SearchNode> blockedNodes = new HashSet<>();
     private final Map<DependencyKey, Set<SearchNode>> waitingByDependency = new HashMap<>();
-    private final Set<DependencyKey> encounteredPendingDependencies = new HashSet<>();
-    private final Set<DependencyKey> encounteredUnavailableDependencies = new HashSet<>();
     private final ExpansionBuffer expansionBuffer = new ExpansionBuffer();
 
     private Status status = Status.RUNNING;
@@ -42,16 +39,13 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
     private Corridor result;
     private boolean initialized;
     private boolean waitingForTopology;
+    private long expansionWorkUnits;
     private long expandedNodes;
     private long generatedConnections;
     private long reopenedNodes;
     private long reexpandedBlockedNodes;
     private int maximumDegree;
     private int maximumBlockedNodes;
-
-    public MacroSearch(Graph graph, float weight) {
-        this(graph, weight, Integer.MAX_VALUE);
-    }
 
     public MacroSearch(Graph graph,
                        float weight,
@@ -67,8 +61,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         this.maxVisitedNodes = maxVisitedNodes;
     }
 
-    @Override
-    public Status step(int expansionBudget, long deadlineNanos) {
+    public Status step(int expansionBudget) {
         if (status != Status.RUNNING) {
             return status;
         }
@@ -84,31 +77,39 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
 
         waitingForTopology = false;
         int expandedThisStep = 0;
-        while (expandedThisStep < expansionBudget && System.nanoTime() < deadlineNanos) {
-            if (expandedNodes >= maxVisitedNodes) {
-                return fail(Failure.SEARCH_LIMIT_REACHED);
-            }
+        while (expandedThisStep < expansionBudget) {
             if (shouldWaitForTopology()) {
                 waitingForTopology = true;
-                blockedSection = bestBlockedSection(Availability.PENDING);
+                blockedSection = bestPendingSection();
                 return status;
             }
             if (openSet.isEmpty()) {
-                if (hasBlockedAvailability(Availability.PENDING)) {
+                if (hasPendingDependencies()) {
                     waitingForTopology = true;
-                    blockedSection = bestBlockedSection(Availability.PENDING);
+                    blockedSection = bestPendingSection();
                     return status;
                 }
-                return fail(hasBlockedAvailability(Availability.UNAVAILABLE)
-                        ? Failure.UNAVAILABLE_CHUNK
+                float recovery = bestBlockedKey(Failure.FACTS_RECOVERY_FAILED);
+                float unavailable = bestBlockedKey(Failure.UNAVAILABLE_CHUNK);
+                return fail(Float.isFinite(recovery)
+                        ? recovery <= unavailable ? Failure.FACTS_RECOVERY_FAILED
+                        : Failure.UNAVAILABLE_CHUNK
+                        : Float.isFinite(unavailable) ? Failure.UNAVAILABLE_CHUNK
                         : Failure.NO_STRUCTURAL_ROUTE);
             }
             SearchNode current = popOpenNode();
             if (current.closed) {
                 continue;
             }
+            if (!current.expansionStarted && expandedNodes >= maxVisitedNodes) {
+                return fail(Failure.SEARCH_LIMIT_REACHED);
+            }
             expandedThisStep++;
-            expandedNodes++;
+            expansionWorkUnits++;
+            if (!current.expansionStarted) {
+                current.expansionStarted = true;
+                expandedNodes++;
+            }
 
             if (current.endpoint.id() == graph.goal().id()) {
                 result = trace(current);
@@ -125,12 +126,10 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         return (SearchNode) openSet.pop();
     }
 
-    @Override
     public Status status() {
         return status;
     }
 
-    @Override
     @Nullable
     public Corridor result() {
         return result;
@@ -147,14 +146,13 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
 
     public Metrics metrics() {
         return new Metrics(
+                expansionWorkUnits,
                 expandedNodes,
                 generatedConnections,
                 reopenedNodes,
                 reexpandedBlockedNodes,
                 maximumDegree,
-                maximumBlockedNodes,
-                encounteredPendingDependencies.size(),
-                encounteredUnavailableDependencies.size()
+                maximumBlockedNodes
         );
     }
 
@@ -162,14 +160,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         return status == Status.RUNNING && waitingForTopology;
     }
 
-    public List<SectionPos> pendingSections(int limit) {
-        return pendingDependencies(limit).stream()
-                .map(dependency -> dependency.key().position())
-                .distinct()
-                .toList();
-    }
-
-    public List<Dependency> pendingDependencies(int limit) {
+    public List<DependencyKey> pendingDependencies(int limit) {
         if (limit <= 0) {
             throw new IllegalArgumentException("limit must be positive");
         }
@@ -188,19 +179,8 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
                         .thenComparingInt(entry -> entry.getKey().position().y())
                         .thenComparingInt(entry -> entry.getKey().position().z()))
                 .limit(limit)
-                .map(entry -> new Dependency(entry.getKey(), Availability.PENDING))
+                .map(Map.Entry::getKey)
                 .toList();
-    }
-
-    public void topologyAvailable(SectionPos section) {
-        Objects.requireNonNull(section, "section");
-        dependenciesAvailable(waitingByDependency.keySet().stream()
-                .filter(key -> key.position().equals(section))
-                .toList());
-    }
-
-    public void dependencyAvailable(DependencyKey dependency) {
-        dependenciesAvailable(List.of(Objects.requireNonNull(dependency, "dependency")));
     }
 
     /**
@@ -208,22 +188,23 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
      * The node may still have another pending dependency; once those are resolved,
      * the unavailable edge remains excluded and the ready frontier can continue.
      */
-    void dependencyUnavailable(DependencyKey dependency) {
+    void dependencyUnavailable(DependencyKey dependency, Failure reason) {
         Objects.requireNonNull(dependency, "dependency");
         Set<SearchNode> affected = waitingByDependency.remove(dependency);
         if (affected == null || affected.isEmpty()) {
             return;
         }
         for (SearchNode node : affected) {
-            if (!blockedNodes.contains(node) || !node.pendingDependencies.contains(dependency)) {
+            if (!blockedNodes.contains(node) || node.pendingParts == null) {
                 continue;
             }
-            Set<DependencyKey> pending = new HashSet<>(node.pendingDependencies);
-            pending.remove(dependency);
-            Set<DependencyKey> unavailable = new HashSet<>(node.unavailableDependencies);
-            unavailable.add(dependency);
-            node.pendingDependencies = Set.copyOf(pending);
-            node.unavailableDependencies = Set.copyOf(unavailable);
+            Long parts = node.pendingParts.remove(dependency);
+            if (parts == null) continue;
+            if (node.pendingParts.isEmpty()) node.pendingParts = null;
+            node.completedExpansionParts |= parts;
+            if (node.unavailableDependencies == null) node.unavailableDependencies = new HashMap<>();
+            node.unavailableDependencies.put(dependency, reason);
+            if (node.pendingParts == null) node.closed = true;
         }
         waitingForTopology = false;
         blockedSection = null;
@@ -233,11 +214,17 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         Objects.requireNonNull(dependencies, "dependencies");
         Set<SearchNode> affectedNodes = new HashSet<>();
         for (DependencyKey dependency : dependencies) {
-            Set<SearchNode> affected = waitingByDependency.get(
+            Set<SearchNode> affected = waitingByDependency.remove(
                     Objects.requireNonNull(dependency, "dependency")
             );
             if (affected != null) {
-                affectedNodes.addAll(affected);
+                for (SearchNode node : affected) {
+                    if (node.pendingParts != null) {
+                        node.pendingParts.remove(dependency);
+                        if (node.pendingParts.isEmpty()) node.pendingParts = null;
+                    }
+                    affectedNodes.add(node);
+                }
             }
         }
         boolean reopened = false;
@@ -245,7 +232,6 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             if (!blockedNodes.contains(node)) {
                 continue;
             }
-            unregisterBlocked(node, false);
             node.closed = false;
             if (!node.inOpenSet()) {
                 openSet.insert(node);
@@ -259,13 +245,6 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         }
     }
 
-    @Override
-    public void cancel() {
-        if (status == Status.RUNNING) {
-            fail(Failure.CANCELLED);
-        }
-    }
-
     private void initialize() {
         SearchNode start = node(graph.start());
         start.g = 0.0F;
@@ -276,7 +255,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
     }
 
     private boolean shouldWaitForTopology() {
-        float blockedKey = bestBlockedKey(Availability.PENDING);
+        float blockedKey = bestPendingKey();
         if (!Float.isFinite(blockedKey)) {
             return false;
         }
@@ -288,19 +267,13 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
     }
 
     private void expand(SearchNode current) {
-        expansionBuffer.reset(current.endpoint);
+        expansionBuffer.reset(current.endpoint, current.completedExpansionParts,
+                current.pendingPartMask());
         graph.expandInto(current.endpoint, expansionBuffer);
-        boolean incomplete = expansionBuffer.dependencyCount() != 0;
-        if (incomplete && current.emittedConnectionIds == null) {
-            current.emittedConnectionIds = new LongOpenHashSet();
-        }
+        current.completedExpansionParts = expansionBuffer.completedParts();
         int generatedThisExpansion = 0;
         for (int index = 0; index < expansionBuffer.connectionCount(); index++) {
             long connectionId = expansionBuffer.connectionId(index);
-            if (current.emittedConnectionIds != null
-                    && !current.emittedConnectionIds.add(connectionId)) {
-                continue;
-            }
             generatedConnections++;
             generatedThisExpansion++;
             float lowerBound = expansionBuffer.lowerBound(index);
@@ -323,6 +296,9 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             boolean wasBlocked = blockedNodes.contains(next);
             if (wasBlocked) {
                 unregisterBlocked(next, true);
+            } else if (wasClosed) {
+                next.completedExpansionParts = 0L;
+                next.expansionStarted = false;
             }
             if (next.inOpenSet()) {
                 openSet.changeCost(next, next.f);
@@ -335,69 +311,66 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             }
         }
         maximumDegree = Math.max(maximumDegree, generatedThisExpansion);
-        if (incomplete) {
-            registerBlocked(current, expansionBuffer.dependencies());
+        if (expansionBuffer.dependencyCount() != 0
+                || current.pendingParts != null) {
+            registerBlocked(current, expansionBuffer);
         } else {
             current.closed = true;
-            current.emittedConnectionIds = null;
+            if (current.unavailableDependencies == null) blockedNodes.remove(current);
         }
     }
 
-    private void registerBlocked(SearchNode node, List<Dependency> dependencies) {
-        unregisterBlocked(node, false);
-        Set<DependencyKey> pendingDependencies = new HashSet<>();
-        Set<DependencyKey> unavailableDependencies = new HashSet<>();
-        for (Dependency dependency : dependencies) {
-            if (dependency.availability() == Availability.PENDING) {
-                pendingDependencies.add(dependency.key());
-                encounteredPendingDependencies.add(dependency.key());
-            } else {
-                unavailableDependencies.add(dependency.key());
-                encounteredUnavailableDependencies.add(dependency.key());
-            }
+    private void registerBlocked(SearchNode node, ExpansionBuffer expansion) {
+        for (int index = 0; index < expansion.dependencyCount(); index++) {
+            DependencyKey dependency = expansion.dependency(index);
+            if (node.pendingParts == null) node.pendingParts = new HashMap<>();
+            node.pendingParts.merge(dependency, expansion.dependencyParts(index),
+                    (left, right) -> left | right);
+            waitingByDependency.computeIfAbsent(dependency, ignored -> new HashSet<>())
+                    .add(node);
         }
-        node.pendingDependencies = Set.copyOf(pendingDependencies);
-        node.unavailableDependencies = Set.copyOf(unavailableDependencies);
-        node.closed = false;
+        node.closed = node.pendingParts == null;
         blockedNodes.add(node);
-        for (DependencyKey dependency : pendingDependencies) {
-            waitingByDependency.computeIfAbsent(dependency, ignored -> new HashSet<>()).add(node);
-        }
         maximumBlockedNodes = Math.max(maximumBlockedNodes, blockedNodes.size());
     }
 
-    private void unregisterBlocked(SearchNode node, boolean clearEmittedConnections) {
+    private void unregisterBlocked(SearchNode node, boolean resetExpansion) {
         if (!blockedNodes.remove(node)) {
             return;
         }
-        for (DependencyKey dependency : node.pendingDependencies) {
-            Set<SearchNode> waiting = waitingByDependency.get(dependency);
-            if (waiting == null) {
-                continue;
-            }
-            waiting.remove(node);
-            if (waiting.isEmpty()) {
-                waitingByDependency.remove(dependency);
+        if (node.pendingParts != null) {
+            for (DependencyKey dependency : node.pendingParts.keySet()) {
+                Set<SearchNode> waiting = waitingByDependency.get(dependency);
+                if (waiting == null) continue;
+                waiting.remove(node);
+                if (waiting.isEmpty()) waitingByDependency.remove(dependency);
             }
         }
-        node.pendingDependencies = Set.of();
-        node.unavailableDependencies = Set.of();
-        if (clearEmittedConnections) {
-            node.emittedConnectionIds = null;
+        node.pendingParts = null;
+        node.unavailableDependencies = null;
+        if (resetExpansion) {
+            node.completedExpansionParts = 0L;
+            node.expansionStarted = false;
         }
     }
 
-    private boolean hasBlockedAvailability(Availability availability) {
-        return Float.isFinite(bestBlockedKey(availability));
+    private boolean hasPendingDependencies() {
+        return Float.isFinite(bestPendingKey());
     }
 
-    private float bestBlockedKey(Availability availability) {
+    private float bestPendingKey() {
         float best = Float.POSITIVE_INFINITY;
         for (SearchNode node : blockedNodes) {
-            Set<DependencyKey> dependencies = availability == Availability.PENDING
-                    ? node.pendingDependencies
-                    : node.unavailableDependencies;
-            if (!dependencies.isEmpty()) {
+            if (node.pendingParts != null) best = Math.min(best, node.f);
+        }
+        return best;
+    }
+
+    private float bestBlockedKey(Failure reason) {
+        float best = Float.POSITIVE_INFINITY;
+        for (SearchNode node : blockedNodes) {
+            if (node.unavailableDependencies != null
+                    && node.unavailableDependencies.containsValue(reason)) {
                 best = Math.min(best, node.f);
             }
         }
@@ -405,23 +378,17 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
     }
 
     @Nullable
-    private SectionPos bestBlockedSection(Availability availability) {
+    private SectionPos bestPendingSection() {
         SearchNode bestNode = null;
         for (SearchNode node : blockedNodes) {
-            Set<DependencyKey> dependencies = availability == Availability.PENDING
-                    ? node.pendingDependencies
-                    : node.unavailableDependencies;
-            if (!dependencies.isEmpty() && (bestNode == null || node.f < bestNode.f)) {
+            if (node.pendingParts != null && (bestNode == null || node.f < bestNode.f)) {
                 bestNode = node;
             }
         }
         if (bestNode == null) {
             return null;
         }
-        Set<DependencyKey> dependencies = availability == Availability.PENDING
-                ? bestNode.pendingDependencies
-                : bestNode.unavailableDependencies;
-        return dependencies.stream()
+        return bestNode.pendingParts.keySet().stream()
                 .map(DependencyKey::position)
                 .min(Comparator.comparingInt((SectionPos section) -> section.x())
                         .thenComparingInt(section -> section.y())
@@ -524,11 +491,28 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
     private Status fail(Failure reason) {
         status = Status.FAILED;
         failure = Objects.requireNonNull(reason, "reason");
-        blockedSection = reason == Failure.UNAVAILABLE_CHUNK
-                ? bestBlockedSection(Availability.UNAVAILABLE)
-                : blockedSection;
+        if (reason == Failure.UNAVAILABLE_CHUNK || reason == Failure.FACTS_RECOVERY_FAILED) {
+            blockedSection = bestFailureSection(reason);
+        }
         result = null;
         return status;
+    }
+
+    @Nullable
+    private SectionPos bestFailureSection(Failure reason) {
+        SearchNode bestNode = null;
+        for (SearchNode node : blockedNodes) {
+            if (node.unavailableDependencies != null
+                    && node.unavailableDependencies.containsValue(reason)
+                    && (bestNode == null || node.f < bestNode.f)) bestNode = node;
+        }
+        if (bestNode == null) return null;
+        return bestNode.unavailableDependencies.entrySet().stream()
+                .filter(entry -> entry.getValue() == reason)
+                .map(entry -> entry.getKey().position())
+                .min(Comparator.comparingInt((SectionPos section) -> section.x())
+                        .thenComparingInt(SectionPos::y).thenComparingInt(SectionPos::z))
+                .orElse(null);
     }
 
     public interface Graph {
@@ -571,11 +555,16 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         private int[] payloadIndexes = new int[16];
         private long[] primitivePayloads = new long[16];
         private int connectionCount;
-        private Dependency[] dependencies = new Dependency[4];
+        private DependencyKey[] dependencies = new DependencyKey[4];
+        private long[] dependencyParts = new long[4];
         private int dependencyCount;
+        private long completedParts;
+        private long skippedParts;
 
-        void reset(Endpoint source) {
+        void reset(Endpoint source, long completedParts, long pendingParts) {
             this.source = Objects.requireNonNull(source, "source");
+            this.completedParts = completedParts;
+            this.skippedParts = completedParts | pendingParts;
             for (int index = 0; index < connectionCount; index++) {
                 targets[index] = null;
                 payloads[index] = null;
@@ -602,11 +591,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
 
         public void addLocal(long id,
                              Endpoint target,
-                             float lowerBound,
-                             long capabilityMask) {
-            if (capabilityMask == 0L) {
-                throw new IllegalArgumentException("local transition needs a capability mask");
-            }
+                             float lowerBound) {
             add(id, target, lowerBound, LOCAL, null, 0, 0L);
         }
 
@@ -624,10 +609,22 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             add(id, target, lowerBound, AGGREGATE, null, 0, 0L);
         }
 
-        public void addDependency(Dependency dependency) {
+        // Part 0 is node-local work; parts 1..14 map directly to boundary slots 0..13.
+        public boolean needsPart(int part) {
+            return (skippedParts & partMask(part)) == 0L;
+        }
+
+        public void completePart(int part) {
+            long mask = partMask(part);
+            completedParts |= mask;
+            skippedParts |= mask;
+        }
+
+        public void addDependency(int part, DependencyKey dependency) {
             Objects.requireNonNull(dependency, "dependency");
             ensureDependencyCapacity(dependencyCount + 1);
-            dependencies[dependencyCount++] = dependency;
+            dependencies[dependencyCount] = dependency;
+            dependencyParts[dependencyCount++] = partMask(part);
         }
 
         private void add(long id,
@@ -688,15 +685,21 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
             return dependencyCount;
         }
 
-        private List<Dependency> dependencies() {
-            if (dependencyCount == 0) {
-                return List.of();
-            }
-            List<Dependency> result = new ArrayList<>(dependencyCount);
-            for (int index = 0; index < dependencyCount; index++) {
-                result.add(dependencies[index]);
-            }
-            return result;
+        private DependencyKey dependency(int index) {
+            return dependencies[index];
+        }
+
+        private long dependencyParts(int index) {
+            return dependencyParts[index];
+        }
+
+        private long completedParts() {
+            return completedParts;
+        }
+
+        private static long partMask(int part) {
+            if (part < 0 || part >= Long.SIZE) throw new IllegalArgumentException("expansion part");
+            return 1L << part;
         }
 
         private void ensureConnectionCapacity(int required) {
@@ -715,48 +718,11 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
 
         private void ensureDependencyCapacity(int required) {
             if (required > dependencies.length) {
-                dependencies = java.util.Arrays.copyOf(
-                        dependencies,
-                        Math.max(required, dependencies.length << 1)
-                );
+                int capacity = Math.max(required, dependencies.length << 1);
+                dependencies = java.util.Arrays.copyOf(dependencies, capacity);
+                dependencyParts = java.util.Arrays.copyOf(dependencyParts, capacity);
             }
         }
-    }
-
-    public record Dependency(DependencyKey key, Availability availability) {
-        public Dependency {
-            Objects.requireNonNull(key, "key");
-            Objects.requireNonNull(availability, "availability");
-        }
-
-        public Dependency(SectionPos section, Availability availability) {
-            this(new DependencyKey(DependencyKind.BASE_CLUSTER, section), availability);
-        }
-
-        public static Dependency superCluster(SectionPos origin, Availability availability) {
-            return new Dependency(new DependencyKey(DependencyKind.SUPER_CLUSTER, origin), availability);
-        }
-
-        public static Dependency baseBoundary(SectionPos source,
-                                              SectionPos target,
-                                              Direction face,
-                                              Availability availability) {
-            return new Dependency(
-                    new DependencyKey(DependencyKind.BASE_BOUNDARY, source, target, face),
-                    availability
-            );
-        }
-
-        public static Dependency superBoundary(SectionPos source,
-                                               SectionPos target,
-                                               Direction face,
-                                               Availability availability) {
-            return new Dependency(
-                    new DependencyKey(DependencyKind.SUPER_BOUNDARY, source, target, face),
-                    availability
-            );
-        }
-
     }
 
     public record DependencyKey(DependencyKind kind,
@@ -793,6 +759,22 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         public DependencyKey(DependencyKind kind, SectionPos position) {
             this(kind, position, null, null);
         }
+
+        public static DependencyKey superCluster(SectionPos origin) {
+            return new DependencyKey(DependencyKind.SUPER_CLUSTER, origin);
+        }
+
+        public static DependencyKey baseBoundary(SectionPos source,
+                                                 SectionPos target,
+                                                 Direction face) {
+            return new DependencyKey(DependencyKind.BASE_BOUNDARY, source, target, face);
+        }
+
+        public static DependencyKey superBoundary(SectionPos source,
+                                                  SectionPos target,
+                                                  Direction face) {
+            return new DependencyKey(DependencyKind.SUPER_BOUNDARY, source, target, face);
+        }
     }
 
     public enum DependencyKind {
@@ -800,11 +782,6 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         SUPER_CLUSTER,
         BASE_BOUNDARY,
         SUPER_BOUNDARY
-    }
-
-    public enum Availability {
-        PENDING,
-        UNAVAILABLE
     }
 
     public sealed interface Endpoint permits ExactEndpoint, ComponentEndpoint, AggregateEndpoint {
@@ -895,7 +872,6 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         }
 
         public Direction face() { return face; }
-        public int bandCount() { return verticalShifts.length; }
         public int verticalShift(int band) { return verticalShifts[band]; }
         public long maskWord(int band, int word) {
             if (word < 0 || word >= 4) throw new IndexOutOfBoundsException("boundary mask word");
@@ -923,28 +899,54 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         }
     }
 
-    public record Metrics(long expandedNodes,
+    public record Metrics(long expansionWorkUnits,
+                          long expandedNodes,
                           long generatedConnections,
                           long reopenedNodes,
                           long reexpandedBlockedNodes,
                           int maximumDegree,
-                          int maximumBlockedNodes,
-                          int pendingSections,
-                          int unavailableSections) {
+                          int maximumBlockedNodes) {
+        public static final Metrics EMPTY = new Metrics(0L, 0L, 0L, 0L, 0L, 0, 0);
+
         public Metrics plus(@Nullable Metrics other) {
             if (other == null) {
                 return this;
             }
             return new Metrics(
+                    expansionWorkUnits + other.expansionWorkUnits,
                     expandedNodes + other.expandedNodes,
                     generatedConnections + other.generatedConnections,
                     reopenedNodes + other.reopenedNodes,
                     reexpandedBlockedNodes + other.reexpandedBlockedNodes,
                     Math.max(maximumDegree, other.maximumDegree),
-                    Math.max(maximumBlockedNodes, other.maximumBlockedNodes),
-                    pendingSections + other.pendingSections,
-                    unavailableSections + other.unavailableSections
+                    Math.max(maximumBlockedNodes, other.maximumBlockedNodes)
             );
+        }
+    }
+
+    public record Progress(Status status, Failure failure, Metrics metrics,
+                           long workerTasks, long dependencyWaits, int pendingDependencies,
+                           boolean hierarchical, int witnessSegments,
+                           long queueNanos, long wallNanos,
+                           @Nullable SectionPos blockedSection) {
+        public static final Progress PENDING = new Progress(Status.RUNNING, Failure.NONE,
+                Metrics.EMPTY, 0L, 0L, 0, false, 0, 0L, 0L, null);
+
+        public Progress after(Progress previous) {
+            return new Progress(status, failure, previous.metrics.plus(metrics),
+                    previous.workerTasks + workerTasks,
+                    previous.dependencyWaits + dependencyWaits, pendingDependencies,
+                    previous.hierarchical || hierarchical,
+                    previous.witnessSegments + witnessSegments,
+                    previous.queueNanos + queueNanos,
+                    previous.wallNanos + wallNanos, blockedSection);
+        }
+
+        public Progress withOutcome(Status outcome, Failure reason,
+                                    @Nullable SectionPos blocked) {
+            return new Progress(outcome, reason, metrics, workerTasks, dependencyWaits,
+                    pendingDependencies, hierarchical, witnessSegments,
+                    queueNanos, wallNanos, blocked);
         }
     }
 
@@ -953,6 +955,7 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         NO_STRUCTURAL_ROUTE,
         SEARCH_LIMIT_REACHED,
         UNAVAILABLE_CHUNK,
+        FACTS_RECOVERY_FAILED,
         STALE_WORLD,
         CANCELLED
     }
@@ -966,15 +969,22 @@ public final class MacroSearch implements ResumableSearch<MacroSearch.Corridor> 
         private Object viaPayload;
         private int viaPayloadIndex;
         private long viaPrimitivePayload;
-        private LongOpenHashSet emittedConnectionIds;
-        private Set<DependencyKey> pendingDependencies = Set.of();
-        private Set<DependencyKey> unavailableDependencies = Set.of();
+        private boolean expansionStarted;
+        private long completedExpansionParts;
+        private Map<DependencyKey, Long> pendingParts;
+        private Map<DependencyKey, Failure> unavailableDependencies;
 
         private SearchNode(Endpoint endpoint) {
             super((int) endpoint.id(), (int) (endpoint.id() >>> 32), 0);
             this.endpoint = endpoint;
             this.g = Float.POSITIVE_INFINITY;
         }
+
+        private long pendingPartMask() {
+            if (pendingParts == null) return 0L;
+            long mask = 0L;
+            for (long parts : pendingParts.values()) mask |= parts;
+            return mask;
+        }
     }
 }
-
