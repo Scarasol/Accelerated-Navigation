@@ -89,13 +89,10 @@ public final class MacroSearch {
                     blockedSection = bestPendingSection();
                     return status;
                 }
-                float recovery = bestBlockedKey(Failure.FACTS_RECOVERY_FAILED);
-                float unavailable = bestBlockedKey(Failure.UNAVAILABLE_CHUNK);
-                return fail(Float.isFinite(recovery)
-                        ? recovery <= unavailable ? Failure.FACTS_RECOVERY_FAILED
-                        : Failure.UNAVAILABLE_CHUNK
-                        : Float.isFinite(unavailable) ? Failure.UNAVAILABLE_CHUNK
-                        : Failure.NO_STRUCTURAL_ROUTE);
+                BlockedFailure blocked = bestBlockedFailure();
+                if (blocked == null) return fail(Failure.NO_STRUCTURAL_ROUTE);
+                blockedSection = blocked.unavailability.section();
+                return fail(blocked.unavailability.reason());
             }
             SearchNode current = popOpenNode();
             if (current.closed) {
@@ -188,7 +185,7 @@ public final class MacroSearch {
      * The node may still have another pending dependency; once those are resolved,
      * the unavailable edge remains excluded and the ready frontier can continue.
      */
-    void dependencyUnavailable(DependencyKey dependency, Failure reason) {
+    void dependencyUnavailable(DependencyKey dependency, Unavailability reason) {
         Objects.requireNonNull(dependency, "dependency");
         Set<SearchNode> affected = waitingByDependency.remove(dependency);
         if (affected == null || affected.isEmpty()) {
@@ -204,7 +201,7 @@ public final class MacroSearch {
             node.completedExpansionParts |= parts;
             if (node.unavailableDependencies == null) node.unavailableDependencies = new HashMap<>();
             node.unavailableDependencies.put(dependency, reason);
-            if (node.pendingParts == null) node.closed = true;
+            if (node.pendingParts == null && !node.inOpenSet()) node.closed = true;
         }
         waitingForTopology = false;
         blockedSection = null;
@@ -366,12 +363,13 @@ public final class MacroSearch {
         return best;
     }
 
-    private float bestBlockedKey(Failure reason) {
-        float best = Float.POSITIVE_INFINITY;
+    private BlockedFailure bestBlockedFailure() {
+        BlockedFailure best = null;
         for (SearchNode node : blockedNodes) {
-            if (node.unavailableDependencies != null
-                    && node.unavailableDependencies.containsValue(reason)) {
-                best = Math.min(best, node.f);
+            if (node.unavailableDependencies == null) continue;
+            for (Unavailability unavailable : node.unavailableDependencies.values()) {
+                BlockedFailure candidate = new BlockedFailure(node.f, unavailable, node.endpoint);
+                if (best == null || BlockedFailure.ORDER.compare(candidate, best) < 0) best = candidate;
             }
         }
         return best;
@@ -474,45 +472,77 @@ public final class MacroSearch {
         for (int band = links.bandStart(edgeIndex); band < links.bandEnd(edgeIndex); band++) {
             if ((links.capabilityMask(band) & movementMask) != 0L) count++;
         }
-        byte[] shifts = new byte[count];
+        short[] descriptors = new short[count];
         long[] masks = new long[count * 4];
         int selected = 0;
         for (int band = links.bandStart(edgeIndex); band < links.bandEnd(edgeIndex); band++) {
             if ((links.capabilityMask(band) & movementMask) == 0L) continue;
-            shifts[selected] = (byte) links.verticalShift(band);
+            descriptors[selected] = links.descriptor(band);
             for (int word = 0; word < 4; word++) {
                 masks[selected * 4 + word] = links.maskWord(band, word);
             }
             selected++;
         }
-        return new BoundaryTransition(links.face(), shifts, masks);
+        return new BoundaryTransition(links.face(), descriptors, masks);
     }
 
     private Status fail(Failure reason) {
         status = Status.FAILED;
         failure = Objects.requireNonNull(reason, "reason");
-        if (reason == Failure.UNAVAILABLE_CHUNK || reason == Failure.FACTS_RECOVERY_FAILED) {
-            blockedSection = bestFailureSection(reason);
-        }
         result = null;
         return status;
     }
 
-    @Nullable
-    private SectionPos bestFailureSection(Failure reason) {
-        SearchNode bestNode = null;
-        for (SearchNode node : blockedNodes) {
-            if (node.unavailableDependencies != null
-                    && node.unavailableDependencies.containsValue(reason)
-                    && (bestNode == null || node.f < bestNode.f)) bestNode = node;
+    static int failureRank(Failure failure) {
+        return switch (failure) {
+            case FACTS_RECOVERY_FAILED -> 0;
+            case FACTS_PERSISTENCE_UNAVAILABLE -> 1;
+            case UNAVAILABLE_CHUNK -> 2;
+            default -> throw new IllegalArgumentException("not a facts availability failure");
+        };
+    }
+
+    record Unavailability(Failure reason, SectionPos section) {
+        Unavailability {
+            failureRank(reason);
+            Objects.requireNonNull(section, "section");
         }
-        if (bestNode == null) return null;
-        return bestNode.unavailableDependencies.entrySet().stream()
-                .filter(entry -> entry.getValue() == reason)
-                .map(entry -> entry.getKey().position())
-                .min(Comparator.comparingInt((SectionPos section) -> section.x())
-                        .thenComparingInt(SectionPos::y).thenComparingInt(SectionPos::z))
-                .orElse(null);
+    }
+
+    private static int sourceLayer(Endpoint endpoint) {
+        return endpoint instanceof AggregateEndpoint ? 2 : endpoint instanceof ComponentEndpoint ? 1 : 0;
+    }
+
+    private static SectionPos sourceSection(Endpoint endpoint) {
+        return endpoint instanceof AggregateEndpoint aggregate ? aggregate.origin()
+                : endpoint instanceof ComponentEndpoint component ? component.section()
+                : SectionPos.of(endpoint.anchor());
+    }
+
+    private static int sourceComponent(Endpoint endpoint) {
+        return endpoint instanceof AggregateEndpoint aggregate ? aggregate.aggregateId()
+                : endpoint instanceof ComponentEndpoint component ? component.componentId() : -1;
+    }
+
+    // Geometry and movement are fixed within one search; allocation IDs are not part of this key.
+    private static final Comparator<Endpoint> SOURCE_ORDER = Comparator
+            .comparingInt(MacroSearch::sourceLayer)
+            .thenComparingInt(value -> sourceSection(value).x())
+            .thenComparingInt(value -> sourceSection(value).y())
+            .thenComparingInt(value -> sourceSection(value).z())
+            .thenComparingInt(MacroSearch::sourceComponent)
+            .thenComparingInt(value -> value.anchor().getX())
+            .thenComparingInt(value -> value.anchor().getY())
+            .thenComparingInt(value -> value.anchor().getZ());
+
+    private record BlockedFailure(float f, Unavailability unavailability, Endpoint source) {
+        private static final Comparator<BlockedFailure> ORDER = Comparator
+                .comparingDouble(BlockedFailure::f)
+                .thenComparingInt(value -> failureRank(value.unavailability.reason()))
+                .thenComparingInt(value -> value.unavailability.section().x())
+                .thenComparingInt(value -> value.unavailability.section().y())
+                .thenComparingInt(value -> value.unavailability.section().z())
+                .thenComparing(BlockedFailure::source, SOURCE_ORDER);
     }
 
     public interface Graph {
@@ -859,26 +889,34 @@ public final class MacroSearch {
 
     public static final class BoundaryTransition implements Transition {
         private final Direction face;
-        private final byte[] verticalShifts;
+        private final short[] descriptors;
         private final long[] spatialMasks;
 
-        private BoundaryTransition(Direction face, byte[] verticalShifts, long[] spatialMasks) {
+        private BoundaryTransition(Direction face, short[] descriptors, long[] spatialMasks) {
             this.face = Objects.requireNonNull(face, "face");
-            this.verticalShifts = verticalShifts;
+            this.descriptors = descriptors;
             this.spatialMasks = spatialMasks;
-            if (verticalShifts.length == 0 || spatialMasks.length != verticalShifts.length * 4) {
+            if (descriptors.length == 0 || spatialMasks.length != descriptors.length * 4) {
                 throw new IllegalArgumentException("boundary transition requires complete bands");
             }
         }
 
         public Direction face() { return face; }
-        public int verticalShift(int band) { return verticalShifts[band]; }
+        public int bandCount() { return descriptors.length; }
+        public int sourceInset(int band) { return SuperClusterTopology.bandInset(descriptors[band]); }
+        public Direction horizontalDirection(int band) {
+            return SuperClusterTopology.bandDirection(descriptors[band]);
+        }
+        public int horizontalDistance(int band) {
+            return SuperClusterTopology.bandDistance(descriptors[band]);
+        }
+        public int verticalShift(int band) { return SuperClusterTopology.bandShift(descriptors[band]); }
         public long maskWord(int band, int word) {
             if (word < 0 || word >= 4) throw new IndexOutOfBoundsException("boundary mask word");
             return spatialMasks[band * 4 + word];
         }
         public int retainedBytes() {
-            return 40 + verticalShifts.length + spatialMasks.length * Long.BYTES;
+            return 40 + descriptors.length * Short.BYTES + spatialMasks.length * Long.BYTES;
         }
     }
 
@@ -956,6 +994,7 @@ public final class MacroSearch {
         SEARCH_LIMIT_REACHED,
         UNAVAILABLE_CHUNK,
         FACTS_RECOVERY_FAILED,
+        FACTS_PERSISTENCE_UNAVAILABLE,
         STALE_WORLD,
         CANCELLED
     }
@@ -972,7 +1011,7 @@ public final class MacroSearch {
         private boolean expansionStarted;
         private long completedExpansionParts;
         private Map<DependencyKey, Long> pendingParts;
-        private Map<DependencyKey, Failure> unavailableDependencies;
+        private Map<DependencyKey, Unavailability> unavailableDependencies;
 
         private SearchNode(Endpoint endpoint) {
             super((int) endpoint.id(), (int) (endpoint.id() >>> 32), 0);

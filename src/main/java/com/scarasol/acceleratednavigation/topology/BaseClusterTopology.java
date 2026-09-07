@@ -17,7 +17,7 @@ public final class BaseClusterTopology {
     public static final int SIDE = 16;
     public static final int CELL_COUNT = SIDE * SIDE * SIDE;
     static final int PACKED_FACT_BYTES = CELL_COUNT / 2;
-    static final int FACTS_ALGORITHM_VERSION = 3;
+    static final int FACTS_ALGORITHM_VERSION = 4;
     public static final int VOLUME_OPEN = 1;
     public static final int GROUND_OPEN = 1 << 1;
     public static final int FLUID = 1 << 2;
@@ -39,7 +39,7 @@ public final class BaseClusterTopology {
     private final GeometryKey geometry;
     private final BitStorage componentLabels;
     private final int baseLabel;
-    private final int[] componentMetadata;
+    private final long[] componentMetadata;
     private final int[] outgoingOffsets;
     private final int[] outgoingTargets;
     private final long[] outgoingCapabilityMasks;
@@ -56,7 +56,7 @@ public final class BaseClusterTopology {
                                 GeometryKey geometry,
                                 BitStorage componentLabels,
                                 int baseLabel,
-                                int[] componentMetadata,
+                                long[] componentMetadata,
                                 int[] outgoingOffsets,
                                 int[] outgoingTargets,
                                 long[] outgoingCapabilityMasks,
@@ -81,8 +81,8 @@ public final class BaseClusterTopology {
         this.signature = signature(section, revision, sourceFingerprint, geometry,
                 haloOffsets, haloRevisions, haloFingerprints);
         this.retainedBytes = 128 + componentLabels.getRaw().length * Long.BYTES
-                + (componentMetadata.length + outgoingOffsets.length + outgoingTargets.length)
-                * Integer.BYTES
+                + componentMetadata.length * Long.BYTES
+                + (outgoingOffsets.length + outgoingTargets.length) * Integer.BYTES
                 + outgoingCapabilityMasks.length * Long.BYTES
                 + outgoingLowerBounds.length * Float.BYTES
                 + haloOffsets.length + (haloRevisions.length + haloFingerprints.length) * Long.BYTES;
@@ -102,7 +102,7 @@ public final class BaseClusterTopology {
         BitStorage labels = compactLabels(scratch.labels, componentCount);
         int uniformLabel = uniformLabel(scratch.labels);
         int baseLabel = uniformLabel < 0 ? 0 : uniformLabel;
-        int[] metadata = Arrays.copyOf(scratch.componentMetadata, componentCount);
+        long[] metadata = Arrays.copyOf(scratch.componentMetadata, componentCount);
         PrimitiveEdges edges = geometry.channel() == Channel.GROUND
                 ? buildGroundEdges(input, geometry, scratch, componentCount)
                 : PrimitiveEdges.empty(componentCount);
@@ -154,7 +154,32 @@ public final class BaseClusterTopology {
     }
 
     public int componentAnchorCell(int componentId) {
-        return metadata(componentId) & 0xfff;
+        return (int) metadata(componentId) & 0xfff;
+    }
+
+    boolean mayExit(int componentId, SectionPos target, MovementKey movement) {
+        long bounds = metadata(componentId);
+        int dx = target.x() - section.x();
+        int dy = target.y() - section.y();
+        int dz = target.z() - section.z();
+        int horizontal = Math.abs(dx) + Math.abs(dz);
+        if (horizontal > 1 || Math.abs(dy) > 1 || (horizontal == 0 && dy == 0)) return false;
+        boolean volume = geometry.channel() == Channel.VOLUME;
+        if (volume && horizontal + Math.abs(dy) != 1) return false;
+        int reach = volume ? 1 : movement.jumpClass() + 1;
+        int up = volume ? 1 : movement.maxStep();
+        int down = volume ? 1 : movement.maxDrop();
+        return overlapsSection((int) (bounds >>> 12) & 15, (int) (bounds >>> 24) & 15,
+                reach, reach, dx)
+                && overlapsSection((int) (bounds >>> 16) & 15, (int) (bounds >>> 28) & 15,
+                down, up, dy)
+                && overlapsSection((int) (bounds >>> 20) & 15, (int) (bounds >>> 32) & 15,
+                reach, reach, dz);
+    }
+
+    private static boolean overlapsSection(int min, int max, int negative, int positive, int delta) {
+        int targetMin = delta * SIDE;
+        return min - negative < targetMin + SIDE && max + positive >= targetMin;
     }
 
     public int localEdgeStart(int componentId) {
@@ -207,7 +232,7 @@ public final class BaseClusterTopology {
         return signature;
     }
 
-    private int metadata(int componentId) {
+    private long metadata(int componentId) {
         if (componentId < 0 || componentId >= componentMetadata.length) {
             throw new IndexOutOfBoundsException("unknown component " + componentId);
         }
@@ -345,11 +370,16 @@ public final class BaseClusterTopology {
             int tail = 0;
             scratch.queue[tail++] = candidate;
             scratch.labels[candidate] = (char) (componentCount + 1);
+            int minX = SIDE - 1, minY = SIDE - 1, minZ = SIDE - 1;
+            int maxX = 0, maxY = 0, maxZ = 0;
             while (head < tail) {
                 int cell = scratch.queue[head++];
                 int x = x(cell);
                 int y = y(cell);
                 int z = z(cell);
+                minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+                minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+                minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
                 tail = enqueue(x - 1, y, z, componentCount, scratch, tail);
                 tail = enqueue(x + 1, y, z, componentCount, scratch, tail);
                 tail = enqueue(x, y, z - 1, componentCount, scratch, tail);
@@ -359,7 +389,9 @@ public final class BaseClusterTopology {
                     tail = enqueue(x, y + 1, z, componentCount, scratch, tail);
                 }
             }
-            scratch.componentMetadata[componentCount] = candidate;
+            scratch.componentMetadata[componentCount] = candidate
+                    | (long) minX << 12 | (long) minY << 16 | (long) minZ << 20
+                    | (long) maxX << 24 | (long) maxY << 28 | (long) maxZ << 32;
             componentCount++;
         }
         return componentCount;
@@ -833,7 +865,7 @@ public final class BaseClusterTopology {
         private static final int MAX_PARENT_NODES = CELL_COUNT * 8;
         private final char[] labels = new char[CELL_COUNT];
         private final int[] queue = new int[CELL_COUNT];
-        private final int[] componentMetadata = new int[CELL_COUNT];
+        private final long[] componentMetadata = new long[CELL_COUNT];
         private final long[] legalMask = new long[CELL_COUNT / Long.SIZE];
         private final long[] prismMask = new long[PRISM_LAYERS * SIDE * SIDE / Long.SIZE];
         private final int[] volumeRows = new int[(SIDE * 2) * EXTENDED_SIDE];
@@ -863,7 +895,7 @@ public final class BaseClusterTopology {
 
         int retainedBytes() {
             return labels.length * Character.BYTES + queue.length * Integer.BYTES
-                    + componentMetadata.length * Integer.BYTES
+                    + componentMetadata.length * Long.BYTES
                     + (legalMask.length + prismMask.length) * Long.BYTES
                     + (volumeRows.length + groundRows.length + erodedRows.length
                     + fullCollisionRows.length) * Integer.BYTES

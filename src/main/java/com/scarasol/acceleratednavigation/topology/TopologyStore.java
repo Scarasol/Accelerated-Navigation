@@ -45,6 +45,9 @@ final class TopologyStore implements AutoCloseable {
             new LinkedHashMap<>(64, 0.75F, true);
     private final Map<ChunkKey, CompletableFuture<ChunkLoad>> loads = new HashMap<>();
     private final Map<ChunkKey, PendingChunk> pending = new HashMap<>();
+    private final Set<WriteReceipt> receipts = new HashSet<>();
+    private final Map<TopologyWorkerRuntime.ClusterKey, Set<WriteReceipt>> receiptsBySection =
+            new HashMap<>();
     private final Map<ResourceKey<Level>, Integer> dirtyChunksByDimension = new HashMap<>();
     private final Set<ResourceKey<Level>> requestedFlushes = new HashSet<>();
     private final Set<ResourceKey<Level>> queuedFlushes = new HashSet<>();
@@ -112,92 +115,124 @@ final class TopologyStore implements AutoCloseable {
         });
     }
 
-    CompletableFuture<UpdateResult> writeFull(ResourceKey<Level> dimension,
-                                              SectionPos section,
-                                              long version,
-                                              BaseClusterTopology.PackedFacts facts) {
-        Objects.requireNonNull(dimension, "dimension");
-        Objects.requireNonNull(section, "section");
-        SectionRecord record = new SectionRecord(version, facts);
-        CompletableFuture<UpdateResult> result = new CompletableFuture<>();
-        CompletableFuture<UpdateResult> superseded = null;
+    WriteReceipt accept(TopologyWorkerRuntime.FactDecision decision) {
+        WriteReceipt receipt = new WriteReceipt(decision);
         synchronized (monitor) {
             ensureAccepting();
-            writeRequests++;
-            ChunkKey key = new ChunkKey(dimension, new ChunkPos(section.x(), section.z()));
-            PendingChunk chunk = pendingChunkLocked(key);
-            PendingSection previous = chunk.sections.get(section.y());
-            if (previous != null) {
-                superseded = previous.completion;
-                recordsCoalesced++;
-            }
-            chunk.sections.put(section.y(), new PendingSection(
-                    new FullMutation(record), result));
-            scheduleWriteLocked(key, chunk);
+            receipts.add(receipt);
+            receiptsBySection.computeIfAbsent(decision.key(), ignored -> new HashSet<>())
+                    .add(receipt);
+            dirtyChunksByDimension.merge(decision.key().dimension(), 1, Integer::sum);
+            if (decision.facts() == null) enqueueLocked(foreground, () -> formDelta(receipt));
         }
-        if (superseded != null) {
-            superseded.complete(UpdateResult.coalesced());
+        if (decision.facts() != null) {
+            receipt.formed.complete(new Formation(decision.facts(), null, null));
         }
-        return result;
+        return receipt;
     }
 
-    CompletableFuture<UpdateResult> mergeDelta(ResourceKey<Level> dimension,
-                                               SectionPos section,
-                                               SectionDelta delta) {
-        Objects.requireNonNull(dimension, "dimension");
-        Objects.requireNonNull(section, "section");
-        Objects.requireNonNull(delta, "delta");
-        CompletableFuture<UpdateResult> result = new CompletableFuture<>();
-        CompletableFuture<UpdateResult> superseded = null;
-        synchronized (monitor) {
-            ensureAccepting();
-            writeRequests++;
-            ChunkKey key = new ChunkKey(dimension, new ChunkPos(section.x(), section.z()));
-            PendingChunk chunk = pendingChunkLocked(key);
-            PendingSection previous = chunk.sections.get(section.y());
-            Mutation mutation;
-            if (previous == null) {
-                long expected = chunk.inFlightTargetVersion(section.y());
-                if (expected >= 0L && expected != delta.originalVersion) {
-                    removePendingChunkIfIdleLocked(key, chunk);
-                    writeFailures++;
-                    return CompletableFuture.completedFuture(UpdateResult.versionMismatch());
-                }
-                mutation = new DeltaMutation(delta);
+    private void formDelta(WriteReceipt receipt) {
+        TopologyWorkerRuntime.FactDecision decision = receipt.decision;
+        ChunkKey key = new ChunkKey(decision.key().dimension(), new ChunkPos(
+                decision.key().section().x(), decision.key().section().z()));
+        Formation result;
+        try {
+            ChunkLoad load;
+            synchronized (monitor) {
+                if (!receipts.contains(receipt)) return;
+                readRequests++;
+                load = decodedLoadLocked(key);
+            }
+            if (load == null) load = readChunk(key);
+            ReadResult baseline;
+            synchronized (monitor) {
+                baseline = latestLocked(key, decision.key().section().y(), load);
+                recordReadLocked(baseline);
+            }
+            if (baseline.status() != ReadStatus.FOUND) {
+                result = new Formation(null, baseline.status() == ReadStatus.CORRUPT
+                        ? UpdateStatus.CORRUPT : UpdateStatus.BASE_MISSING, baseline.failure());
+            } else if (baseline.record().version() != decision.previousVersion()) {
+                result = new Formation(null, UpdateStatus.VERSION_MISMATCH, null);
             } else {
-                mutation = appendDelta(previous.mutation, delta);
-                if (mutation == null) {
-                    writeFailures++;
-                    return CompletableFuture.completedFuture(UpdateResult.versionMismatch());
-                }
+                result = new Formation(baseline.record().facts().withChanges(
+                        decision.changes()), null, null);
             }
-            if (previous != null) {
-                superseded = previous.completion;
-                recordsCoalesced++;
-            }
-            chunk.sections.put(section.y(), new PendingSection(mutation, result));
-            scheduleWriteLocked(key, chunk);
+        } catch (IOException | RuntimeException failure) {
+            synchronized (monitor) { readFailures++; }
+            result = new Formation(null, UpdateStatus.IO_FAILURE, failure);
         }
-        if (superseded != null) {
-            superseded.complete(UpdateResult.coalesced());
-        }
-        return result;
+        receipt.formed.complete(result);
+        if (result.facts() == null) finishReceipt(receipt,
+                new UpdateResult(result.failureStatus(), result.failure()));
     }
 
-    private static Mutation appendDelta(Mutation previous, SectionDelta next) {
-        if (previous.targetVersion() != next.originalVersion) {
-            return null;
+    void continueWrite(WriteReceipt receipt) {
+        Formation formed = receipt.formed.getNow(null);
+        List<WriteReceipt> superseded = new ArrayList<>();
+        CompletableFuture<UpdateResult> result = new CompletableFuture<>();
+        CompletableFuture<UpdateResult> coalesced = null;
+        try {
+            synchronized (monitor) {
+                if (!receipts.contains(receipt) || receipt.writing
+                        || formed == null || formed.facts() == null) return;
+                ensureAccepting();
+                var decision = receipt.decision;
+                SectionPos section = decision.key().section();
+                SectionRecord record = new SectionRecord(decision.version(), formed.facts());
+                receipt.writing = true;
+                // Retiring old loads and entering the write queue share one ordering point.
+                for (WriteReceipt previous : List.copyOf(receiptsBySection.get(decision.key()))) {
+                    if (previous != receipt && !previous.writing
+                            && previous.decision.loadIdentity() < decision.loadIdentity()) {
+                        removeReceiptLocked(previous);
+                        recordsCoalesced++;
+                        superseded.add(previous);
+                    }
+                }
+                writeRequests++;
+                ChunkKey key = new ChunkKey(decision.key().dimension(), section.chunk());
+                PendingChunk chunk = pendingChunkLocked(key);
+                PendingSection previous = chunk.sections.put(section.y(), new PendingSection(record, result));
+                if (previous != null) {
+                    coalesced = previous.completion;
+                    recordsCoalesced++;
+                }
+                scheduleWriteLocked(key, chunk);
+            }
+        } catch (RuntimeException failure) {
+            result.complete(new UpdateResult(UpdateStatus.IO_FAILURE, failure));
         }
-        if (previous instanceof FullMutation full) {
-            return new FullMutation(new SectionRecord(
-                    next.newVersion,
-                    full.record.facts.withChanges(next.cells)));
+        for (WriteReceipt previous : superseded) {
+            previous.formed.complete(new Formation(null, UpdateStatus.CLOSED, null));
+            previous.completed.complete(UpdateResult.coalesced());
         }
-        DeltaMutation delta = (DeltaMutation) previous;
-        Map<Integer, Byte> merged = new HashMap<>(delta.delta.cells);
-        merged.putAll(next.cells);
-        return new DeltaMutation(new SectionDelta(
-                delta.delta.originalVersion, next.newVersion, merged));
+        if (coalesced != null) coalesced.complete(UpdateResult.coalesced());
+        result.whenComplete((written, failure) -> finishReceipt(receipt, failure == null ? written
+                : new UpdateResult(UpdateStatus.IO_FAILURE, failure)));
+    }
+
+    void rejectWrite(WriteReceipt receipt) {
+        finishReceipt(receipt, new UpdateResult(UpdateStatus.CLOSED, null));
+    }
+
+    private void finishReceipt(WriteReceipt receipt, UpdateResult result) {
+        synchronized (monitor) {
+            if (!removeReceiptLocked(receipt)) return;
+        }
+        receipt.completed.complete(result);
+    }
+
+    private boolean removeReceiptLocked(WriteReceipt receipt) {
+        if (!receipts.remove(receipt)) return false;
+        Set<WriteReceipt> section = receiptsBySection.get(receipt.decision.key());
+        section.remove(receipt);
+        if (section.isEmpty()) receiptsBySection.remove(receipt.decision.key());
+        ResourceKey<Level> dimension = receipt.decision.key().dimension();
+        dirtyChunksByDimension.computeIfPresent(dimension,
+                (ignored, count) -> count == 1 ? null : count - 1);
+        scheduleFlushIfReadyLocked(dimension);
+        return true;
     }
 
     void requestSave(ResourceKey<Level> dimension) {
@@ -230,12 +265,19 @@ final class TopologyStore implements AutoCloseable {
 
     @Override
     public void close() {
+        List<WriteReceipt> abandoned;
         synchronized (monitor) {
             if (!closing) {
                 accepting = false;
                 closing = true;
                 monitor.notifyAll();
             }
+            abandoned = receipts.stream().filter(receipt -> !receipt.writing).toList();
+            abandoned.forEach(this::removeReceiptLocked);
+        }
+        for (WriteReceipt receipt : abandoned) {
+            receipt.formed.complete(new Formation(null, UpdateStatus.CLOSED, null));
+            receipt.completed.complete(new UpdateResult(UpdateStatus.CLOSED, null));
         }
         try {
             worker.join(CLOSE_WAIT_MILLIS);
@@ -271,7 +313,8 @@ final class TopologyStore implements AutoCloseable {
                     flushes,
                     flushFailures,
                     accepting,
-                    closing
+                    closing,
+                    receipts.size()
             );
         }
     }
@@ -323,13 +366,9 @@ final class TopologyStore implements AutoCloseable {
                     ? new LinkedHashMap<>(base.image.sections) : new LinkedHashMap<>();
             boolean changed = false;
             for (Map.Entry<Integer, PendingSection> entry : batch.entrySet()) {
-                Applied applied = apply(entry.getValue().mutation,
-                        merged.get(entry.getKey()), base.status);
-                statuses.put(entry.getKey(), applied.status);
-                if (applied.record != null) {
-                    merged.put(entry.getKey(), applied.record);
-                    changed = true;
-                }
+                merged.put(entry.getKey(), entry.getValue().record);
+                statuses.put(entry.getKey(), null);
+                changed = true;
             }
             if (changed) {
                 image = new ChunkImage(Map.copyOf(merged));
@@ -347,25 +386,6 @@ final class TopologyStore implements AutoCloseable {
             writeFailure = failure;
         }
         completeWrite(key, expected, batch, image, statuses, writeFailure);
-    }
-
-    private static Applied apply(Mutation mutation,
-                                 SectionRecord base,
-                                 ChunkStatus chunkStatus) {
-        if (mutation instanceof FullMutation full) {
-            return new Applied(full.record, null);
-        }
-        DeltaMutation pending = (DeltaMutation) mutation;
-        if (base == null) {
-            return new Applied(null, chunkStatus == ChunkStatus.CORRUPT
-                    ? UpdateStatus.CORRUPT : UpdateStatus.BASE_MISSING);
-        }
-        if (base.version != pending.delta.originalVersion) {
-            return new Applied(null, UpdateStatus.VERSION_MISMATCH);
-        }
-        return new Applied(new SectionRecord(
-                pending.delta.newVersion,
-                base.facts.withChanges(pending.delta.cells)), null);
     }
 
     private static Map<Integer, UpdateStatus> uniformStatuses(
@@ -487,8 +507,7 @@ final class TopologyStore implements AutoCloseable {
         if (pending == null) {
             return base;
         }
-        Applied applied = apply(pending.mutation, base, status);
-        return applied.record;
+        return pending.record;
     }
 
     private ChunkLoad readChunk(ChunkKey key) throws IOException {
@@ -778,14 +797,11 @@ final class TopologyStore implements AutoCloseable {
         BASE_MISSING,
         VERSION_MISMATCH,
         CORRUPT,
-        IO_FAILURE
+        IO_FAILURE,
+        CLOSED
     }
 
     record UpdateResult(UpdateStatus status, Throwable failure) {
-        private static UpdateResult versionMismatch() {
-            return new UpdateResult(UpdateStatus.VERSION_MISMATCH, null);
-        }
-
         private static UpdateResult coalesced() {
             return new UpdateResult(UpdateStatus.COALESCED, null);
         }
@@ -802,42 +818,20 @@ final class TopologyStore implements AutoCloseable {
         IO_FAILURE
     }
 
-    private sealed interface Mutation permits FullMutation, DeltaMutation {
-        long targetVersion();
-    }
-
-    private record FullMutation(SectionRecord record) implements Mutation {
-        @Override
-        public long targetVersion() {
-            return record.version;
-        }
-    }
-
-    private record DeltaMutation(SectionDelta delta) implements Mutation {
-        @Override
-        public long targetVersion() {
-            return delta.newVersion;
-        }
-    }
-
     private static final class PendingChunk {
         private final Map<Integer, PendingSection> sections = new HashMap<>();
         private Map<Integer, PendingSection> inFlight;
         private boolean unloaded;
 
-        private long inFlightTargetVersion(int sectionY) {
-            PendingSection section = inFlight == null ? null : inFlight.get(sectionY);
-            return section == null ? -1L : section.mutation.targetVersion();
-        }
     }
 
     private static final class PendingSection {
-        private final Mutation mutation;
+        private final SectionRecord record;
         private final CompletableFuture<UpdateResult> completion;
 
-        private PendingSection(Mutation mutation,
+        private PendingSection(SectionRecord record,
                                CompletableFuture<UpdateResult> completion) {
-            this.mutation = mutation;
+            this.record = record;
             this.completion = completion;
         }
     }
@@ -914,7 +908,19 @@ final class TopologyStore implements AutoCloseable {
                                      WeakReference<BaseClusterTopology.PackedFacts> facts) {
     }
 
-    private record Applied(SectionRecord record, UpdateStatus status) {
+    record Formation(BaseClusterTopology.PackedFacts facts,
+                     UpdateStatus failureStatus, Throwable failure) {
+    }
+
+    static final class WriteReceipt {
+        final TopologyWorkerRuntime.FactDecision decision;
+        final CompletableFuture<Formation> formed = new CompletableFuture<>();
+        final CompletableFuture<UpdateResult> completed = new CompletableFuture<>();
+        private boolean writing;
+
+        private WriteReceipt(TopologyWorkerRuntime.FactDecision decision) {
+            this.decision = Objects.requireNonNull(decision, "decision");
+        }
     }
 
     private record Completion(CompletableFuture<UpdateResult> future,

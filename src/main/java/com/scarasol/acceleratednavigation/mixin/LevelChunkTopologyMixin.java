@@ -29,6 +29,13 @@ abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarr
     private TopologyService.ChunkFactsState acceleratedNavigation$facts =
             new TopologyService.ChunkFactsState();
 
+    @Inject(method = "<init>", at = @At("RETURN"))
+    private void acceleratedNavigation$bindSections(CallbackInfo callback) {
+        if (level instanceof ServerLevel) {
+            TopologyService.bindGeneration((LevelChunk) (Object) this);
+        }
+    }
+
     @Inject(
             method = "<init>(Lnet/minecraft/server/level/ServerLevel;"
                     + "Lnet/minecraft/world/level/chunk/ProtoChunk;"
@@ -43,6 +50,7 @@ abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarr
         if (source instanceof TopologyService.ChunkFactsCarrier carrier) {
             acceleratedNavigation$facts = carrier.acceleratedNavigation$factsState();
         }
+        TopologyService.bindGeneration((LevelChunk) (Object) this);
     }
 
     @Inject(method = "setBlockState", at = @At("HEAD"))
@@ -52,8 +60,8 @@ abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarr
             boolean moved,
             CallbackInfoReturnable<BlockState> callback,
             @Share("oldFacts") LocalLongRef oldFacts) {
-        if (level instanceof ServerLevel serverLevel
-                && TopologyService.tracksFacts(serverLevel, (LevelChunk) (Object) this)) {
+        if (level instanceof ServerLevel
+                && TopologyService.tracksFacts((LevelChunk) (Object) this)) {
             oldFacts.set(TopologyService.sampleColumnFacts(
                     (LevelChunk) (Object) this, position));
         }
@@ -67,7 +75,7 @@ abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarr
             CallbackInfoReturnable<BlockState> callback,
             @Share("oldFacts") LocalLongRef oldFacts) {
         if (!(level instanceof ServerLevel serverLevel)
-                || !TopologyService.tracksFacts(serverLevel, (LevelChunk) (Object) this)
+                || !TopologyService.tracksFacts((LevelChunk) (Object) this)
                 || callback.getReturnValue() == null) {
             return;
         }

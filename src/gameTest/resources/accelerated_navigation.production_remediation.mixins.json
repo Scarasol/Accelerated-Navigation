@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.scarasol.acceleratednavigation.gametest.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "accelerated_navigation.terrain_benchmark.refmap.json",
+  "mixins": ["TopologyGraphValidationMixin", "TopologyEndpointValidationMixin", "TopologyFlightValidationMixin",
+    "TopologyNoiseValidationMixin", "TopologyOreValidationMixin", "TopologyGenerationValidationMixin",
+    "TopologySectionValidationMixin", "TopologyLoadValidationMixin", "TopologyGenerationStageValidationMixin", "TopologySectionEventValidationMixin",
+    "TopologyResultValidationMixin"],
+  "injectors": {"defaultRequire": 1}
+}

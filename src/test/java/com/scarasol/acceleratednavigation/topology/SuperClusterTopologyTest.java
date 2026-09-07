@@ -1,9 +1,15 @@
 package com.scarasol.acceleratednavigation.topology;
 
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+import static com.scarasol.acceleratednavigation.topology.SuperClusterTopology.boundaryLinks;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -144,6 +150,168 @@ class SuperClusterTopologyTest {
         assertTrue(sourceAggregate >= 0);
         assertTrue(crossing.edgeEnd(sourceAggregate) > crossing.edgeStart(sourceAggregate));
         assertTrue(source.hasPotentialExit(sourceAggregate, targetOrigin));
+    }
+
+    @Test
+    void groundCrossesYWithHorizontalMovementFromEverySupportedInset() {
+        BaseClusterTopology.BuildScratch scratch = new BaseClusterTopology.BuildScratch();
+        for (Direction direction : Direction.Plane.HORIZONTAL) {
+            for (int distance = 1; distance <= 3; distance++) {
+                for (int dy = -4; dy <= 1; dy++) {
+                    if (dy == 0) continue;
+                    for (int inset = 0; inset < Math.abs(dy); inset++) {
+                        BlockPos start = new BlockPos(8, dy > 0 ? 15 : inset, 8);
+                        BlockPos goal = start.offset(direction.getStepX() * distance, dy,
+                                direction.getStepZ() * distance);
+                        BaseClusterTopology source = pointTopology(SectionPos.of(start),
+                                BaseClusterTopology.Channel.GROUND, scratch, start);
+                        BaseClusterTopology target = pointTopology(SectionPos.of(goal),
+                                BaseClusterTopology.Channel.GROUND, scratch, goal);
+                        Direction face = dy > 0 ? Direction.UP : Direction.DOWN;
+                        SuperClusterTopology.BoundaryLinks links = boundaryLinks(source, target, face);
+                        BaseClusterTopology.MovementKey allowed = new BaseClusterTopology.MovementKey(
+                                Math.max(0, dy), distance - 1, Math.max(0, -dy));
+                        assertEquals(1, links.edgeEnd(0));
+                        assertTrue(links.supports(0, allowed));
+                        assertFalse(links.supports(0, new BaseClusterTopology.MovementKey(0, 0, 0)));
+                        assertTrue(source.mayExit(0, target.section(), allowed));
+                        assertEquals(1, links.bandEnd(0));
+                        int descriptor = links.descriptor(0);
+                        assertEquals(inset, SuperClusterTopology.bandInset(descriptor));
+                        assertEquals(direction, SuperClusterTopology.bandDirection(descriptor));
+                        assertEquals(distance, SuperClusterTopology.bandDistance(descriptor));
+                        assertEquals(dy, SuperClusterTopology.bandShift(descriptor));
+                        assertEquals(1L << (8 * 16 + 8), links.maskWord(0, (8 * 16 + 8) >>> 6));
+                        if (dy < -1) assertEquals(0, boundaryLinks(target, source, Direction.UP).edgeEnd(0));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void overlappingFaceCoordinatesKeepDifferentSourceInsets() {
+        BaseClusterTopology.BuildScratch scratch = new BaseClusterTopology.BuildScratch();
+        BaseClusterTopology source = pointTopology(SectionPos.of(0, 0, 0),
+                BaseClusterTopology.Channel.GROUND, scratch,
+                new BlockPos(14, 5, 8), new BlockPos(15, 5, 8));
+        BaseClusterTopology target = pointTopology(SectionPos.of(1, 0, 0),
+                BaseClusterTopology.Channel.GROUND, scratch,
+                new BlockPos(16, 5, 8), new BlockPos(17, 5, 8));
+        SuperClusterTopology.BoundaryLinks links = boundaryLinks(source, target, Direction.EAST);
+        Set<String> decoded = new HashSet<>();
+        for (int band = links.bandStart(0); band < links.bandEnd(0); band++) {
+            int descriptor = links.descriptor(band);
+            int sourceX = 15 - SuperClusterTopology.bandInset(descriptor);
+            int targetX = sourceX + SuperClusterTopology.bandDistance(descriptor);
+            assertEquals(Direction.EAST, SuperClusterTopology.bandDirection(descriptor));
+            assertEquals(0, SuperClusterTopology.bandShift(descriptor));
+            assertEquals(1L << 88, links.maskWord(band, 1));
+            assertTrue(decoded.add(sourceX + ":" + targetX));
+        }
+        assertEquals(Set.of("14:16", "14:17", "15:16", "15:17"), decoded);
+    }
+
+    @Test
+    void directedReachabilitySurvivesChildAndParentYBoundaries() {
+        BaseClusterTopology.BuildScratch scratch = new BaseClusterTopology.BuildScratch();
+        BaseClusterTopology.GeometryKey geometry = new BaseClusterTopology.GeometryKey(
+                BaseClusterTopology.Channel.GROUND, 1, 1, false);
+        BaseClusterTopology.MovementKey movement = new BaseClusterTopology.MovementKey(1, 2, 4);
+        for (Direction direction : Direction.Plane.HORIZONTAL) {
+            for (int dy : new int[]{-4, -1, 1}) {
+                for (int y : dy > 0 ? new int[]{8, 15, 31} : new int[]{8, 16, 32}) {
+                    BlockPos start = new BlockPos(8, y, 8);
+                    BlockPos goal = start.offset(direction.getStepX(), dy, direction.getStepZ());
+                    SectionPos startOrigin = SuperClusterTopology.originOf(SectionPos.of(start));
+                    SectionPos goalOrigin = SuperClusterTopology.originOf(SectionPos.of(goal));
+                    BaseClusterTopology[] sourceChildren = pointChildren(startOrigin, scratch, start, goal);
+                    SuperClusterTopology source = SuperClusterTopology.build(startOrigin, sourceChildren,
+                            geometry, movement, scratch);
+                    int sourceAggregate = source.aggregateId(SectionPos.of(start),
+                            pointComponent(sourceChildren, start));
+                    if (startOrigin.equals(goalOrigin)) {
+                        int goalAggregate = source.aggregateId(SectionPos.of(goal),
+                                pointComponent(sourceChildren, goal));
+                        if (dy == -4) {
+                            assertTrue(sourceAggregate != goalAggregate);
+                            assertTrue(hasParentEdge(source, sourceAggregate, goalAggregate));
+                            assertFalse(hasParentEdge(source, goalAggregate, sourceAggregate));
+                        } else {
+                            assertEquals(sourceAggregate, goalAggregate);
+                        }
+                    } else {
+                        BaseClusterTopology[] targetChildren = pointChildren(goalOrigin, scratch, start, goal);
+                        SuperClusterTopology target = SuperClusterTopology.build(goalOrigin, targetChildren,
+                                geometry, movement, scratch);
+                        int goalAggregate = target.aggregateId(SectionPos.of(goal),
+                                pointComponent(targetChildren, goal));
+                        Direction face = dy > 0 ? Direction.UP : Direction.DOWN;
+                        SuperClusterTopology.CrossingIndex crossing = source.crossingIndex(
+                                face, target, sourceChildren, targetChildren);
+                        assertTrue(source.hasPotentialExit(sourceAggregate, goalOrigin));
+                        assertEquals(crossing.edgeStart(sourceAggregate) + 1, crossing.edgeEnd(sourceAggregate));
+                        assertEquals(goalAggregate, crossing.targetAggregate(crossing.edgeStart(sourceAggregate)));
+                        assertEquals(face, crossing.face(crossing.edgeStart(sourceAggregate)));
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void volumeCrossesAllSixFacesWithoutGroundMovementCapabilities() {
+        BaseClusterTopology.BuildScratch scratch = new BaseClusterTopology.BuildScratch();
+        for (Direction face : Direction.values()) {
+            BlockPos start = new BlockPos(face.getStepX() > 0 ? 15 : face.getStepX() < 0 ? 0 : 8,
+                    face.getStepY() > 0 ? 15 : face.getStepY() < 0 ? 0 : 8,
+                    face.getStepZ() > 0 ? 15 : face.getStepZ() < 0 ? 0 : 8);
+            BlockPos goal = start.relative(face);
+            BaseClusterTopology source = pointTopology(SectionPos.of(start),
+                    BaseClusterTopology.Channel.VOLUME, scratch, start, start.relative(face.getOpposite()));
+            BaseClusterTopology target = pointTopology(SectionPos.of(goal),
+                    BaseClusterTopology.Channel.VOLUME, scratch, goal, goal.relative(face));
+            SuperClusterTopology.BoundaryLinks links = boundaryLinks(source, target, face);
+            BaseClusterTopology.MovementKey movement = new BaseClusterTopology.MovementKey(0, 0, 0);
+            assertEquals(1, links.edgeEnd(0));
+            assertTrue(links.supports(0, movement));
+            assertTrue(source.mayExit(0, target.section(), movement));
+            assertEquals(1.0F, links.lowerBound(0));
+        }
+    }
+
+    private static boolean hasParentEdge(SuperClusterTopology topology, int source, int target) {
+        for (int edge = topology.outgoingStart(source); edge < topology.outgoingEnd(source); edge++) {
+            if (topology.outgoingTarget(edge) == target) return true;
+        }
+        return false;
+    }
+
+    private static int pointComponent(BaseClusterTopology[] children, BlockPos point) {
+        return Arrays.stream(children).filter(child -> child.section().equals(SectionPos.of(point)))
+                .findFirst().orElseThrow().componentAt(point.getX() & 15, point.getY() & 15, point.getZ() & 15);
+    }
+
+    private static BaseClusterTopology[] pointChildren(SectionPos origin,
+                                                       BaseClusterTopology.BuildScratch scratch,
+                                                       BlockPos... points) {
+        return SuperClusterTopology.childSections(origin).stream().map(section -> pointTopology(
+                section, BaseClusterTopology.Channel.GROUND, scratch, points)).toArray(BaseClusterTopology[]::new);
+    }
+
+    private static BaseClusterTopology pointTopology(SectionPos section, BaseClusterTopology.Channel channel,
+                                                     BaseClusterTopology.BuildScratch scratch,
+                                                     BlockPos... points) {
+        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
+        if (channel == BaseClusterTopology.Channel.GROUND) Arrays.fill(cells, (byte) BaseClusterTopology.VOLUME_OPEN);
+        for (BlockPos point : points) {
+            if (SectionPos.of(point).equals(section)) cells[BaseClusterTopology.cellIndex(
+                    point.getX() & 15, point.getY() & 15, point.getZ() & 15)] =
+                    BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN;
+        }
+        return BaseClusterTopology.build(section, 1L,
+                BaseClusterTopology.BuildInput.center(BaseClusterTopology.PackedFacts.fromCells(cells)),
+                new BaseClusterTopology.GeometryKey(channel, 1, 1, false), scratch);
     }
 
     private static SuperClusterTopology buildSuper(SectionPos origin,

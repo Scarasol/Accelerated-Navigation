@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.scarasol.acceleratednavigation.gametest.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "accelerated_navigation.terrain_benchmark.refmap.json",
+  "mixins": [
+    "TopologyServiceObservationMixin",
+    "TopologyStoreObservationMixin",
+    "TopologyWorkerRuntimePrewarmMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

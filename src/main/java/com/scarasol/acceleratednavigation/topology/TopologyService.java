@@ -35,8 +35,11 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 
 /** Server-thread owner of basic facts, persistence, recovery and caller publication. */
 public final class TopologyService {
@@ -66,6 +69,9 @@ public final class TopologyService {
     private final Object factDemandLock = new Object();
     private Map<FactDemandKey, Integer> factDemandChanges = new HashMap<>();
     private boolean factDemandNoticeQueued;
+    private final ConcurrentLinkedQueue<Runnable> persistenceCallbacks = new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean persistenceNoticeQueued = new AtomicBoolean();
+    private final AtomicBoolean unsupportedThreading = new AtomicBoolean();
     private long nextLoadIdentity;
     private int highestMacroRequests;
     private int highestQueuedRecoveries;
@@ -92,13 +98,58 @@ public final class TopologyService {
             AcceleratedNavigation.LOGGER.error("Could not open macro topology store", failure);
         }
         store = opened;
-        runtime = new TopologyWorkerRuntime(this::factDemandChanged);
+        runtime = new TopologyWorkerRuntime(this::factDemandChanged,
+                this::queueFactDecision);
     }
 
     public static TopologyService forServer(MinecraftServer server) {
         Objects.requireNonNull(server, "server");
+        if (!server.isSameThread()) {
+            rejectUnsupportedThread(server);
+            throw unsupportedThreadFailure();
+        }
         synchronized (SERVICES) {
+            if (SERVICES.containsKey(server) && SERVICES.get(server) == null) {
+                throw unsupportedThreadFailure();
+            }
             return SERVICES.computeIfAbsent(server, TopologyService::new);
+        }
+    }
+
+    private static void rejectUnsupportedThread(MinecraftServer server) {
+        synchronized (SERVICES) {
+            TopologyService service = SERVICES.get(server);
+            if (service != null) service.disableUnsupportedThreading();
+            else if (!SERVICES.containsKey(server)) {
+                // A null entry rejects creation until shutdown, without starting workers off-thread.
+                SERVICES.put(server, null);
+                AcceleratedNavigation.LOGGER.warn(
+                        "Macro topology disabled until server restart: unsupported calling thread");
+            }
+        }
+    }
+
+    private void disableUnsupportedThreading() {
+        if (!unsupportedThreading.compareAndSet(false, true)) return;
+        AcceleratedNavigation.LOGGER.warn(
+                "Macro topology disabled until server restart: unsupported calling thread");
+        queueServer(this::beginStopping);
+    }
+
+    private static UnsupportedOperationException unsupportedThreadFailure() {
+        return new UnsupportedOperationException(
+                "Macro topology requires the server thread and is disabled until server restart");
+    }
+
+    public boolean isAvailable() {
+        return !unsupportedThreading.get() && !stopping && !stopped;
+    }
+
+    public static boolean canReuseFactVersions(MinecraftServer server) {
+        synchronized (SERVICES) {
+            if (!SERVICES.containsKey(server)) return true;
+            TopologyService service = SERVICES.get(server);
+            return service != null && !service.unsupportedThreading.get();
         }
     }
 
@@ -127,10 +178,19 @@ public final class TopologyService {
     }
 
     public static void onChunkLoaded(ServerLevel level, ChunkAccess chunk) {
+        if (!level.getServer().isSameThread()) {
+            rejectUnsupportedThread(level.getServer());
+            return;
+        }
+        if (!canReuseFactVersions(level.getServer())) return;
         forServer(level.getServer()).loadChunk(level, chunk);
     }
 
     public static void onChunkUnloaded(ServerLevel level, ChunkAccess chunk) {
+        if (!level.getServer().isSameThread()) {
+            rejectUnsupportedThread(level.getServer());
+            return;
+        }
         TopologyService service;
         synchronized (SERVICES) {
             service = SERVICES.get(level.getServer());
@@ -153,27 +213,25 @@ public final class TopologyService {
                                             BlockPos position,
                                             long before,
                                             long after) {
-        TopologyService service;
-        synchronized (SERVICES) {
-            service = SERVICES.get(level.getServer());
-        }
-        if (service == null) return;
+        if (!(chunk instanceof ChunkFactsCarrier carrier)) return;
+        TopologyService service = carrier.acceleratedNavigation$factsState().consumer;
+        if (service == null || !service.acceptsFactsThread()) return;
         service.recordColumnChange(level, chunk, position.immutable(), before, after);
     }
 
     /** Returns whether this loaded chunk currently has a live facts consumer. */
-    public static boolean tracksFacts(ServerLevel level, LevelChunk chunk) {
-        Objects.requireNonNull(level, "level");
+    public static boolean tracksFacts(LevelChunk chunk) {
         Objects.requireNonNull(chunk, "chunk");
-        if (!level.getServer().isSameThread()
-                || !(chunk instanceof ChunkFactsCarrier carrier)
-                || !carrier.acceleratedNavigation$factsState().tracking()) {
-            return false;
-        }
-        synchronized (SERVICES) {
-            TopologyService service = SERVICES.get(level.getServer());
-            return service != null && !service.stopping && !service.stopped;
-        }
+        if (!(chunk instanceof ChunkFactsCarrier carrier)) return false;
+        TopologyService service = carrier.acceleratedNavigation$factsState().consumer;
+        return service != null && service.acceptsFactsThread();
+    }
+
+    private boolean acceptsFactsThread() {
+        if (!isAvailable()) return false;
+        if (server.isSameThread()) return true;
+        disableUnsupportedThreading();
+        return false;
     }
 
     public MacroRequest requestMacroQuery(ServerLevel level,
@@ -183,6 +241,8 @@ public final class TopologyService {
                                           BaseClusterTopology.Channel channel,
                                           BaseClusterTopology.TraversalProfile profile,
                                           NavigationScheduler.Priority priority) {
+        if (!server.isSameThread()) disableUnsupportedThreading();
+        if (unsupportedThreading.get()) throw unsupportedThreadFailure();
         requireServerThread();
         if (stopping || level.getServer() != server) {
             throw new IllegalStateException("topology service is stopping or belongs to another server");
@@ -202,7 +262,7 @@ public final class TopologyService {
 
     private void loadChunk(ServerLevel level, ChunkAccess access) {
         requireServerThread();
-        if (stopping || !(access instanceof LevelChunk chunk)
+        if (!isAvailable() || !(access instanceof LevelChunk chunk)
                 || !(access instanceof ChunkFactsCarrier carrier)) return;
         ChunkKey key = new ChunkKey(level.dimension(), chunk.getPos().toLong());
         LoadedChunk previous = loadedChunks.remove(key);
@@ -211,8 +271,11 @@ public final class TopologyService {
         loadedChunks.put(key, loaded);
 
         ChunkFactsState carrierState = carrier.acceleratedNavigation$factsState();
-        carrierState.beginTracking();
+        carrierState.beginTracking(this);
         Map<Integer, TopologyStore.SectionRecord> generated = carrierState.drainGeneratedFacts();
+        for (LevelChunkSection section : chunk.getSections()) {
+            ((GenerationSection) section).acceleratedNavigation$bind(null, 0);
+        }
         Map<Integer, Long> versions = carrierState.versions();
         List<Integer> nonAir = new ArrayList<>();
         LevelChunkSection[] sections = chunk.getSections();
@@ -236,7 +299,6 @@ public final class TopologyService {
             loadedSections.put(sectionKey, section);
             loaded.sections.add(section);
             if (initial != null) {
-                publishFull(section, initial.facts());
                 writeFull(section, initial.facts());
             } else if (allAir) {
                 publishFull(section, BaseClusterTopology.PackedFacts.allAir());
@@ -273,18 +335,15 @@ public final class TopologyService {
     }
 
     private void readPersisted(LoadedSection section) {
-        if (stopping || section.readInFlight || recoveryQueued(section)
+        if (!isAvailable() || section.readInFlight || recoveryQueued(section)
                 || section.recoveryFailed) return;
-        if (section.persistencePendingVersion >= 0L || hasUncommittedChanges(section)) {
-            section.readRetryPending = true;
-            return;
-        }
+        if (section.persistenceUnavailable) return;
+        if (hasUncommittedChanges(section) || section.persistencePending) return;
         if (store == null) {
             registerRecovery(section);
             return;
         }
         section.readInFlight = true;
-        section.readRetryPending = false;
         long identity = section.chunk.identity;
         long requestedVersion = section.version;
         long readRequest = ++section.readRequest;
@@ -292,14 +351,11 @@ public final class TopologyService {
             store.read(section.key.dimension(), section.key.section())
                     .whenComplete((result, failure) -> queueServer(() -> {
                         LoadedSection current = current(section.key, identity);
-                        if (current == null || stopping
+                        if (current == null || !isAvailable()
                                 || current.readRequest != readRequest) return;
                         current.readInFlight = false;
                         if (current.version != requestedVersion
-                                || hasUncommittedChanges(current)) {
-                            retryPersistedRead(current);
-                            return;
-                        }
+                                || hasUncommittedChanges(current)) return;
                         if (failure == null && result != null
                                 && result.status() == TopologyStore.ReadStatus.FOUND
                                 && result.record().version() == requestedVersion) {
@@ -309,28 +365,13 @@ public final class TopologyService {
         } catch (RuntimeException failure) {
             queueServer(() -> {
                 LoadedSection current = current(section.key, identity);
-                if (current == null || stopping
+                if (current == null || !isAvailable()
                         || current.readRequest != readRequest) return;
                 current.readInFlight = false;
-                if (current.version != requestedVersion
-                        || hasUncommittedChanges(current)) retryPersistedRead(current);
-                else registerRecovery(current);
+                if (current.version == requestedVersion
+                        && !hasUncommittedChanges(current)) registerRecovery(current);
             });
         }
-    }
-
-    /** Defers a replacement read until this tick's matching persistence mutation exists. */
-    private void retryPersistedRead(LoadedSection section) {
-        if (section.readInFlight) return;
-        if (hasUncommittedChanges(section) || section.persistencePendingVersion >= 0L) {
-            section.readRetryPending = true;
-            return;
-        }
-        if (section.implicitAllAirBase) {
-            publishFull(section, BaseClusterTopology.PackedFacts.allAir());
-            return;
-        }
-        readPersisted(section);
     }
 
     private boolean hasUncommittedChanges(LoadedSection section) {
@@ -340,7 +381,15 @@ public final class TopologyService {
 
     private void registerRecovery(LoadedSection section) {
         requireServerThread();
-        if (stopping || section.recoveryFailed || recoveryQueued(section)) return;
+        if (!isAvailable() || section.recoveryFailed || section.persistenceUnavailable
+                || recoveryQueued(section)) return;
+        if (section.recoveryAttempted) {
+            section.persistenceUnavailable = true;
+            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                    section.key, section.chunk.identity, section.version, section.version,
+                    TopologyWorkerRuntime.FactState.PERSISTENCE_UNAVAILABLE, null, Map.of()));
+            return;
+        }
         if (recoverySet(section).add(section.key)) {
             highestQueuedRecoveries = Math.max(highestQueuedRecoveries,
                     foregroundRecovery.size() + ordinaryRecovery.size());
@@ -362,7 +411,7 @@ public final class TopologyService {
                                    int delta) {
         boolean schedule = false;
         synchronized (factDemandLock) {
-            if (stopping) return;
+            if (!isAvailable()) return;
             FactDemandKey demand = new FactDemandKey(key, loadIdentity);
             factDemandChanges.merge(demand, delta, Integer::sum);
             if (factDemandChanges.get(demand) == 0) factDemandChanges.remove(demand);
@@ -384,7 +433,7 @@ public final class TopologyService {
         }
         batch.forEach((demand, delta) -> {
             LoadedSection section = loadedSections.get(demand.key);
-            if (section == null || section.chunk.identity != demand.loadIdentity || stopping) return;
+            if (section == null || section.chunk.identity != demand.loadIdentity || !isAvailable()) return;
             int previous = section.foregroundWaiters;
             section.foregroundWaiters = previous + delta;
             if (recoveryQueued(section)
@@ -402,14 +451,14 @@ public final class TopologyService {
         });
         boolean schedule;
         synchronized (factDemandLock) {
-            schedule = !stopping && !factDemandChanges.isEmpty() && !factDemandNoticeQueued;
+            schedule = isAvailable() && !factDemandChanges.isEmpty() && !factDemandNoticeQueued;
             if (schedule) factDemandNoticeQueued = true;
         }
         if (schedule) queueServer(this::drainFactDemandChanges);
     }
 
     private void queueRecoveryNotice() {
-        if (stopping || recoveryNoticeQueued
+        if (!isAvailable() || recoveryNoticeQueued
                 || foregroundRecovery.isEmpty() && ordinaryRecovery.isEmpty()) return;
         recoveryNoticeQueued = true;
         queueServer(this::runOneRecovery);
@@ -417,7 +466,7 @@ public final class TopologyService {
 
     private void runOneRecovery() {
         requireServerThread();
-        if (stopping) return;
+        if (!isAvailable()) return;
         // A worker demand can reach the server mailbox after the recovery notice
         // was queued. Apply that mailbox before choosing ordinary recovery so a
         // waiting query is visible to the strict foreground ordering.
@@ -447,6 +496,7 @@ public final class TopologyService {
             return;
         }
         try {
+            section.recoveryAttempted = true;
             RecoveryResult recovered = scanSection(section);
             if (recovered.firstFailure != null) {
                 AcceleratedNavigation.LOGGER.warn(
@@ -458,7 +508,6 @@ public final class TopologyService {
             changedSections.remove(section);
             section.changeOriginalVersion = -1L;
             section.changedTick = Long.MIN_VALUE;
-            publishFull(section, recovered.facts);
             writeFull(section, recovered.facts);
             recoveredSections++;
             degradedRecoveryCells += recovered.degradedCount;
@@ -543,10 +592,10 @@ public final class TopologyService {
                         collides = true;
                     } else try {
                         int classified = collisionBit(fullCells, cell)
-                                || enclosedByFullCells(x, y, z, fullCells)
+                                || !state.getBlock().hasDynamicShape()
+                                && enclosedByFullCells(x, y, z, fullCells)
                                 ? (fluid ? BaseClusterTopology.FLUID : 0) | COLLIDES
-                                : collisionClassification(
-                                        section.chunk.chunk, cursor, state, true);
+                                : collisionClassification(state, true);
                         flags = classified & FACT_MASK;
                         collides = (classified & COLLIDES) != 0;
                     } catch (RuntimeException failure) {
@@ -597,7 +646,7 @@ public final class TopologyService {
                                     long before,
                                     long after) {
         requireServerThread();
-        if (stopping || before == after) return;
+        if (!isAvailable() || before == after) return;
         recordCellChange(level, chunk, position,
                 (byte) (before & FACT_MASK), (byte) (after & FACT_MASK));
         if ((before & HAS_ABOVE) != 0L && (after & HAS_ABOVE) != 0L) {
@@ -612,7 +661,7 @@ public final class TopologyService {
                                   BlockPos position,
                                   byte before,
                                   byte after) {
-        if (stopping || before == after) return;
+        if (!isAvailable() || before == after) return;
         TopologyWorkerRuntime.ClusterKey key = new TopologyWorkerRuntime.ClusterKey(
                 level.dimension(), SectionPos.of(position));
         LoadedSection section = loadedSections.get(key);
@@ -637,6 +686,13 @@ public final class TopologyService {
     private void finishTick() {
         requireServerThread();
         if (stopped) return;
+        if (unsupportedThreading.get()) {
+            beginStopping();
+            drainPersistence();
+            if (runtime.factsSettled() && persistenceCallbacks.isEmpty()) runtime.finishFactClosing();
+            return;
+        }
+        drainPersistence();
         List<LoadedSection> changed = List.copyOf(changedSections);
         changedSections.clear();
         for (LoadedSection section : changed) {
@@ -647,98 +703,121 @@ public final class TopologyService {
             long targetVersion = section.version;
             section.changeOriginalVersion = -1L;
             section.changedTick = Long.MIN_VALUE;
+            section.implicitAllAirBase = false;
+            section.readRequest++;
+            section.readInFlight = false;
+            section.persistencePending = true;
             runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                     section.key, section.chunk.identity, original, targetVersion,
                     TopologyWorkerRuntime.FactState.AVAILABLE, null, changes));
-            if (section.implicitAllAirBase) {
-                section.implicitAllAirBase = false;
-                if (store != null) {
-                    writeFull(section, BaseClusterTopology.PackedFacts.allAir()
-                            .withChanges(changes));
-                }
-            } else if (store != null) {
-                TopologyStore.SectionDelta delta = new TopologyStore.SectionDelta(
-                        original, targetVersion, changes);
-                section.persistencePendingVersion = targetVersion;
-                try {
-                    store.mergeDelta(section.key.dimension(), section.key.section(), delta)
-                            .whenComplete((result, failure) -> queueServer(() ->
-                                    completePersistence(section.key, section.chunk.identity,
-                                            targetVersion, true, result, failure)));
-                } catch (RuntimeException failure) {
-                    completePersistence(section.key, section.chunk.identity,
-                            targetVersion, true, null, failure);
-                }
-            }
-            if (section.readRetryPending) {
-                section.readRetryPending = false;
-                retryPersistedRead(section);
-            }
         }
         runtime.endServerTick();
     }
 
     private void publishPending(LoadedSection section) {
+        if (!isAvailable()) return;
         runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                 section.key, section.chunk.identity, section.version, section.version,
                 TopologyWorkerRuntime.FactState.PENDING, null, Map.of()));
     }
 
     private void publishFull(LoadedSection section, BaseClusterTopology.PackedFacts facts) {
+        if (!isAvailable()) return;
         runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                 section.key, section.chunk.identity, section.version, section.version,
                 TopologyWorkerRuntime.FactState.AVAILABLE, facts, Map.of()));
     }
 
     private void writeFull(LoadedSection section, BaseClusterTopology.PackedFacts facts) {
-        if (store == null) return;
-        long version = section.version;
-        section.persistencePendingVersion = version;
-        boolean retained = runtime.retainFactsForPersistence(
-                section.key, section.chunk.identity, version, facts);
+        if (!isAvailable()) return;
+        section.persistencePending = true;
+        runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                section.key, section.chunk.identity, section.version, section.version,
+                TopologyWorkerRuntime.FactState.AVAILABLE, facts, Map.of(), true));
+    }
+
+    private void persistDecision(TopologyWorkerRuntime.FactDecision decision) {
+        requireServerThread();
+        LoadedSection section = current(decision.key(), decision.loadIdentity());
+        if (section == null || stopped || unsupportedThreading.get()) {
+            runtime.completeFacts(decision, decision.facts() != null, false);
+            return;
+        }
+        // A lower target may still own the baseline for the current merged tail.
+        if (decision.version() > section.version) {
+            throw new IllegalStateException("facts decision is ahead of its world version");
+        }
+        if (store == null) {
+            completePersistence(decision, decision.facts() != null, false);
+            return;
+        }
         try {
-            store.writeFull(section.key.dimension(), section.key.section(), version, facts)
-                    .whenComplete((result, failure) -> {
-                        if (retained) runtime.releaseFactsForPersistence(section.key, facts);
-                        queueServer(() -> completePersistence(section.key, section.chunk.identity,
-                                version, false, result, failure));
-                    });
+            TopologyStore.WriteReceipt receipt = store.accept(decision);
+            runtime.acceptFacts(decision);
+            receipt.formed.whenComplete((formation, failure) -> {
+                if (formation == null || formation.facts() == null) return;
+                runtime.factsFormed(decision, formation.facts()).whenComplete(
+                        (pinned, pinFailure) -> {
+                            if (pinFailure == null && Boolean.TRUE.equals(pinned)) store.continueWrite(receipt);
+                            else store.rejectWrite(receipt);
+                        });
+            });
+            receipt.completed.whenComplete((result, failure) -> {
+                TopologyStore.Formation formation = receipt.formed.getNow(null);
+                boolean formed = formation != null && formation.facts() != null;
+                boolean written = failure == null && result != null && result.accepted();
+                if (!queuePersistence(() -> completePersistence(decision, formed, written))) {
+                    runtime.completeFacts(decision, formed, written);
+                }
+            });
         } catch (RuntimeException failure) {
-            if (retained) runtime.releaseFactsForPersistence(section.key, facts);
-            completePersistence(section.key, section.chunk.identity,
-                    version, false, null, failure);
+            AcceleratedNavigation.LOGGER.warn("Could not accept macro facts for {}", decision.key(), failure);
+            completePersistence(decision, decision.facts() != null, false);
         }
     }
 
-    private void completePersistence(TopologyWorkerRuntime.ClusterKey key,
-                                     long loadIdentity,
-                                     long version,
-                                     boolean deltaPersistence,
-                                     @Nullable TopologyStore.UpdateResult result,
-                                     @Nullable Throwable failure) {
+    private void completePersistence(TopologyWorkerRuntime.FactDecision decision,
+                                     boolean formed, boolean written) {
         requireServerThread();
-        LoadedSection section = current(key, loadIdentity);
-        if (section == null || stopping) return;
-        if (section.persistencePendingVersion == version) {
-            section.persistencePendingVersion = -1L;
+        runtime.completeFacts(decision, formed, written).thenAccept(applied -> {
+            if (applied) queuePersistence(() -> persistenceApplied(decision, formed, written));
+        });
+    }
+
+    private void persistenceApplied(TopologyWorkerRuntime.FactDecision decision,
+                                    boolean formed, boolean written) {
+        requireServerThread();
+        LoadedSection section = current(decision.key(), decision.loadIdentity());
+        if (section != null && !unsupportedThreading.get()) {
+            if (section.version == decision.version()) section.persistencePending = false;
+            if (formed && !written) section.persistenceUnavailable = true;
+            if (written && section.version == decision.version()) section.persistenceUnavailable = false;
+            if (!formed && !written) registerRecovery(section);
         }
-        if (!deltaPersistence && section.version == version) {
-            section.readRetryPending = false;
+    }
+
+    private void queueFactDecision(TopologyWorkerRuntime.FactDecision decision) {
+        if (!queuePersistence(() -> persistDecision(decision))) {
+            runtime.completeFacts(decision, decision.facts() != null, false);
         }
-        boolean accepted = failure == null && result != null && result.accepted();
-        if (!accepted) {
-            Throwable cause = failure != null ? failure : result == null ? null : result.failure();
-            AcceleratedNavigation.LOGGER.warn("Could not persist macro facts for {}", key, cause);
-            if (deltaPersistence && section.version == version
-                    && section.persistencePendingVersion < 0L) {
-                registerRecovery(section);
-            }
+    }
+
+    private boolean queuePersistence(Runnable action) {
+        synchronized (persistenceCallbacks) {
+            if (stopped) return false;
+            persistenceCallbacks.add(action);
         }
-        if (section.readRetryPending && section.persistencePendingVersion < 0L
-                && section.version == version && !recoveryQueued(section)
-                && !section.recoveryFailed) {
-            section.readRetryPending = false;
-            retryPersistedRead(section);
+        if (persistenceNoticeQueued.compareAndSet(false, true)) queueServer(this::drainPersistence);
+        return true;
+    }
+
+    private void drainPersistence() {
+        requireServerThread();
+        Runnable action;
+        while ((action = persistenceCallbacks.poll()) != null) action.run();
+        persistenceNoticeQueued.set(false);
+        if (!persistenceCallbacks.isEmpty() && persistenceNoticeQueued.compareAndSet(false, true)) {
+            queueServer(this::drainPersistence);
         }
     }
 
@@ -751,7 +830,7 @@ public final class TopologyService {
     private void beginStopping() {
         requireServerThread();
         if (stopping) return;
-        finishTick();
+        if (!unsupportedThreading.get()) finishTick();
         stopping = true;
         foregroundRecovery.clear();
         ordinaryRecovery.clear();
@@ -761,24 +840,46 @@ public final class TopologyService {
             factDemandChanges.clear();
             factDemandNoticeQueued = false;
         }
-        for (MacroRequest request : List.copyOf(macroRequests.values())) request.cancelOnServer();
+        for (MacroRequest request : List.copyOf(macroRequests.values())) {
+            if (unsupportedThreading.get()) request.rejectUnsupportedThreading();
+            else request.cancelOnServer();
+        }
         macroRequests.clear();
-        loadedChunks.values().forEach(loaded ->
-                loaded.carrier.acceleratedNavigation$factsState().endTracking());
+        loadedChunks.values().forEach(loaded -> {
+            ChunkFactsState state = loaded.carrier.acceleratedNavigation$factsState();
+            if (unsupportedThreading.get()) state.loadedVersions(Map.of(), false);
+            state.endTracking();
+        });
         runtime.beginStopping();
+        if (unsupportedThreading.get()) {
+            loadedSections.clear();
+            loadedChunks.clear();
+        }
     }
 
     private void finishStopping() {
         requireServerThread();
         beginStopping();
         if (stopped) return;
-        stopped = true;
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WORKER_CLOSE_WAIT_MILLIS);
+        while (true) {
+            drainPersistence();
+            if (runtime.factsSettled() && persistenceCallbacks.isEmpty()) break;
+            if (System.nanoTime() >= deadline) {
+                AcceleratedNavigation.LOGGER.error("Timed out settling final macro facts transfers");
+                break;
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+        }
+        if (store != null) store.close();
+        drainPersistence();
+        synchronized (persistenceCallbacks) { stopped = true; }
+        drainPersistence();
         if (!runtime.awaitStopped(WORKER_CLOSE_WAIT_MILLIS, TimeUnit.MILLISECONDS)) {
             AcceleratedNavigation.LOGGER.error(
                     "Timed out while closing macro topology workers after {} ms",
                     WORKER_CLOSE_WAIT_MILLIS);
         }
-        if (store != null) store.close();
         loadedSections.clear();
         loadedChunks.clear();
         AcceleratedNavigation.LOGGER.info("Accelerated navigation topology summary: {}", metrics());
@@ -828,7 +929,12 @@ public final class TopologyService {
         if (stamps.isEmpty()) return false;
         for (TopologyWorkerRuntime.SectionStamp stamp : stamps) {
             LoadedSection section = loadedSections.get(stamp.key());
-            if (!stamp.current() || section == null
+            if (!stamp.current()) return false;
+            if (stamp.absent()) {
+                if (section != null) return false;
+                continue;
+            }
+            if (section == null
                     || section.chunk.identity != stamp.loadIdentity()
                     || section.version != stamp.version()) return false;
         }
@@ -869,6 +975,10 @@ public final class TopologyService {
 
         private void submit() {
             requireServerThread();
+            if (unsupportedThreading.get()) {
+                rejectUnsupportedThreading();
+                return;
+            }
             try {
                 workerRequest = runtime.requestMacroQuery(key.dimension(), start, goal,
                         channel, profile, priority);
@@ -883,6 +993,10 @@ public final class TopologyService {
                                     @Nullable Throwable requestFailure) {
             requireServerThread();
             if (!active) return;
+            if (unsupportedThreading.get()) {
+                rejectUnsupportedThreading();
+                return;
+            }
             if (requestFailure != null) {
                 finishExceptionally(requestFailure);
                 return;
@@ -891,8 +1005,14 @@ public final class TopologyService {
                 finishExceptionally(new IllegalStateException("topology worker returned no result"));
                 return;
             }
-            boolean rejectedByFinalValidation = result.corridor() != null
+            boolean rejectedByFinalValidation = (result.corridor() != null || !result.stamps().isEmpty())
+                    && result.progress().failure() != MacroSearch.Failure.STALE_WORLD
+                    && result.progress().failure() != MacroSearch.Failure.CANCELLED
                     && !resultCurrent(result.stamps());
+            if (unsupportedThreading.get()) {
+                rejectUnsupportedThreading();
+                return;
+            }
             if (rejectedByFinalValidation) {
                 finalValidationRejections++;
                 progress = result.progress().withOutcome(ResumableSearch.Status.FAILED,
@@ -928,6 +1048,12 @@ public final class TopologyService {
             future.completeExceptionally(requestFailure);
         }
 
+        private void rejectUnsupportedThreading() {
+            if (!active) return;
+            if (workerRequest != null) workerRequest.cancel();
+            finishExceptionally(unsupportedThreadFailure());
+        }
+
         private void cancelOnServer() {
             requireServerThread();
             if (!active) return;
@@ -952,9 +1078,9 @@ public final class TopologyService {
         Objects.requireNonNull(getter, "getter");
         Objects.requireNonNull(position, "position");
         BlockState current = getter.getBlockState(position);
-        int currentCollision = collisionClassification(getter, position, current);
+        int currentCollision = collisionClassification(current, false);
         int belowCollision = (position.getY() & 15) == 0 ? 0 : collisionClassification(
-                getter, position.below(), getter.getBlockState(position.below()));
+                getter.getBlockState(position.below()), false);
         int currentFlags = addSupport(
                 currentCollision, (belowCollision & COLLIDES) != 0);
         if (position.getY() + 1 >= getter.getMaxBuildHeight()) {
@@ -962,7 +1088,7 @@ public final class TopologyService {
         }
         BlockPos abovePosition = position.above();
         int aboveCollision = collisionClassification(
-                getter, abovePosition, getter.getBlockState(abovePosition));
+                getter.getBlockState(abovePosition), false);
         int aboveFlags = addSupport(aboveCollision,
                 (abovePosition.getY() & 15) != 0 && (currentCollision & COLLIDES) != 0);
         return (currentFlags & FACT_MASK)
@@ -977,15 +1103,7 @@ public final class TopologyService {
         return flags;
     }
 
-    private static int collisionClassification(BlockGetter getter,
-                                               BlockPos position,
-                                               BlockState state) {
-        return collisionClassification(getter, position, state, false);
-    }
-
-    private static int collisionClassification(BlockGetter getter,
-                                                BlockPos position,
-                                                BlockState state,
+    private static int collisionClassification(BlockState state,
                                                 boolean staticFullChecked) {
         boolean fluid = !state.getFluidState().isEmpty();
         int flags = fluid ? BaseClusterTopology.FLUID : 0;
@@ -993,16 +1111,17 @@ public final class TopologyService {
             return flags | BaseClusterTopology.VOLUME_OPEN
                     | BaseClusterTopology.GROUND_OPEN;
         }
-        boolean dynamic = state.getBlock().hasDynamicShape();
-        if (!dynamic && !staticFullChecked && state.isCollisionShapeFullBlock(
+        if (state.getBlock().hasDynamicShape()) {
+            return flags | BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
+                    | BaseClusterTopology.EXACT_REQUIRED | COLLIDES;
+        }
+        if (!staticFullChecked && state.isCollisionShapeFullBlock(
                 EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) return flags | COLLIDES;
-        VoxelShape shape = state.getCollisionShape(
-                dynamic ? getter : EmptyBlockGetter.INSTANCE,
-                dynamic ? position : BlockPos.ZERO);
+        VoxelShape shape = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         if (Block.isShapeFullBlock(shape)) return flags | COLLIDES;
         flags |= BaseClusterTopology.VOLUME_OPEN;
         if (!shape.isEmpty() || fluid) flags |= BaseClusterTopology.GROUND_OPEN;
-        if (dynamic || !shape.isEmpty()) flags |= BaseClusterTopology.EXACT_REQUIRED;
+        if (!shape.isEmpty()) flags |= BaseClusterTopology.EXACT_REQUIRED;
         return flags | (shape.isEmpty() ? 0 : COLLIDES);
     }
 
@@ -1010,32 +1129,58 @@ public final class TopologyService {
         ChunkFactsState acceleratedNavigation$factsState();
     }
 
+    public interface GenerationSection {
+        void acceleratedNavigation$bind(@Nullable ChunkAccess owner, int sectionY);
+    }
+
+    public static void bindGeneration(ChunkAccess chunk) {
+        ChunkFactsState state = ((ChunkFactsCarrier) chunk).acceleratedNavigation$factsState();
+        state.initializeGeneration(chunk);
+        LevelChunkSection[] sections = chunk.getSections();
+        for (int index = 0; index < sections.length; index++) {
+            ((GenerationSection) sections[index]).acceleratedNavigation$bind(
+                    state.consumer != null ? null : chunk, chunk.getSectionYFromSectionIndex(index));
+        }
+    }
+
     /** Per-chunk generation/version state; it never mirrors the global facts cache. */
     public static final class ChunkFactsState {
         private final Map<Integer, Long> versions = new HashMap<>();
         private final Map<Integer, byte[]> generatedCells = new HashMap<>();
+        private final Set<Integer> incompleteSections = new java.util.HashSet<>();
+        private boolean generationInitialized;
         private boolean loadedFromDisk;
         private boolean versionTagValid = true;
-        private volatile boolean tracking;
+        @Nullable
+        private volatile TopologyService consumer;
 
-        public synchronized boolean recordsGeneration() {
-            return !loadedFromDisk;
+        private synchronized void initializeGeneration(ChunkAccess chunk) {
+            if (generationInitialized) return;
+            generationInitialized = true;
+            LevelChunkSection[] sections = chunk.getSections();
+            for (int index = 0; index < sections.length; index++) {
+                if (!sections[index].hasOnlyAir()) {
+                    incompleteSections.add(chunk.getSectionYFromSectionIndex(index));
+                }
+            }
         }
 
-        synchronized void beginTracking() {
-            tracking = true;
+        synchronized void beginTracking(TopologyService service) {
+            consumer = service;
         }
 
         synchronized void endTracking() {
-            tracking = false;
+            consumer = null;
         }
 
-        boolean tracking() {
-            return tracking;
-        }
-
-        public synchronized void recordGeneratedColumn(BlockPos position, long sampled) {
-            if (loadedFromDisk) return;
+        public synchronized void recordGeneratedWrite(BlockGetter chunk, BlockPos position) {
+            if (consumer != null) return;
+            int sectionY = position.getY() >> 4;
+            if (loadedFromDisk || incompleteSections.contains(sectionY)) {
+                versions.remove(sectionY);
+                return;
+            }
+            long sampled = sampleColumnFacts(chunk, position);
             recordGeneratedCell(position, (byte) (sampled & FACT_MASK));
             if ((sampled & HAS_ABOVE) != 0L) {
                 recordGeneratedCell(position.above(),
@@ -1045,6 +1190,7 @@ public final class TopologyService {
 
         private void recordGeneratedCell(BlockPos position, byte flags) {
             int sectionY = position.getY() >> 4;
+            if (incompleteSections.contains(sectionY)) return;
             byte[] cells = generatedCells.computeIfAbsent(sectionY, ignored -> {
                 byte[] created = new byte[BaseClusterTopology.CELL_COUNT];
                 Arrays.fill(created, (byte) BaseClusterTopology.VOLUME_OPEN);
@@ -1061,6 +1207,7 @@ public final class TopologyService {
             versions.clear();
             versions.putAll(Objects.requireNonNull(loaded, "loaded"));
             generatedCells.clear();
+            incompleteSections.clear();
             loadedFromDisk = true;
             versionTagValid = valid;
         }
@@ -1120,12 +1267,13 @@ public final class TopologyService {
         private long version;
         private long changedTick = Long.MIN_VALUE;
         private long changeOriginalVersion = -1L;
-        private long persistencePendingVersion = -1L;
+        private boolean persistencePending;
+        private boolean persistenceUnavailable;
         private int foregroundWaiters;
         private long readRequest;
         private boolean readInFlight;
-        private boolean readRetryPending;
         private boolean recoveryFailed;
+        private boolean recoveryAttempted;
         private boolean implicitAllAirBase;
 
         private LoadedSection(TopologyWorkerRuntime.ClusterKey key,
@@ -1209,14 +1357,22 @@ public final class TopologyService {
                          long automaticStaleRetries,
                          long staleRetryExhaustions,
                          EventMetrics events,
-                         TaskMetrics tasks) {
+                          TaskMetrics tasks,
+                          FactRetention facts) {
         WorkerMetrics {
             Objects.requireNonNull(baseCache, "baseCache");
             Objects.requireNonNull(parentCache, "parentCache");
             Objects.requireNonNull(corridorCache, "corridorCache");
             Objects.requireNonNull(events, "events");
             Objects.requireNonNull(tasks, "tasks");
+            Objects.requireNonNull(facts, "facts");
         }
+    }
+
+    record FactRetention(int transfers, int mergedSections, int mergedCells,
+                         int executingDeltaCells, long activeFactsBytes, long sectionIndexBytes) {
+        long mergedEstimatedBytes() { return mergedSections * 64L + mergedCells * 32L; }
+        long executingInputEstimatedBytes() { return transfers * 96L + executingDeltaCells * 32L; }
     }
 
     record EventMetrics(int pendingKeys,
@@ -1254,7 +1410,8 @@ public final class TopologyService {
                               long flushes,
                               long flushFailures,
                               boolean accepting,
-                              boolean closing) {
+                              boolean closing,
+                              int acceptedWrites) {
     }
 
     private record Metrics(int loadedChunks,

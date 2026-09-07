@@ -161,6 +161,37 @@ class BaseClusterTopologyTest {
         assertFalse(new BaseClusterTopology.MovementKey(0, 0, 0).capabilityMask() == 0L);
     }
 
+    @Test
+    void componentBoundsRejectUnrelatedSectionsAndRespectVerticalCapability() {
+        byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
+        java.util.Arrays.fill(cells, (byte) BaseClusterTopology.VOLUME_OPEN);
+        for (int x = 4; x <= 10; x++) cells[BaseClusterTopology.cellIndex(x, 6, 7)] |= BaseClusterTopology.GROUND_OPEN;
+        cells[BaseClusterTopology.cellIndex(14, 15, 8)] |= BaseClusterTopology.GROUND_OPEN;
+        cells[BaseClusterTopology.cellIndex(15, 15, 8)] |= BaseClusterTopology.GROUND_OPEN;
+        SectionPos section = SectionPos.of(-5, -3, 7);
+        BaseClusterTopology topology = build(section, BaseClusterTopology.PackedFacts.fromCells(cells),
+                BaseClusterTopology.Channel.GROUND, false);
+        BaseClusterTopology.MovementKey full = new BaseClusterTopology.MovementKey(1, 2, 4);
+        int inner = topology.componentAt(4, 6, 7);
+        int upperEdge = topology.componentAt(14, 15, 8);
+        assertTrue(inner >= 0 && upperEdge >= 0);
+        assertEquals(inner, topology.componentAt(10, 6, 7));
+        assertEquals(upperEdge, topology.componentAt(15, 15, 8));
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    assertFalse(topology.mayExit(inner, SectionPos.of(section.x() + dx,
+                            section.y() + dy, section.z() + dz), full));
+                }
+            }
+        }
+        assertTrue(topology.mayExit(upperEdge, SectionPos.of(-4, -3, 7), full));
+        assertTrue(topology.mayExit(upperEdge, SectionPos.of(-5, -2, 7), full));
+        assertFalse(topology.mayExit(upperEdge, SectionPos.of(-5, -2, 7),
+                new BaseClusterTopology.MovementKey(0, 2, 4)));
+        assertFalse(topology.mayExit(upperEdge, SectionPos.of(-4, -3, 8), full));
+    }
+
     private static BaseClusterTopology build(SectionPos section,
                                                 BaseClusterTopology.PackedFacts snapshot,
                                                BaseClusterTopology.Channel channel,

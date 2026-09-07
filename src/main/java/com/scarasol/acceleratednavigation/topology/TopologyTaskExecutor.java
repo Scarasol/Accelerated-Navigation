@@ -73,22 +73,25 @@ final class TopologyTaskExecutor {
         Objects.requireNonNull(command, "command");
         synchronized (monitor) {
             ensureAccepting();
-            if (controlTask != null && controlTask.state != TaskState.DONE) {
-                if (controlTask.state == TaskState.RUNNING
-                        && controlTask.nextCommand == null) {
-                    controlTask.nextPriority = NavigationScheduler.Priority.PLAYER_PURSUIT;
-                    controlTask.nextKind = WorkKind.CONTROL;
-                    controlTask.nextCommand = command;
-                }
-                return controlTask;
-            }
-            Task task = new Task(++sequence, NavigationScheduler.Priority.PLAYER_PURSUIT,
-                    WorkKind.CONTROL, command, System.nanoTime());
-            controlTask = task;
-            queue(task);
-            monitor.notifyAll();
-            return task;
+            return queueControlLocked(command);
         }
+    }
+
+    private TaskHandle queueControlLocked(Runnable command) {
+        if (controlTask != null && controlTask.state != TaskState.DONE) {
+            if (controlTask.state == TaskState.RUNNING && controlTask.nextCommand == null) {
+                controlTask.nextPriority = NavigationScheduler.Priority.PLAYER_PURSUIT;
+                controlTask.nextKind = WorkKind.CONTROL;
+                controlTask.nextCommand = command;
+            }
+            return controlTask;
+        }
+        Task task = new Task(++sequence, NavigationScheduler.Priority.PLAYER_PURSUIT,
+                WorkKind.CONTROL, command, System.nanoTime());
+        controlTask = task;
+        queue(task);
+        monitor.notifyAll();
+        return task;
     }
 
     private TaskHandle submit(NavigationScheduler.Priority priority,
@@ -120,6 +123,15 @@ final class TopologyTaskExecutor {
             accepting = false;
             cancelQueuedTasks();
             monitor.notifyAll();
+        }
+    }
+
+    /** Preserve the final state-consumption notice when ordinary submission was rejected. */
+    void shutdown(Runnable finalControl) {
+        Objects.requireNonNull(finalControl, "finalControl");
+        synchronized (monitor) {
+            queueControlLocked(finalControl);
+            shutdown();
         }
     }
 
@@ -225,7 +237,7 @@ final class TopologyTaskExecutor {
         leaveRunning(task);
         completedByKind[task.kind.ordinal()]++;
         if (failed) failedByKind[task.kind.ordinal()]++;
-        if (task.nextCommand != null && accepting) {
+        if (task.nextCommand != null && (accepting || task.nextKind == WorkKind.CONTROL)) {
             task.command = task.nextCommand;
             task.priority = task.nextPriority;
             task.kind = task.nextKind;

@@ -72,11 +72,23 @@ final class TopologyWorkerRuntime {
 
     private final TopologyTaskExecutor taskExecutor;
     private final FactDemandListener factDemandListener;
+    private final Consumer<FactDecision> factDecisionListener;
+    private final Map<FactDecision, PersistenceHold> persistenceHolds = new HashMap<>();
+    private final IdentityHashMap<BaseClusterTopology.PackedFacts, FactReferences> factReferences =
+            new IdentityHashMap<>();
+    private long activeFactBytes;
+    private int mergedFactSections;
+    private int mergedFactCells;
+    private int executingDeltaCells;
+    private long nextFactDecision;
     private final AtomicBoolean prewarmAllowed = new AtomicBoolean(true);
     private final Object runtimeLock = new Object();
     private final ThreadLocal<List<Runnable>> afterRuntimeLock = new ThreadLocal<>();
     private Map<ClusterKey, SectionEvent> pendingSectionEvents = new HashMap<>();
     private Map<ClusterKey, SectionEvent> processingSectionEvents = Map.of();
+    private Map<FactDecision, FactFeedback> pendingFactFeedback = new HashMap<>();
+    private boolean factClosingPending;
+    private boolean factClosingFinished;
     private Map<ChunkKey, Long> pendingChunkUnloads = new HashMap<>();
     private final IdentityHashMap<MacroRequest, RequestEvent> pendingRequestEvents =
             new IdentityHashMap<>();
@@ -152,8 +164,10 @@ final class TopologyWorkerRuntime {
     private long completedCorridorBytes;
     private boolean eventBatchActive;
 
-    TopologyWorkerRuntime(FactDemandListener factDemandListener) {
+    TopologyWorkerRuntime(FactDemandListener factDemandListener,
+                          Consumer<FactDecision> factDecisionListener) {
         this.factDemandListener = Objects.requireNonNull(factDemandListener, "factDemandListener");
+        this.factDecisionListener = Objects.requireNonNull(factDecisionListener, "factDecisionListener");
         this.taskExecutor = new TopologyTaskExecutor(prewarmAllowed::get);
     }
 
@@ -205,19 +219,25 @@ final class TopologyWorkerRuntime {
                             completedEventBatches, failedEventBatches,
                             longestEventWaitNanos, longestEventBatchNanos,
                             eventTaskOutstanding, eventBatchActive),
-                    tasks
+                    tasks,
+                    new TopologyService.FactRetention(persistenceHolds.size(), mergedFactSections,
+                            mergedFactCells, executingDeltaCells, activeFactBytes,
+                            clusters.size() * 128L)
             );
         }
     }
 
     private int pendingEventKeyCount() {
         return pendingSectionEvents.size() + pendingChunkUnloads.size()
+                + pendingFactFeedback.size() + (factClosingPending ? 1 : 0)
                 + pendingRequestEvents.size() + (tickPending ? 1 : 0)
                 + (stopEventPending ? 1 : 0);
     }
 
     private long pendingEventEstimatedBytes() {
         return pendingSectionEvents.size() * SECTION_EVENT_METADATA_BYTES
+                + pendingFactFeedback.size() * SECTION_EVENT_METADATA_BYTES
+                + (factClosingPending ? FLAG_EVENT_METADATA_BYTES : 0L)
                 + pendingSectionChangeCells * SECTION_CHANGE_METADATA_BYTES
                 + pendingChunkUnloads.size() * SIMPLE_EVENT_METADATA_BYTES
                 + pendingRequestEvents.size() * SIMPLE_EVENT_METADATA_BYTES
@@ -382,7 +402,7 @@ final class TopologyWorkerRuntime {
             if (--pendingExecutorSubmissions < 0) {
                 throw new IllegalStateException("executor submission count became negative");
             }
-            if (closed && pendingExecutorSubmissions == 0) {
+            if (factClosingFinished && pendingExecutorSubmissions == 0) {
                 afterRuntimeLock(taskExecutor::shutdown);
             }
         }
@@ -432,6 +452,12 @@ final class TopologyWorkerRuntime {
             if (closed || stopRequested) return;
             ClusterEntry entry = clusters.computeIfAbsent(event.key(), ClusterEntry::new);
             LatestFacts latest = entry.latest.get();
+            if (latest.loadIdentity() == event.loadIdentity()
+                    && latest.state() == FactState.PERSISTENCE_UNAVAILABLE
+                    && event.state() != FactState.UNLOADED) {
+                event = new SectionEvent(event.key(), event.loadIdentity(), event.previousVersion(),
+                        event.version(), FactState.PERSISTENCE_UNAVAILABLE, null, Map.of());
+            }
             if (latest.loadIdentity() > event.loadIdentity()
                     || latest.loadIdentity() == event.loadIdentity()
                     && (latest.revision() > event.version()
@@ -439,8 +465,7 @@ final class TopologyWorkerRuntime {
                 return;
             }
             SectionEvent queued = pendingSectionEvents.get(event.key());
-            SectionEvent previous = queued != null
-                    ? queued : processingSectionEvents.get(event.key());
+            SectionEvent previous = queued;
             if (previous == null && sectionEventAlreadyApplied(entry, event)) return;
             SectionEvent merged = mergeSectionEvent(previous, event);
             if (queued == null && sameSectionEvent(previous, merged)) return;
@@ -450,7 +475,6 @@ final class TopologyWorkerRuntime {
                     || sameVersionFactsChanged(entry, merged);
             if (invalidates) {
                 entry.latest.set(merged.loadIdentity(), merged.version(), merged.state());
-                markLatestDerivedStale(event.key(), merged.state());
             }
             pendingSectionEvents.put(event.key(), merged);
             pendingSectionChangeCells += merged.changes().size()
@@ -476,6 +500,7 @@ final class TopologyWorkerRuntime {
         if (first == null || first.loadIdentity() != second.loadIdentity()
                 || first.previousVersion() != second.previousVersion()
                 || first.version() != second.version() || first.state() != second.state()
+                || first.persist() != second.persist()
                 || !first.changes().equals(second.changes())) return false;
         return first.facts() == second.facts()
                 || first.facts() != null && second.facts() != null
@@ -550,7 +575,7 @@ final class TopologyWorkerRuntime {
         changes.putAll(next.changes());
         return new SectionEvent(next.key(), next.loadIdentity(),
                 previous.previousVersion(), next.version(), FactState.AVAILABLE,
-                previous.facts(), changes);
+                previous.facts(), changes, previous.persist() || next.persist());
     }
 
     void publishChunkUnload(ResourceKey<Level> dimension,
@@ -573,14 +598,19 @@ final class TopologyWorkerRuntime {
         try {
             taskExecutor.submitControl(this::processSectionEvents);
         } catch (RejectedExecutionException ignored) {
+            boolean closing;
             synchronized (runtimeLock) {
-                eventTaskOutstanding = false;
+                closing = stopRequested && !closed;
+                eventTaskOutstanding = closing;
             }
+            if (closing) taskExecutor.shutdown(this::processSectionEvents);
         }
     }
 
     private void processSectionEvents() {
         Map<ClusterKey, SectionEvent> batch;
+        Map<FactDecision, FactFeedback> feedback;
+        boolean finishFacts;
         Map<ChunkKey, Long> chunkUnloads;
         IdentityHashMap<MacroRequest, RequestEvent> requests;
         boolean tick;
@@ -593,6 +623,10 @@ final class TopologyWorkerRuntime {
             pendingSectionEvents = new HashMap<>();
             pendingSectionChangeCells = 0;
             processingSectionEvents = batch;
+            feedback = pendingFactFeedback;
+            pendingFactFeedback = new HashMap<>();
+            finishFacts = factClosingPending;
+            factClosingPending = false;
             chunkUnloads = pendingChunkUnloads;
             pendingChunkUnloads = new HashMap<>();
             requests = new IdentityHashMap<>(pendingRequestEvents);
@@ -610,6 +644,7 @@ final class TopologyWorkerRuntime {
             batchQueuedNanos = pendingEventSinceNanos;
             pendingEventSinceNanos = 0L;
             activeEventBatchKeys = batch.size() + chunkUnloads.size() + requests.size()
+                    + feedback.size() + (finishFacts ? 1 : 0)
                     + (tick ? 1 : 0) + (stop ? 1 : 0);
             activeEventBatchEstimatedBytes = batchEstimatedBytes;
             highestEventBatchKeys = Math.max(
@@ -621,6 +656,7 @@ final class TopologyWorkerRuntime {
         try {
             if (stop) {
                 runBatchedRuntimeTransition(() -> {
+                    batch.values().forEach(this::applySectionEvent);
                     requests.forEach(this::cancelRequestEvent);
                     closeState();
                 });
@@ -639,11 +675,13 @@ final class TopologyWorkerRuntime {
                         removePrewarm(chunk.dimension(), chunk.chunkLong(), unloaded.getValue());
                     });
                 }
-                requests.forEach((request, event) ->
-                        runBatchedRuntimeTransition(() -> {
-                            applyRequestEvent(request, event);
-                            processingRequestEvents.remove(request, event);
-                        }));
+                for (Map.Entry<MacroRequest, RequestEvent> request :
+                        List.copyOf(requests.entrySet())) {
+                    runBatchedRuntimeTransition(() -> {
+                        applyRequestEvent(request.getKey(), request.getValue());
+                        processingRequestEvents.remove(request.getKey(), request.getValue());
+                    });
+                }
                 if (tick) {
                     runBatchedRuntimeTransition(() -> {
                         topologyTick++;
@@ -653,6 +691,10 @@ final class TopologyWorkerRuntime {
                     });
                 }
             }
+            for (Map.Entry<FactDecision, FactFeedback> event : feedback.entrySet()) {
+                runBatchedRuntimeTransition(() -> applyFactFeedback(event.getKey(), event.getValue()));
+            }
+            if (finishFacts) runBatchedRuntimeTransition(this::finishFactClosingState);
         } catch (VirtualMachineError | ThreadDeath fatal) {
             processingFailure = fatal;
             throw fatal;
@@ -676,6 +718,10 @@ final class TopologyWorkerRuntime {
                 failure.addSuppressed(closeFailure);
             }
         } finally {
+            if (processingFailure != null) {
+                Throwable failure = processingFailure;
+                feedback.values().forEach(event -> event.fail(failure));
+            }
             synchronized (runtimeLock) {
                 if (processingSectionEvents == batch) processingSectionEvents = Map.of();
                 if (processingRequestEvents == requests) processingRequestEvents = Map.of();
@@ -697,15 +743,18 @@ final class TopologyWorkerRuntime {
         if (!stop && processingFailure == null) {
             runRuntimeTransition(this::finishEventBatch);
         }
-        if (stop || processingFailure != null) {
+        if (processingFailure != null) {
             synchronized (runtimeLock) {
                 eventTaskOutstanding = false;
+                factClosingPending |= finishFacts && !factClosingFinished;
             }
+            scheduleEventTaskIfPending();
             return;
         }
         boolean requeue;
         synchronized (runtimeLock) {
             requeue = stopEventPending || !pendingSectionEvents.isEmpty()
+                    || !pendingFactFeedback.isEmpty() || factClosingPending
                     || !pendingChunkUnloads.isEmpty() || !pendingRequestEvents.isEmpty()
                     || tickPending;
             if (!requeue) eventTaskOutstanding = false;
@@ -728,9 +777,10 @@ final class TopologyWorkerRuntime {
         boolean schedule;
         synchronized (runtimeLock) {
             boolean pending = stopEventPending || !pendingSectionEvents.isEmpty()
+                    || !pendingFactFeedback.isEmpty() || factClosingPending
                     || !pendingChunkUnloads.isEmpty() || !pendingRequestEvents.isEmpty()
                     || tickPending;
-            schedule = pending && !eventTaskOutstanding && !closed;
+            schedule = pending && !eventTaskOutstanding && !factClosingFinished;
             if (schedule) eventTaskOutstanding = true;
         }
         if (schedule) scheduleEventTask();
@@ -749,8 +799,7 @@ final class TopologyWorkerRuntime {
         ClusterEntry entry = clusters.computeIfAbsent(event.key(), ClusterEntry::new);
         LatestFacts latest = entry.latest.get();
         if (latest.loadIdentity() != event.loadIdentity()
-                || latest.revision() != event.version()
-                || latest.state() != event.state()
+                || latest.state() == FactState.UNLOADED && event.state() != FactState.UNLOADED
                 || entry.loadIdentity > event.loadIdentity()
                 || entry.loadIdentity == event.loadIdentity()
                 && entry.revision > event.version()) {
@@ -758,6 +807,37 @@ final class TopologyWorkerRuntime {
         }
         if (!event.changes().isEmpty() && entry.loadIdentity == event.loadIdentity()
                 && entry.revision == event.version()) return;
+        if (entry.loadIdentity != event.loadIdentity() || event.state() == FactState.UNLOADED) {
+            entry.decision = null;
+            setFactTail(entry, null);
+            entry.writeRequired = false;
+            entry.baselineFailed = false;
+            entry.persistenceUnavailableVersion = -1L;
+        }
+        if (!event.changes().isEmpty()) {
+            TopologyStore.SectionDelta next = new TopologyStore.SectionDelta(
+                    event.previousVersion(), event.version(), event.changes());
+            if (entry.tail != null) {
+                if (entry.tail.newVersion() != next.originalVersion()) {
+                    throw new IllegalStateException("non-contiguous section facts: " + event.key());
+                }
+                Map<Integer, Byte> merged = new HashMap<>(entry.tail.cells());
+                merged.putAll(next.cells());
+                next = new TopologyStore.SectionDelta(
+                        entry.tail.originalVersion(), next.newVersion(), merged);
+            }
+            setFactTail(entry, next);
+        } else if (event.facts() != null) {
+            setFactTail(entry, null);
+            entry.baselineFailed = false;
+        }
+        if (event.state() == FactState.PERSISTENCE_UNAVAILABLE) {
+            entry.persistenceUnavailableVersion = event.version();
+            entry.baselineFailed = false;
+            entry.writeRequired = false;
+            setFactTail(entry, null);
+        }
+        entry.writeRequired |= event.persist();
         BaseClusterTopology.PackedFacts nextFacts = event.facts();
         FactState nextState = event.state();
         if (!event.changes().isEmpty()) {
@@ -768,7 +848,8 @@ final class TopologyWorkerRuntime {
                     && entry.facts != null) {
                 nextFacts = entry.facts.withChanges(event.changes());
             } else {
-                nextState = FactState.PENDING;
+                nextState = entry.persistenceUnavailableVersion >= 0L
+                        ? FactState.PERSISTENCE_UNAVAILABLE : FactState.PENDING;
             }
         }
         boolean identityChanged = entry.loadIdentity != event.loadIdentity()
@@ -785,6 +866,7 @@ final class TopologyWorkerRuntime {
                 && nextState == FactState.AVAILABLE && nextFacts != null;
         boolean stateChanged = entry.factState != nextState && !restoresEvictedFacts;
         if (identityChanged || factsChanged || stateChanged) {
+            markLatestDerivedStale(event.key(), nextState);
             discardDerived(event.key(), entry, event.version(), nextState);
         }
         BaseClusterTopology.PackedFacts previousFacts = entry.facts;
@@ -801,6 +883,8 @@ final class TopologyWorkerRuntime {
         } else if (identityChanged || nextState != FactState.AVAILABLE) {
             entry.factFingerprintKnown = false;
         }
+        decideFacts(entry);
+        retainPendingFacts(entry);
         if (entry.facts != null) {
             releaseUnusedFacts(entry);
         }
@@ -826,8 +910,8 @@ final class TopologyWorkerRuntime {
             TopologyDemand demand = view.demand;
             if (demand == null) continue;
             if (eventUnavailable(nextState)) {
-                failDemand(entry, demand, nextState == FactState.RECOVERY_FAILED
-                        ? new FactsRecoveryException(key)
+                failDemand(entry, demand, nextState != FactState.UNLOADED
+                        ? new FactsUnavailableException(key, nextState)
                         : new StaleTopologyException(key));
                 continue;
             }
@@ -854,7 +938,8 @@ final class TopologyWorkerRuntime {
     }
 
     private static boolean eventUnavailable(FactState state) {
-        return state == FactState.UNLOADED || state == FactState.RECOVERY_FAILED;
+        return state == FactState.UNLOADED || state == FactState.RECOVERY_FAILED
+                || state == FactState.PERSISTENCE_UNAVAILABLE;
     }
 
     private void wakeFactWaiters(ClusterEntry entry) {
@@ -882,32 +967,263 @@ final class TopologyWorkerRuntime {
         if (schedule) scheduleEventTask();
     }
 
-    boolean retainFactsForPersistence(ClusterKey key, long loadIdentity, long version,
-                                      BaseClusterTopology.PackedFacts facts) {
+    private void decideFacts(ClusterEntry entry) {
+        if (!entry.writeRequired || entry.decision != null || entry.baselineFailed
+                || entry.factState == FactState.UNLOADED
+                || entry.factState == FactState.RECOVERY_FAILED) return;
+        if (entry.facts == null && entry.persistenceUnavailableVersion >= 0L) {
+            entry.writeRequired = false;
+            setFactTail(entry, null);
+            persistenceUnavailable(entry);
+            return;
+        }
+        if (entry.facts == null && entry.tail == null) return;
+        FactDecision decision = new FactDecision(entry.key, entry.loadIdentity,
+                ++nextFactDecision, entry.tail == null ? entry.revision
+                        : entry.tail.originalVersion(), entry.revision, entry.facts,
+                entry.facts == null ? entry.tail.cells() : Map.of());
+        PersistenceHold hold = new PersistenceHold(entry);
+        persistenceHolds.put(decision, hold);
+        executingDeltaCells += decision.changes().size();
+        entry.decision = decision;
+        setFactTail(entry, null);
+        entry.writeRequired = false;
+        pinPersistenceFacts(hold, decision.facts());
+        retainPendingFacts(entry);
+        afterRuntimeLock(() -> factDecisionListener.accept(decision));
+    }
+
+    boolean acceptFacts(FactDecision decision) {
         return runtimeTransition(false, () -> {
-            ClusterEntry entry = clusters.get(key);
-            if (entry == null || entry.latest.loadIdentity() != loadIdentity
-                    || entry.latest.revision() != version) return false;
-            if (entry.facts == facts) removeIdleFact(entry);
-            entry.pinnedFacts.merge(facts, 1, Integer::sum);
-            addActiveReference();
+            PersistenceHold hold = persistenceHolds.get(decision);
+            if (hold == null || hold.accepted) return false;
+            hold.accepted = true;
             return true;
         });
     }
 
-    void releaseFactsForPersistence(ClusterKey key,
-                                    BaseClusterTopology.PackedFacts facts) {
-        runBatchedRuntimeTransition(() -> {
-            ClusterEntry entry = clusters.get(key);
-            if (entry != null) {
-                Integer count = entry.pinnedFacts.remove(facts);
-                if (count != null && count > 1) entry.pinnedFacts.put(facts, count - 1);
+    CompletableFuture<Boolean> factsFormed(FactDecision decision, BaseClusterTopology.PackedFacts facts) {
+        return queueFactFeedback(decision, facts, true, null);
+    }
+
+    CompletableFuture<Boolean> completeFacts(FactDecision decision, boolean formed, boolean written) {
+        return queueFactFeedback(decision, null, formed, written);
+    }
+
+    private CompletableFuture<Boolean> queueFactFeedback(FactDecision decision,
+            @Nullable BaseClusterTopology.PackedFacts facts, boolean formed, @Nullable Boolean written) {
+        CompletableFuture<Boolean> result;
+        boolean schedule;
+        synchronized (runtimeLock) {
+            if (factClosingFinished || !persistenceHolds.containsKey(decision)) {
+                return CompletableFuture.completedFuture(false);
             }
-            removeActiveReference();
-            if (entry == null) return;
-            releaseUnusedFacts(entry);
-            pruneCluster(entry);
+            FactFeedback event = pendingFactFeedback.computeIfAbsent(decision, ignored -> new FactFeedback());
+            if (written == null) {
+                if (event.formation != null) return event.formation;
+                event.facts = Objects.requireNonNull(facts);
+                result = event.formation = new CompletableFuture<>();
+            } else {
+                if (event.completion != null) return event.completion;
+                event.formed = formed;
+                event.written = written;
+                result = event.completion = new CompletableFuture<>();
+            }
+            recordPendingEvent();
+            schedule = !eventTaskOutstanding;
+            if (schedule) eventTaskOutstanding = true;
+        }
+        if (schedule) scheduleEventTask();
+        return result;
+    }
+
+    private void applyFactFeedback(FactDecision decision, FactFeedback event) {
+        if (event.formation != null) finishFuture(event.formation,
+                applyFactsFormed(decision, event.facts), null);
+        if (event.completion != null) finishFuture(event.completion,
+                applyFactsCompleted(decision, event.formed, event.written), null);
+    }
+
+    private static final class FactFeedback {
+        private BaseClusterTopology.PackedFacts facts;
+        private boolean formed;
+        private boolean written;
+        private CompletableFuture<Boolean> formation;
+        private CompletableFuture<Boolean> completion;
+
+        private void fail(Throwable failure) {
+            if (formation != null) formation.completeExceptionally(failure);
+            if (completion != null) completion.completeExceptionally(failure);
+        }
+    }
+
+    private boolean applyFactsFormed(FactDecision decision, BaseClusterTopology.PackedFacts facts) {
+        return runtimeTransition(false, () -> {
+            PersistenceHold hold = persistenceHolds.get(decision);
+            if (hold == null || !hold.accepted) return false;
+            pinPersistenceFacts(hold, facts);
+            ClusterEntry entry = hold.entry;
+            if (entry.loadIdentity != decision.loadIdentity()
+                    || entry.decision != decision || entry.facts != null) return true;
+            BaseClusterTopology.PackedFacts current = facts;
+            if (entry.revision != decision.version()) {
+                if (entry.tail == null || entry.tail.originalVersion() != decision.version()
+                        || entry.tail.newVersion() != entry.revision) return true;
+                current = facts.withChanges(entry.tail.cells());
+            }
+            entry.facts = current;
+            entry.factFingerprint = current.fingerprint();
+            entry.factFingerprintKnown = true;
+            entry.factState = FactState.AVAILABLE;
+            retainPendingFacts(entry);
+            if (!closed) {
+                releaseUnusedFacts(entry);
+                wakeFactWaiters(entry);
+            }
+            return true;
         });
+    }
+
+    private boolean applyFactsCompleted(FactDecision decision, boolean formed, boolean written) {
+        return runtimeTransition(false, () -> {
+            PersistenceHold hold = persistenceHolds.remove(decision);
+            if (hold == null) return false;
+            executingDeltaCells -= decision.changes().size();
+            ClusterEntry entry = hold.entry;
+            if (hold.facts != null) {
+                unpinFacts(entry, hold.facts);
+            }
+            if (entry.decision == decision && entry.loadIdentity == decision.loadIdentity()) {
+                entry.decision = null;
+                if (!written) {
+                    if (formed) entry.persistenceUnavailableVersion = Math.max(
+                            entry.persistenceUnavailableVersion, decision.version());
+                    else entry.baselineFailed = true;
+                } else if (entry.persistenceUnavailableVersion <= decision.version()) {
+                    entry.persistenceUnavailableVersion = -1L;
+                }
+                decideFacts(entry);
+            }
+            if (closed && entry.decision == null) entry.facts = null;
+            else if (!closed) {
+                releaseUnusedFacts(entry);
+                if (entry.facts == null && entry.persistenceUnavailableVersion >= 0L) {
+                    persistenceUnavailable(entry);
+                }
+                evictBaseCache();
+            }
+            retainPendingFacts(entry);
+            pruneCluster(entry);
+            return true;
+        });
+    }
+
+    private void pinPersistenceFacts(PersistenceHold hold,
+                                     @Nullable BaseClusterTopology.PackedFacts facts) {
+        if (facts == null || hold.facts == facts) return;
+        if (hold.facts != null) throw new IllegalStateException("canonical facts changed during write");
+        hold.facts = facts;
+        pinFacts(hold.entry, facts);
+    }
+
+    private void persistenceUnavailable(ClusterEntry entry) {
+        if (entry.latest.loadIdentity() != entry.loadIdentity
+                || entry.latest.state() == FactState.UNLOADED || closed) return;
+        entry.factState = FactState.PERSISTENCE_UNAVAILABLE;
+        entry.latest.set(entry.loadIdentity, entry.latest.revision(), FactState.PERSISTENCE_UNAVAILABLE);
+        markLatestDerivedStale(entry.key, FactState.PERSISTENCE_UNAVAILABLE);
+        discardDerived(entry.key, entry, entry.revision, FactState.PERSISTENCE_UNAVAILABLE);
+        wakeFactWaiters(entry);
+    }
+
+    boolean factsSettled() {
+        synchronized (runtimeLock) {
+            return persistenceHolds.isEmpty() && pendingSectionEvents.isEmpty()
+                    && pendingFactFeedback.isEmpty()
+                    && processingSectionEvents.isEmpty() && !eventTaskOutstanding;
+        }
+    }
+
+    void finishFactClosing() {
+        boolean schedule;
+        synchronized (runtimeLock) {
+            if (factClosingFinished || factClosingPending) return;
+            factClosingPending = true;
+            recordPendingEvent();
+            schedule = !eventTaskOutstanding;
+            if (schedule) eventTaskOutstanding = true;
+        }
+        if (schedule) scheduleEventTask();
+    }
+
+    private void finishFactClosingState() {
+        runBatchedRuntimeTransition(() -> {
+            if (!closed) throw new IllegalStateException("facts cleanup before worker close");
+            pendingFactFeedback.forEach(this::applyFactFeedback);
+            pendingFactFeedback.clear();
+            for (FactDecision decision : List.copyOf(persistenceHolds.keySet())) {
+                PersistenceHold hold = persistenceHolds.get(decision);
+                hold.entry.writeRequired = false;
+                setFactTail(hold.entry, null);
+                applyFactsCompleted(decision, hold.facts != null, false);
+            }
+            for (ClusterEntry entry : clusters.values()) {
+                entry.writeRequired = false;
+                setFactTail(entry, null);
+                retainPendingFacts(entry);
+            }
+            clusters.clear();
+            factClosingFinished = true;
+            if (pendingExecutorSubmissions == 0) afterRuntimeLock(taskExecutor::shutdown);
+        });
+    }
+
+    private void setFactTail(ClusterEntry entry, @Nullable TopologyStore.SectionDelta tail) {
+        if (entry.tail != null) {
+            mergedFactSections--;
+            mergedFactCells -= entry.tail.cells().size();
+        }
+        entry.tail = tail;
+        if (tail != null) {
+            mergedFactSections++;
+            mergedFactCells += tail.cells().size();
+        }
+    }
+
+    private void retainPendingFacts(ClusterEntry entry) {
+        BaseClusterTopology.PackedFacts next = entry.writeRequired ? entry.facts : null;
+        if (entry.pendingFactsReference == next) return;
+        if (entry.pendingFactsReference != null) unpinFacts(entry, entry.pendingFactsReference);
+        entry.pendingFactsReference = next;
+        if (next != null) pinFacts(entry, next);
+    }
+
+    private void pinFacts(ClusterEntry entry, BaseClusterTopology.PackedFacts facts) {
+        if (entry.facts == facts) removeIdleFact(entry);
+        entry.pinnedFacts.merge(facts, 1, Integer::sum);
+        changeFactReferences(facts, 0, 1);
+        addActiveReference();
+    }
+
+    private void unpinFacts(ClusterEntry entry, BaseClusterTopology.PackedFacts facts) {
+        Integer count = entry.pinnedFacts.remove(facts);
+        if (count == null) throw new IllegalStateException("fact pin is not owned");
+        if (count > 1) entry.pinnedFacts.put(facts, count - 1);
+        changeFactReferences(facts, 0, -1);
+        removeActiveReference();
+    }
+
+    private void changeFactReferences(BaseClusterTopology.PackedFacts facts, int idle, int active) {
+        FactReferences refs = factReferences.computeIfAbsent(facts, ignored -> new FactReferences());
+        long bytes = facts.retainedBytes();
+        if (refs.active > 0) activeFactBytes -= bytes;
+        else if (refs.idle > 0) baseRetainedBytes -= bytes;
+        refs.idle += idle;
+        refs.active += active;
+        if (refs.idle < 0 || refs.active < 0) throw new IllegalStateException("negative fact ownership");
+        if (refs.active > 0) activeFactBytes += bytes;
+        else if (refs.idle > 0) baseRetainedBytes += bytes;
+        else factReferences.remove(facts);
     }
 
     private boolean requestClusterDependency(
@@ -925,11 +1241,10 @@ final class TopologyWorkerRuntime {
         Objects.requireNonNull(priority, "priority");
         ClusterKey key = new ClusterKey(dimension, section);
         ClusterEntry entry = clusters.get(key);
-        if (entry == null || entry.latest.state() == FactState.UNLOADED
-                || entry.latest.state() == FactState.RECOVERY_FAILED) {
+        if (entry == null || eventUnavailable(entry.latest.state())) {
             if (waiter != null) waiter.complete(null,
-                    entry != null && entry.latest.state() == FactState.RECOVERY_FAILED
-                            ? new FactsRecoveryException(key)
+                    entry != null && entry.latest.state() != FactState.UNLOADED
+                            ? new FactsUnavailableException(key, entry.latest.state())
                             : new IllegalStateException(
                             "topology request cannot load an unavailable chunk"));
             return false;
@@ -1154,6 +1469,7 @@ final class TopologyWorkerRuntime {
             return null;
         }
         entry.buildInputs = inputs;
+        entry.buildInputAttempt = attempt;
         entry.buildInputOwners = owners;
         entry.buildStamps = stamps;
         return inputs;
@@ -1168,8 +1484,8 @@ final class TopologyWorkerRuntime {
         SuperEntry entry = superClusters.get(key);
         if (entry != expected || entry.attempt != attempt || closed
                 || entry.waiters.isEmpty()) {
-            expected.buildTask = null;
-            releaseSuperBuildInputs(expected);
+            if (expected.attempt == attempt) expected.buildTask = null;
+            releaseSuperBuildInputs(expected, attempt);
             pruneSuperEntry(expected);
             return;
         }
@@ -1179,7 +1495,7 @@ final class TopologyWorkerRuntime {
                 && topology.matchesChildren(current) && !topologyStamps.isEmpty()
                 && isCurrent(topologyStamps);
         entry.buildTask = null;
-        releaseSuperBuildInputs(entry);
+        releaseSuperBuildInputs(entry, attempt);
         if (!inputsCurrent) {
             entry.attemptRunning = false;
             if (!superClusterAvailable(key.dimension(), key.origin())) {
@@ -1212,9 +1528,9 @@ final class TopologyWorkerRuntime {
                                 long attempt,
                                 Throwable failure) {
         requireRuntimeLock();
-        expected.buildTask = null;
+        if (expected.attempt == attempt) expected.buildTask = null;
         SuperEntry entry = superClusters.get(key);
-        releaseSuperBuildInputs(expected);
+        releaseSuperBuildInputs(expected, attempt);
         if (entry != expected || entry.attempt != attempt) {
             pruneSuperEntry(expected);
             return;
@@ -1837,6 +2153,7 @@ final class TopologyWorkerRuntime {
     }
 
     private void prepareDemand(ClusterEntry entry, TopologyDemand demand) {
+        if (closed || stopRequested) return;
         ViewEntry view = entry.views.get(demand.geometry);
         if (view == null || view.demand != demand
                 || demand.waiters.isEmpty() && !demand.prewarmSlot
@@ -1850,6 +2167,7 @@ final class TopologyWorkerRuntime {
         int horizontal = demand.geometry.widthCells() == 1 ? 0 : 1;
         int lower = demand.geometry.channel() == BaseClusterTopology.Channel.GROUND ? -1 : 0;
         int upper = demand.geometry.heightCells() == 1 ? 0 : 1;
+        ClusterEntry failedHalo = null;
         for (int dx = -horizontal; dx <= horizontal; dx++) {
             for (int dy = lower; dy <= upper; dy++) {
                 for (int dz = -horizontal; dz <= horizontal; dz++) {
@@ -1860,10 +2178,21 @@ final class TopologyWorkerRuntime {
                     ClusterEntry neighbor = clusters.get(neighborKey);
                     if (neighbor == null || neighbor.factState == FactState.UNLOADED) continue;
                     factsReady(neighborKey, neighbor, demand, false);
+                    FactState state = neighbor.latest.state();
+                    if (state == FactState.RECOVERY_FAILED || state == FactState.PERSISTENCE_UNAVAILABLE) {
+                        // The loop supplies x/y/z order within each failure rank.
+                        if (failedHalo == null || state == FactState.RECOVERY_FAILED
+                                && failedHalo.latest.state() != FactState.RECOVERY_FAILED) failedHalo = neighbor;
+                    }
                 }
             }
         }
-        return demand.waitingFacts.isEmpty();
+        if (!demand.waitingFacts.isEmpty()) return false;
+        if (failedHalo != null) {
+            failDemand(entry, demand, new FactsUnavailableException(failedHalo.key, failedHalo.latest.state()));
+            return false;
+        }
+        return true;
     }
 
     private boolean factsReady(ClusterKey key,
@@ -1873,8 +2202,8 @@ final class TopologyWorkerRuntime {
         if (eventUnavailable(entry.latest.state())) {
             if (required) {
                 failDemand(entry, demand,
-                        entry.latest.state() == FactState.RECOVERY_FAILED
-                                ? new FactsRecoveryException(key)
+                        entry.latest.state() != FactState.UNLOADED
+                                ? new FactsUnavailableException(key, entry.latest.state())
                                 : new StaleTopologyException(key));
             }
             return false;
@@ -1899,8 +2228,7 @@ final class TopologyWorkerRuntime {
         if (!entry.current() || entry.factState != FactState.AVAILABLE || facts == null) return;
         removeIdleFact(entry);
         if (demand.heldFacts.put(entry, facts) == null) {
-            entry.pinnedFacts.merge(facts, 1, Integer::sum);
-            addActiveReference();
+            pinFacts(entry, facts);
         }
     }
 
@@ -1960,10 +2288,12 @@ final class TopologyWorkerRuntime {
     }
 
     private void releaseUnusedFacts(ClusterEntry entry) {
-        if (entry.facts == null || entry.pinnedFacts.containsKey(entry.facts)) return;
+        if (entry.facts == null || entry.pinnedFacts.containsKey(entry.facts)
+                || entry.writeRequired || closed) return;
         removeIdleFact(entry);
         if (idleBaseEntries.add(entry)) {
-            baseRetainedBytes += entry.facts.retainedBytes();
+            baseRetainedBytes += 64L;
+            changeFactReferences(entry.facts, 1, 0);
             recordBaseCachePeak();
         }
     }
@@ -1992,7 +2322,8 @@ final class TopologyWorkerRuntime {
 
     private void removeIdleFact(ClusterEntry entry) {
         if (!idleBaseEntries.remove(entry)) return;
-        baseRetainedBytes -= Objects.requireNonNull(entry.facts, "idle facts").retainedBytes();
+        baseRetainedBytes -= 64L;
+        changeFactReferences(Objects.requireNonNull(entry.facts, "idle facts"), -1, 0);
     }
 
     private void removeIdleBase(ViewEntry view) {
@@ -2419,6 +2750,7 @@ final class TopologyWorkerRuntime {
 
     boolean awaitStopped(long timeout, TimeUnit unit) {
         beginStopping();
+        finishFactClosing();
         return taskExecutor.awaitTermination(timeout, unit);
     }
 
@@ -2438,6 +2770,7 @@ final class TopologyWorkerRuntime {
         completedCorridors.clear();
         completedCorridorBytes = 0L;
         for (ClusterEntry entry : List.copyOf(clusters.values())) {
+            removeIdleFact(entry);
             for (ViewEntry view : List.copyOf(entry.views.values())) {
                 for (int slot = 0; slot < view.links.length; slot++) {
                     clearBaseLink(view, slot, "topology service stopped");
@@ -2446,7 +2779,7 @@ final class TopologyWorkerRuntime {
                 view.topology = null;
                 view.topologyStamps = List.of();
             }
-            entry.facts = null;
+            if (entry.decision == null && !entry.writeRequired) entry.facts = null;
         }
         for (SuperEntry entry : superClusters.values()) {
             for (int slot = 0; slot < entry.links.length; slot++) {
@@ -2467,7 +2800,6 @@ final class TopologyWorkerRuntime {
         resolveFlights.clear();
         deferredSearchResumes.clear();
         eventBatchActive = false;
-        clusters.clear();
         superClusters.clear();
         superKeysByOrigin.clear();
         idleBaseEntries.clear();
@@ -2475,9 +2807,6 @@ final class TopologyWorkerRuntime {
         idleSuperEntries.clear();
         superHandoffs.clear();
         prewarmCandidates.clear();
-        if (pendingExecutorSubmissions == 0) {
-            afterRuntimeLock(taskExecutor::shutdown);
-        }
         prewarmAdmitted = 0;
         baseRetainedBytes = 0L;
         superRetainedBytes = 0L;
@@ -2742,10 +3071,7 @@ final class TopologyWorkerRuntime {
                 : demand.heldFacts.entrySet()) {
             ClusterEntry entry = pin.getKey();
             BaseClusterTopology.PackedFacts facts = pin.getValue();
-            Integer count = entry.pinnedFacts.remove(facts);
-            if (count == null) throw new IllegalStateException("fact pin is not owned");
-            if (count > 1) entry.pinnedFacts.put(facts, count - 1);
-            removeActiveReference();
+            unpinFacts(entry, facts);
             releaseUnusedFacts(entry);
             pruneCluster(entry);
         }
@@ -3000,7 +3326,8 @@ final class TopologyWorkerRuntime {
                 BaseClusterTopology.PackedFacts removed = fact.facts;
                 if (removed == null || fact.pinnedFacts.containsKey(removed)) continue;
                 fact.facts = null;
-                if (fact.factState == FactState.AVAILABLE) fact.factState = FactState.PENDING;
+                if (fact.persistenceUnavailableVersion >= 0L) persistenceUnavailable(fact);
+                else if (fact.factState == FactState.AVAILABLE) fact.factState = FactState.PENDING;
                 continue;
             }
             ViewEntry view = (ViewEntry) candidate;
@@ -3096,11 +3423,8 @@ final class TopologyWorkerRuntime {
         }
     }
 
-    private void releaseSuperBuildInputs(SuperEntry entry) {
-        if (entry.buildInputs == null) {
-            entry.buildStamps = List.of();
-            return;
-        }
+    private void releaseSuperBuildInputs(SuperEntry entry, long attempt) {
+        if (entry.buildInputs == null || entry.buildInputAttempt != attempt) return;
         releaseBaseInputs(entry.buildInputOwners, entry.buildInputs);
         entry.buildInputs = null;
         entry.buildInputOwners = List.of();
@@ -3110,12 +3434,9 @@ final class TopologyWorkerRuntime {
     private void cancelSuperBuild(SuperEntry entry) {
         TopologyTaskExecutor.TaskHandle task = entry.buildTask;
         entry.buildTask = null;
-        if (task == null) releaseSuperBuildInputs(entry);
-        else cancelQueuedTask(task, cancelled -> {
-            if (cancelled) {
-                releaseSuperBuildInputs(entry);
-                pruneSuperEntry(entry);
-            }
+        // Only the executing attempt owns pinned inputs; cancellation cannot release them.
+        if (task != null) cancelQueuedTask(task, cancelled -> {
+            if (cancelled) pruneSuperEntry(entry);
         });
     }
 
@@ -3230,12 +3551,16 @@ final class TopologyWorkerRuntime {
 
     static final class SectionStamp {
         private final ClusterKey key;
-        private final LatestFactsRef latest;
+        private final Supplier<LatestFacts> source;
         private final LatestFacts expected;
 
         private SectionStamp(ClusterKey key, LatestFactsRef latest, LatestFacts expected) {
+            this(key, latest::get, expected);
+        }
+
+        private SectionStamp(ClusterKey key, Supplier<LatestFacts> source, @Nullable LatestFacts expected) {
             this.key = key;
-            this.latest = latest;
+            this.source = source;
             this.expected = expected;
         }
 
@@ -3244,16 +3569,31 @@ final class TopologyWorkerRuntime {
         }
 
         long loadIdentity() {
-            return expected.loadIdentity();
+            return absent() ? 0L : expected.loadIdentity();
         }
 
         long version() {
-            return expected.revision();
+            return absent() ? 0L : expected.revision();
+        }
+
+        boolean absent() {
+            return expected == null;
         }
 
         boolean current() {
-            return latest.get() == expected && expected.state() == FactState.AVAILABLE;
+            // Both usable facts and terminal fact failures have an immutable source identity.
+            return source.get() == expected;
         }
+    }
+
+    private SectionStamp absentStamp(ClusterKey key) {
+        return new SectionStamp(key, () -> {
+            synchronized (runtimeLock) {
+                ClusterEntry entry = clusters.get(key);
+                return entry == null || entry.latest.state() == FactState.UNLOADED
+                        ? null : entry.latest.get();
+            }
+        }, null);
     }
 
     private record LatestFacts(long loadIdentity, long revision, FactState state) {
@@ -3304,6 +3644,7 @@ final class TopologyWorkerRuntime {
         PENDING,
         AVAILABLE,
         RECOVERY_FAILED,
+        PERSISTENCE_UNAVAILABLE,
         UNLOADED
     }
 
@@ -3332,7 +3673,14 @@ final class TopologyWorkerRuntime {
                         long version,
                         FactState state,
                         @Nullable BaseClusterTopology.PackedFacts facts,
-                        Map<Integer, Byte> changes) {
+                        Map<Integer, Byte> changes,
+                        boolean persist) {
+        SectionEvent(ClusterKey key, long loadIdentity, long previousVersion, long version,
+                     FactState state, @Nullable BaseClusterTopology.PackedFacts facts,
+                     Map<Integer, Byte> changes) {
+            this(key, loadIdentity, previousVersion, version, state, facts, changes,
+                    !changes.isEmpty());
+        }
         SectionEvent {
             Objects.requireNonNull(key, "key");
             Objects.requireNonNull(state, "state");
@@ -3353,6 +3701,33 @@ final class TopologyWorkerRuntime {
         void changed(ClusterKey key, long loadIdentity, int delta);
     }
 
+    record FactDecision(ClusterKey key, long loadIdentity, long generation,
+                        long previousVersion, long version,
+                        @Nullable BaseClusterTopology.PackedFacts facts,
+                        Map<Integer, Byte> changes) {
+        FactDecision {
+            Objects.requireNonNull(key, "key");
+            changes = Map.copyOf(changes);
+            if (loadIdentity <= 0L || generation <= 0L || previousVersion < 0L
+                    || version < previousVersion || (facts == null) == changes.isEmpty()) {
+                throw new IllegalArgumentException("invalid facts decision");
+            }
+        }
+    }
+
+    private static final class PersistenceHold {
+        private final ClusterEntry entry;
+        private BaseClusterTopology.PackedFacts facts;
+        private boolean accepted;
+
+        private PersistenceHold(ClusterEntry entry) { this.entry = entry; }
+    }
+
+    private static final class FactReferences {
+        private int idle;
+        private int active;
+    }
+
     private sealed interface BaseIdleEntry permits ClusterEntry, ViewEntry {
     }
 
@@ -3365,6 +3740,12 @@ final class TopologyWorkerRuntime {
         private BaseClusterTopology.PackedFacts facts;
         private long factFingerprint;
         private boolean factFingerprintKnown;
+        private FactDecision decision;
+        private TopologyStore.SectionDelta tail;
+        private boolean writeRequired;
+        private boolean baselineFailed;
+        private long persistenceUnavailableVersion = -1L;
+        private BaseClusterTopology.PackedFacts pendingFactsReference;
         private final IdentityHashMap<BaseClusterTopology.PackedFacts, Integer> pinnedFacts =
                 new IdentityHashMap<>();
         private final Set<TopologyDemand> factWaiters =
@@ -3392,7 +3773,8 @@ final class TopologyWorkerRuntime {
             LatestFacts value = latest.get();
             return loadIdentity == value.loadIdentity() && revision == value.revision()
                     && value.state() != FactState.UNLOADED
-                    && value.state() != FactState.RECOVERY_FAILED;
+                    && value.state() != FactState.RECOVERY_FAILED
+                    && value.state() != FactState.PERSISTENCE_UNAVAILABLE;
         }
     }
 
@@ -3520,6 +3902,7 @@ final class TopologyWorkerRuntime {
         private NavigationScheduler.Priority requestPriority;
         private TopologyTaskExecutor.TaskHandle buildTask;
         private BaseClusterTopology[] buildInputs;
+        private long buildInputAttempt;
         private List<ViewEntry> buildInputOwners = List.of();
         @SuppressWarnings("unchecked")
         private final LinkEntry<SuperClusterTopology.CrossingIndex>[] links =
@@ -3655,7 +4038,7 @@ final class TopologyWorkerRuntime {
 
     private void joinResolved(MacroRequest request,
                               CandidateResolution starts,
-                              CandidateResolution goals) {
+                              CandidateResolution goals, List<SectionStamp> stamps) {
         if (starts.candidates.isEmpty() || goals.candidates.isEmpty()) {
             CandidateResolution missing = starts.candidates.isEmpty() ? starts : goals;
             MacroSearch.Failure failure = missing.unavailable == null
@@ -3664,7 +4047,7 @@ final class TopologyWorkerRuntime {
             SectionPos blocked = missing.unavailable == null
                     ? SectionPos.of(starts.candidates.isEmpty()
                     ? request.startPosition : request.goalPosition) : missing.unavailable;
-            request.finish(null, failure, blocked, List.of());
+            request.finish(null, failure, blocked, stamps);
             return;
         }
         boolean hierarchical = !request.forceBaseSearch
@@ -3785,8 +4168,10 @@ final class TopologyWorkerRuntime {
         private final RawQueryKey key;
         private final Set<MacroRequest> waiters =
                 Collections.newSetFromMap(new IdentityHashMap<>());
-        private List<TopologyWaiter<BaseClusterTopology>> dependencies = List.of();
+        private Map<SectionPos, TopologyWaiter<BaseClusterTopology>> dependencies = Map.of();
         private List<EndpointTopology> held = List.of();
+        private List<SectionStamp> failedInputs = List.of();
+        private Map<SectionPos, Long> requestedLoads = Map.of();
         private TopologyTaskExecutor.TaskHandle task = UNTRACKED_TASK;
         private NavigationScheduler.Priority priority = NavigationScheduler.Priority.BACKGROUND;
         private boolean fallbackStart;
@@ -3807,37 +4192,44 @@ final class TopologyWorkerRuntime {
             else sections.add(SectionPos.of(key.start));
             if (fallbackGoal) sections.addAll(candidateSections(key.goal));
             else sections.add(SectionPos.of(key.goal));
-            List<TopologyWaiter<BaseClusterTopology>> requested = new ArrayList<>();
+            Map<SectionPos, TopologyWaiter<BaseClusterTopology>> requested = new LinkedHashMap<>();
+            Map<SectionPos, Long> loads = new HashMap<>();
             collectingDependencies = true;
             dependencies = requested;
             for (SectionPos section : sections.stream()
                     .sorted(Comparator.comparingLong(SectionPos::asLong)).toList()) {
+                loads.put(section, loadedIdentity(section));
                 if (clusterLoaded(new ClusterKey(key.dimension, section))) {
                     TopologyWaiter<BaseClusterTopology> waiter = new TopologyWaiter<>(
                             priority, ignored -> dependenciesReady());
-                    requested.add(waiter);
+                    requested.put(section, waiter);
                     requestClusterDependency(key.dimension, section,
                             key.profile.geometry(key.channel), priority, false, waiter);
                 }
             }
             collectingDependencies = false;
-            dependencies = List.copyOf(requested);
+            requestedLoads = Map.copyOf(loads);
+            dependencies = Map.copyOf(requested);
             dependenciesReady();
         }
 
         private void dependenciesReady() {
             if (resolveFlights.get(key) != this || waiters.isEmpty()
                     || collectingDependencies
-                    || dependencies.stream().anyMatch(waiter -> waiter.active)) return;
-            List<TopologyWaiter<BaseClusterTopology>> ready = dependencies;
-            dependencies = List.of();
-            Set<SectionPos> recoveryFailures = new HashSet<>();
+                    || dependencies.values().stream().anyMatch(waiter -> waiter.active)) return;
+            Map<SectionPos, TopologyWaiter<BaseClusterTopology>> ready = dependencies;
+            dependencies = Map.of();
+            Map<SectionPos, MacroSearch.Unavailability> factFailures = new HashMap<>();
+            List<SectionStamp> failures = new ArrayList<>();
             Throwable failure = null;
-            for (TopologyWaiter<BaseClusterTopology> waiter : ready) {
+            for (var dependency : ready.entrySet()) {
+                TopologyWaiter<BaseClusterTopology> waiter = dependency.getValue();
                 if (waiter.failure == null) continue;
                 Throwable root = rootFailure(waiter.failure);
-                if (root instanceof FactsRecoveryException facts) {
-                    recoveryFailures.add(facts.key.section());
+                if (root instanceof FactsUnavailableException facts) {
+                    if (!facts.stamp.current()) { retryAll(); return; }
+                    factFailures.put(dependency.getKey(), facts.unavailability);
+                    failures.add(facts.stamp);
                 } else {
                     failure = waiter.failure;
                     break;
@@ -3848,7 +4240,7 @@ final class TopologyWorkerRuntime {
                 return;
             }
             List<EndpointTopology> captured = new ArrayList<>(ready.size());
-            for (TopologyWaiter<BaseClusterTopology> waiter : ready) {
+            for (TopologyWaiter<BaseClusterTopology> waiter : ready.values()) {
                 if (waiter.failure != null) continue;
                 BaseClusterTopology topology = waiter.value;
                 ViewEntry owner = baseView(key.dimension, topology);
@@ -3861,11 +4253,12 @@ final class TopologyWorkerRuntime {
                 captured.add(new EndpointTopology(topology, owner, owner.validity));
             }
             held = List.copyOf(captured);
+            failedInputs = List.copyOf(failures);
             task = SUBMITTING_TASK;
             submitOutsideRuntimeLock(
                     () -> taskExecutor.submitSearch(priority,
                             TopologyTaskExecutor.WorkKind.QUICK_SEARCH,
-                            () -> resolveOnWorker(held, Set.copyOf(recoveryFailures))),
+                            () -> resolveOnWorker(held, Map.copyOf(factFailures))),
                     submitted -> {
                         if (task != SUBMITTING_TASK || resolveFlights.get(key) != this
                                 || waiters.isEmpty()) {
@@ -3889,15 +4282,15 @@ final class TopologyWorkerRuntime {
         }
 
         private void resolveOnWorker(List<EndpointTopology> input,
-                                     Set<SectionPos> recoveryFailures) {
+                                     Map<SectionPos, MacroSearch.Unavailability> factFailures) {
             try {
                 Map<Long, BaseClusterTopology> topologies = new HashMap<>(input.size());
                 input.forEach(captured -> topologies.put(captured.topology.section().asLong(),
                         captured.topology));
                 CandidateResolution starts = resolveEndpoint(key.start, fallbackStart,
-                        key.channel, topologies, recoveryFailures);
+                        key.channel, topologies, factFailures);
                 CandidateResolution goals = resolveEndpoint(key.goal, fallbackGoal,
-                        key.channel, topologies, recoveryFailures);
+                        key.channel, topologies, factFailures);
                 runRuntimeTransition(() -> resolved(starts, goals));
             } catch (VirtualMachineError | ThreadDeath fatal) {
                 throw fatal;
@@ -3916,9 +4309,16 @@ final class TopologyWorkerRuntime {
 
         private void resolved(CandidateResolution starts, CandidateResolution goals) {
             task = UNTRACKED_TASK;
-            boolean current = held.stream().allMatch(input ->
+            List<SectionStamp> stamps = new ArrayList<>(failedInputs);
+            held.forEach(input -> stamps.addAll(input.owner.topologyStamps));
+            boolean current = isCurrent(stamps)
+                    && requestedLoads.entrySet().stream().allMatch(entry -> loadedIdentity(entry.getKey()) == entry.getValue())
+                    && held.stream().allMatch(input ->
                     input.owner.validity == input.validity
                             && baseView(key.dimension, input.topology) == input.owner);
+            requestedLoads.forEach((section, identity) -> {
+                if (identity == 0L) stamps.add(absentStamp(new ClusterKey(key.dimension, section)));
+            });
             releaseHeld();
             if (resolveFlights.get(key) != this || waiters.isEmpty()) return;
             if (!current) {
@@ -3941,7 +4341,7 @@ final class TopologyWorkerRuntime {
             for (MacroRequest request : resolved) {
                 request.resolver = null;
                 try {
-                    joinResolved(request, starts, goals);
+                    joinResolved(request, starts, goals, stamps);
                 } catch (VirtualMachineError | ThreadDeath fatal) {
                     throw fatal;
                 } catch (Throwable failure) {
@@ -3961,9 +4361,10 @@ final class TopologyWorkerRuntime {
             waiters.clear();
             for (MacroRequest request : failed) {
                 request.resolver = null;
-                if (root instanceof FactsRecoveryException facts) {
-                    request.finish(null, MacroSearch.Failure.FACTS_RECOVERY_FAILED,
-                            facts.key.section(), List.of());
+                if (root instanceof FactsUnavailableException facts) {
+                    if (!facts.stamp.current()) retryStaleRequest(request);
+                    else request.finish(null, facts.unavailability.reason(),
+                            facts.unavailability.section(), List.of(facts.stamp));
                 } else request.finishExceptionally(root);
             }
         }
@@ -3984,8 +4385,8 @@ final class TopologyWorkerRuntime {
                 return;
             }
             resolveFlights.remove(key, this);
-            dependencies.forEach(TopologyWaiter::cancel);
-            dependencies = List.of();
+            dependencies.values().forEach(TopologyWaiter::cancel);
+            dependencies = Map.of();
             TopologyTaskExecutor.TaskHandle activeTask = task;
             task = UNTRACKED_TASK;
             if (activeTask == UNTRACKED_TASK) releaseHeld();
@@ -3996,13 +4397,19 @@ final class TopologyWorkerRuntime {
             priority = waiters.stream().map(request -> request.priority)
                     .reduce(NavigationScheduler.Priority.BACKGROUND,
                             TopologyWorkerRuntime::higherPriority);
-            dependencies.forEach(dependency -> dependency.reprioritize(priority));
+            dependencies.values().forEach(dependency -> dependency.reprioritize(priority));
             reprioritizeTask(task, priority);
         }
 
         private void releaseHeld() {
             release(held);
             held = List.of();
+            failedInputs = List.of();
+        }
+
+        private long loadedIdentity(SectionPos section) {
+            ClusterEntry entry = clusters.get(new ClusterKey(key.dimension, section));
+            return entry == null || entry.latest.state() == FactState.UNLOADED ? 0L : entry.latest.loadIdentity();
         }
 
         private void release(List<EndpointTopology> inputs) {
@@ -4018,7 +4425,7 @@ final class TopologyWorkerRuntime {
             boolean fallback,
             BaseClusterTopology.Channel channel,
             Map<Long, BaseClusterTopology> topologies,
-            Set<SectionPos> recoveryFailures) {
+            Map<SectionPos, MacroSearch.Unavailability> factFailures) {
         Set<MacroComponentKey> candidates = new HashSet<>();
         SectionPos unavailable = null;
         MacroSearch.Failure unavailableFailure = null;
@@ -4026,13 +4433,12 @@ final class TopologyWorkerRuntime {
             SectionPos section = SectionPos.of(anchor);
             BaseClusterTopology topology = topologies.get(section.asLong());
             if (topology == null) {
-                boolean recoveryFailed = recoveryFailures.contains(section);
-                if (unavailable == null || recoveryFailed
-                        && unavailableFailure != MacroSearch.Failure.FACTS_RECOVERY_FAILED) {
-                    unavailable = section;
-                    unavailableFailure = recoveryFailed
-                            ? MacroSearch.Failure.FACTS_RECOVERY_FAILED
-                            : MacroSearch.Failure.UNAVAILABLE_CHUNK;
+                MacroSearch.Unavailability cause = factFailures.getOrDefault(section,
+                        new MacroSearch.Unavailability(MacroSearch.Failure.UNAVAILABLE_CHUNK, section));
+                if (unavailable == null || MacroSearch.failureRank(cause.reason())
+                        < MacroSearch.failureRank(unavailableFailure)) {
+                    unavailable = cause.section();
+                    unavailableFailure = cause.reason();
                 }
                 continue;
             }
@@ -4555,9 +4961,9 @@ final class TopologyWorkerRuntime {
             try {
                 query.finishMeasurement();
                 progress.value = query.progress();
-                stamps = corridor == null ? List.of() : query.resultStamps();
-                if (searchFailure == null && corridor != null
-                        && !query.resultCurrentAtWorkerCompletion()) {
+                stamps = corridor == null ? List.copyOf(query.usedSections.values()) : query.resultStamps();
+                if (searchFailure == null && query.failure != MacroSearch.Failure.CANCELLED
+                        && (!isCurrent(stamps) || corridor != null && !query.resultCurrentAtWorkerCompletion())) {
                     progress.value = progress.value.withOutcome(Status.FAILED,
                             MacroSearch.Failure.STALE_WORLD, progress.value.blockedSection());
                     completing.forEach(TopologyWorkerRuntime.this::retryStaleRequest);
@@ -4790,12 +5196,12 @@ final class TopologyWorkerRuntime {
         private final Object owner;
         private final Object stamps;
         private final long validity;
-        private final MacroSearch.Failure unavailability;
+        private final MacroSearch.Unavailability unavailability;
         private volatile boolean transferred;
 
         private ResolvedDependency(MacroSearch.DependencyKey dependency, Object cacheKey,
                                    Object value, Object owner, Object stamps,
-                                   long validity, MacroSearch.Failure unavailability) {
+                                   long validity, MacroSearch.Unavailability unavailability) {
             this.dependency = dependency;
             this.cacheKey = cacheKey;
             this.value = value;
@@ -4806,8 +5212,9 @@ final class TopologyWorkerRuntime {
         }
 
         private static ResolvedDependency unavailable(MacroSearch.DependencyKey dependency,
-                                                      MacroSearch.Failure reason) {
-            return new ResolvedDependency(dependency, null, null, null, null, 0L, reason);
+                                                       FactsUnavailableException facts) {
+            return new ResolvedDependency(dependency, null, null, null,
+                    List.of(facts.stamp), 0L, facts.unavailability);
         }
     }
 
@@ -4985,9 +5392,10 @@ final class TopologyWorkerRuntime {
             if (buildFailure != null) {
                 status = Status.FAILED;
                 Throwable root = rootFailure(buildFailure);
-                if (root instanceof FactsRecoveryException facts) {
-                    failure = MacroSearch.Failure.FACTS_RECOVERY_FAILED;
-                    blockedEndpoint = facts.key.section();
+                if (root instanceof FactsUnavailableException facts) {
+                    failure = facts.stamp.current() ? facts.unavailability.reason() : MacroSearch.Failure.STALE_WORLD;
+                    blockedEndpoint = facts.unavailability.section();
+                    usedSections.put(facts.stamp.key, facts.stamp);
                 } else if (staleTopologyFailure(root)) failure = MacroSearch.Failure.STALE_WORLD;
                 else failureCause = root;
                 clearRequests();
@@ -5060,7 +5468,12 @@ final class TopologyWorkerRuntime {
             try {
                 if (search == null) createSearchOnWorker();
                 applyResolvedDependencies(resolutions);
+                if (usedSections.values().stream().anyMatch(stamp -> !stamp.current())) restartStaleSearch();
                 Status resultStatus = stepSearch(expansionBudget, expandedBefore);
+                if (usedSections.values().stream().anyMatch(stamp -> !stamp.current())) {
+                    restartStaleSearch();
+                    resultStatus = status;
+                }
                 if (status == Status.RUNNING && search != null
                         && search.waitingForTopology()) {
                     pendingDependencies = mergePendingDependencies(
@@ -5510,6 +5923,7 @@ final class TopologyWorkerRuntime {
                 }
                 ready = false;
                 if (!clusterLoaded(key)) {
+                    usedSections.putIfAbsent(key, absentStamp(key));
                     failure = MacroSearch.Failure.UNAVAILABLE_CHUNK;
                     blockedEndpoint = section;
                     status = Status.FAILED;
@@ -5534,8 +5948,7 @@ final class TopologyWorkerRuntime {
                 ResolvedDependency ready = captureDependency(key);
                 if (ready != null) retainResolvedDependency(key, ready);
                 else if (dependencyAvailableInWorld(key)) requestDependency(key);
-                else retainResolvedDependency(key, ResolvedDependency.unavailable(
-                        key, MacroSearch.Failure.UNAVAILABLE_CHUNK));
+                else retainResolvedDependency(key, unavailableDependency(key));
             }
             pendingDependencies = List.copyOf(remaining);
         }
@@ -5633,6 +6046,24 @@ final class TopologyWorkerRuntime {
                         && superClusterAvailable(dimension, dependency.position())
                         && superClusterAvailable(dimension, dependency.target());
             };
+        }
+
+        private ResolvedDependency unavailableDependency(MacroSearch.DependencyKey dependency) {
+            List<SectionStamp> missing = new ArrayList<>();
+            boolean parent = dependency.kind() == MacroSearch.DependencyKind.SUPER_CLUSTER
+                    || dependency.kind() == MacroSearch.DependencyKind.SUPER_BOUNDARY;
+            List<SectionPos> origins = dependency.target() == null
+                    ? List.of(dependency.position())
+                    : List.of(dependency.position(), dependency.target());
+            for (SectionPos origin : origins) {
+                for (SectionPos section : parent ? SuperClusterTopology.childSections(origin) : List.of(origin)) {
+                    ClusterKey key = new ClusterKey(dimension, section);
+                    if (!clusterLoaded(key)) missing.add(absentStamp(key));
+                }
+            }
+            return new ResolvedDependency(dependency, null, null, null, List.copyOf(missing), 0L,
+                    new MacroSearch.Unavailability(MacroSearch.Failure.UNAVAILABLE_CHUNK,
+                            dependency.position()));
         }
 
         @Nullable
@@ -5754,13 +6185,12 @@ final class TopologyWorkerRuntime {
                 Throwable root = rootFailure(request.failure);
                 if (!dependencyAvailableInWorld(dependency)) {
                     if (hasSearchState()) {
-                        retainResolvedDependency(dependency, ResolvedDependency.unavailable(
-                                dependency, MacroSearch.Failure.UNAVAILABLE_CHUNK));
+                        retainResolvedDependency(dependency, unavailableDependency(dependency));
                     }
-                } else if (root instanceof FactsRecoveryException) {
+                } else if (root instanceof FactsUnavailableException facts) {
                     if (hasSearchState()) {
                         retainResolvedDependency(dependency, ResolvedDependency.unavailable(
-                                dependency, MacroSearch.Failure.FACTS_RECOVERY_FAILED));
+                                dependency, facts));
                     } else if (dependency.kind() == MacroSearch.DependencyKind.SUPER_CLUSTER) {
                         parentFallbackPending = true;
                     } else {
@@ -5899,6 +6329,7 @@ final class TopologyWorkerRuntime {
             try {
                 for (ResolvedDependency dependency : resolved) {
                     if (dependency.unavailability != null) {
+                        for (SectionStamp stamp : castStamps(dependency.stamps)) usedSections.putIfAbsent(stamp.key, stamp);
                         search.dependencyUnavailable(
                                 dependency.dependency, dependency.unavailability);
                     } else if (attachResolved(dependency)) {
@@ -6001,12 +6432,20 @@ final class TopologyWorkerRuntime {
         }
     }
 
-    private static final class FactsRecoveryException extends RuntimeException {
-        private final ClusterKey key;
+    private final class FactsUnavailableException extends RuntimeException {
+        private final MacroSearch.Unavailability unavailability;
+        private final SectionStamp stamp;
 
-        private FactsRecoveryException(ClusterKey key) {
-            super("basic facts recovery failed for " + key);
-            this.key = key;
+        private FactsUnavailableException(ClusterKey key, FactState state) {
+            super("basic facts " + state + " for " + key);
+            unavailability = new MacroSearch.Unavailability(state == FactState.RECOVERY_FAILED
+                    ? MacroSearch.Failure.FACTS_RECOVERY_FAILED
+                    : MacroSearch.Failure.FACTS_PERSISTENCE_UNAVAILABLE, key.section());
+            ClusterEntry entry = Objects.requireNonNull(clusters.get(key));
+            LatestFacts expected = entry.latest.get();
+            // A superseded failure notification must fail validation even before consumption.
+            stamp = new SectionStamp(key, entry.latest, expected.state() == state ? expected
+                    : new LatestFacts(expected.loadIdentity(), expected.revision(), state));
         }
     }
 
@@ -6669,7 +7108,8 @@ final class TopologyWorkerRuntime {
             SectionPos neighborSection = sourceTopology.neighbor(face, yShift);
             int part = baseLinkSlot(source.cluster().section(), neighborSection, face) + 1;
             if (!output.needsPart(part)) return;
-            if (admission != null && !admission.allowsSection(neighborSection)) {
+            if (!sourceTopology.topology.mayExit(sourceComponentId, neighborSection, movement)
+                    || (admission != null && !admission.allowsSection(neighborSection))) {
                 output.completePart(part);
                 return;
             }

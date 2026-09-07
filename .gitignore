@@ -24,6 +24,7 @@
 /run-data/
 /run-terrain-benchmark/
 /run-terrain-probe/*
+/terrain-qualification-input/
 /logs/
 *.log
 *.log.gz

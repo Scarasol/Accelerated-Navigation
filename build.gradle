@@ -1,9 +1,78 @@
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.services.BuildService
+import org.gradle.api.services.BuildServiceParameters
+
+import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
+import java.nio.channels.OverlappingFileLockException
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption
+
 plugins {
     id 'eclipse'
     id 'idea'
     id 'maven-publish'
     id 'net.minecraftforge.gradle' version '[6.0,6.2)'
     id 'org.spongepowered.mixin' version '0.7.+'
+}
+
+abstract class TerrainQualificationRunLock implements
+        BuildService<TerrainQualificationRunLock.Parameters>, AutoCloseable {
+    interface Parameters extends BuildServiceParameters {
+        RegularFileProperty getLockFile()
+    }
+
+    private FileChannel channel
+    private FileLock lock
+
+    synchronized void acquire() {
+        if (lock != null) {
+            return
+        }
+        Path lockPath = parameters.lockFile.get().asFile.toPath().toAbsolutePath().normalize()
+        Files.createDirectories(lockPath.parent)
+        channel = FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+        try {
+            lock = channel.tryLock()
+        } catch (OverlappingFileLockException active) {
+            failAcquire(lockPath, active)
+        }
+        if (lock == null) {
+            failAcquire(lockPath, null)
+        }
+    }
+
+    private void failAcquire(Path lockPath, Throwable cause) {
+        try {
+            channel.close()
+        } catch (IOException closeFailure) {
+            if (cause == null) {
+                cause = closeFailure
+            } else {
+                cause.addSuppressed(closeFailure)
+            }
+        } finally {
+            channel = null
+        }
+        throw new GradleException(
+                "Terrain qualification input is already in use: ${lockPath}", cause)
+    }
+
+    @Override
+    synchronized void close() throws Exception {
+        try {
+            if (lock != null) {
+                lock.close()
+            }
+        } finally {
+            lock = null
+            if (channel != null) {
+                channel.close()
+                channel = null
+            }
+        }
+    }
 }
 
 def acceleratedNavigationMod = [
@@ -15,6 +84,141 @@ def acceleratedNavigationMod = [
         authors    : 'Scarasol',
         description: 'Server-side hierarchical navigation scheduling infrastructure.'
 ]
+
+def terrainFlushVerification = (findProperty('terrainFlushVerification') ?: 'false')
+        .toString()
+        .toBoolean()
+if (hasProperty('terrainRouteScan')) {
+    throw new GradleException(
+            'terrainRouteScan was removed; use -PterrainTestMode=qualification or benchmark')
+}
+def terrainTestModeProperty = findProperty('terrainTestMode')?.toString()
+def terrainTestMode = terrainTestModeProperty ?: 'unset'
+def terrainCausality = (findProperty('terrainCausality') ?: 'false').toString().toBoolean()
+if (terrainCausality && terrainTestMode != 'benchmark') {
+    throw new GradleException('terrainCausality requires terrainTestMode=benchmark')
+}
+if (terrainTestMode != 'unset' && !(terrainTestMode in ['qualification', 'benchmark'])) {
+    throw new GradleException(
+            "terrainTestMode must be qualification or benchmark, got: ${terrainTestMode}")
+}
+if (terrainFlushVerification && terrainTestMode != 'unset') {
+    throw new GradleException('terrainFlushVerification cannot run with terrainTestMode')
+}
+def terrainFixtureScenario = 'FQS-01'
+def terrainFixtureControlProperty = findProperty('terrainFixtureControl')?.toString()
+def terrainFixtureControl = terrainFixtureControlProperty ?: 'FQC-01'
+if (terrainFixtureControlProperty != null && terrainTestMode != 'qualification') {
+    throw new GradleException('terrainFixtureControl is only valid with terrainTestMode=qualification')
+}
+if (terrainTestMode == 'qualification'
+        && !(terrainFixtureControl in ['FQC-01', 'FQC-02', 'FQC-03'])) {
+    throw new GradleException(
+            "terrainFixtureControl must be FQC-01, FQC-02 or FQC-03, got: ${terrainFixtureControl}")
+}
+def validationKeys = ['Profile', 'Case', 'Run', 'Batch', 'Variant', 'Control', 'Family']
+def terrainValidation = validationKeys.collectEntries { suffix ->
+    [(suffix.toLowerCase(Locale.ROOT)): findProperty("terrainValidation${suffix}")?.toString()]
+}
+def validationEnabled = terrainValidation.profile != null
+def validationWCounts = [W01: 4, W02: 4, W03: 2, W04: 12, W05: 5, W06: 3, W07: 15, W08: 5, W09: 3]
+if (!validationEnabled && terrainValidation.values().any { it != null }) {
+    throw new GradleException('terrainValidation parameters require terrainValidationProfile')
+}
+if (validationEnabled) {
+    if (!(terrainValidation.profile in ['formal', 'fixture', 'diagnostic'])
+            || terrainTestMode != 'benchmark' || terrainCausality || terrainFlushVerification
+            || terrainFixtureControlProperty != null) {
+        throw new GradleException('Invalid or conflicting production remediation validation profile')
+    }
+    def cases = terrainValidation.profile == 'diagnostic'
+            ? ['causality', 'generation-cost', 'probe'] : ['terrain', 'G', 'H', 'F', 'L', 'W', 'M']
+    if (terrainValidation.profile == 'fixture') cases += ['D06']
+    if (!(terrainValidation['case'] in cases)) {
+        throw new GradleException("Unsupported validation case: ${terrainValidation['case']}")
+    }
+    def scenario = terrainValidation['case']
+    def runs = scenario == 'W' ? validationWCounts.keySet()
+            : scenario in ['terrain', 'M', 'generation-cost', 'probe'] ? ['R1', 'R2', 'R3'] : ['R1']
+    if (!(terrainValidation.run in runs)) throw new GradleException('Invalid validation run')
+    if (scenario == 'W') {
+        if (!(terrainValidation.variant ==~ /[1-9][0-9]*/)
+                || terrainValidation.variant.toInteger() > validationWCounts[terrainValidation.run]) {
+            throw new GradleException('W requires its fixed one-based variant number')
+        }
+    } else if (scenario == 'D06') {
+        if (!(terrainValidation.variant in ['chunk-write-idle', 'chunk-write-pending', 'api-pending'])) {
+            throw new GradleException('Invalid D06 fixture variant')
+        }
+    } else if (scenario in ['M', 'generation-cost', 'probe']) {
+        if (!(terrainValidation.variant in ['on', 'off'])) throw new GradleException('Expected on/off variant')
+    } else if (terrainValidation.variant != null) throw new GradleException('Variant is not valid for this case')
+    def prefix = terrainValidation.profile == 'formal' ? 'PRM'
+            : terrainValidation.profile == 'fixture' ? 'PRMQ' : 'PRMD'
+    if (!(terrainValidation.batch ==~ /${prefix}[0-9]{2,}/)) {
+        throw new GradleException("Validation batch must use ${prefix} and at least two digits")
+    }
+    if (terrainValidation.profile == 'fixture') {
+        terrainValidation.control = terrainValidation.control ?: 'normal'
+        if (!(terrainValidation.control in ['normal', 'mutated', 'missed'])) {
+            throw new GradleException('Invalid fixture validation control')
+        }
+    } else if (terrainValidation.control != null) throw new GradleException('Control is fixture-only')
+    if (terrainValidation.family != null && (terrainValidation.profile != 'diagnostic' || scenario != 'probe'
+            || !(terrainValidation.family in ['endpoint', 'build', 'search', 'final-validation']))) {
+        throw new GradleException('Family is only valid for narrow probe diagnostics')
+    }
+}
+def validationSuffix = validationEnabled
+        ? ("${terrainValidation.batch}/${terrainValidation.run}/${terrainValidation['case']}"
+        + (terrainValidation.variant == null ? '' : "/${terrainValidation.variant}")
+        + (terrainValidation.family == null ? '' : "/${terrainValidation.family}")) : null
+def validationUsesFrozenWorld = validationEnabled
+        && terrainValidation['case'] in ['terrain', 'M', 'probe', 'causality']
+def validationInstanceOwned = false
+def terrainModeForConfiguration = terrainFlushVerification
+        ? 'flush'
+        : terrainTestMode
+def terrainRunDirectoryName = terrainFlushVerification
+        ? 'run-terrain-flush-verification'
+        : terrainModeForConfiguration == 'qualification'
+        ? 'run-terrain-qualification'
+        : terrainCausality ? 'run-terrain-causality' : 'run-terrain-benchmark'
+def terrainReportName = terrainFlushVerification
+        ? 'topology-flush-observation-verification.json'
+        : terrainModeForConfiguration == 'qualification'
+        ? 'real-terrain-qualification.json'
+        : terrainCausality ? 'production-causality-diagnostic-20260906/result.json'
+        : 'real-terrain-topology-current.json'
+def terrainWorldName = terrainFlushVerification
+        ? 'topology-flush-verification-world'
+        : terrainModeForConfiguration == 'qualification'
+        ? 'terrain-qualification-world'
+        : 'terrain-benchmark-world'
+if (validationEnabled) {
+    terrainRunDirectoryName = "run-production-remediation/${validationSuffix}"
+    terrainReportName = "production-remediation/${validationSuffix}/result.json"
+}
+// Persistent input lives outside build/ so ordinary clean does not remove qualified terrain.
+def terrainQualificationInputRootName = 'terrain-qualification-input'
+def terrainQualificationReportName = 'real-terrain-qualification.json'
+def terrainQualificationCandidateReportName = 'terrain-qualification-candidate.json'
+def terrainQualificationFailureReportName = 'terrain-qualification-failure.json'
+def terrainPreparedManifestName = 'terrain-qualification-manifest.json'
+def terrainBenchmarkBaselineReportName = 'real-terrain-topology.json'
+if (validationEnabled) terrainBenchmarkBaselineReportName =
+        'rqf28-current-reference-diagnostic-20260905/real-terrain-topology-current.json'
+def terrainQualificationModId = 'accelerated_navigation_terrain_fixture'
+def terrainObservationMixinConfig = 'accelerated_navigation.terrain_observation.mixins.json'
+def terrainFormalMixinConfig = 'accelerated_navigation.terrain_formal.mixins.json'
+def terrainFlushMixinConfig = 'accelerated_navigation.terrain_flush.mixins.json'
+def terrainQualificationStoreFile = layout.projectDirectory.file(
+        "${terrainQualificationInputRootName}/${terrainQualificationReportName}")
+def terrainQualificationRunLock = gradle.sharedServices.registerIfAbsent(
+        'terrainQualificationRunLock', TerrainQualificationRunLock) {
+    parameters.lockFile.set(layout.projectDirectory.file(
+            "${terrainQualificationInputRootName}/${terrainQualificationReportName}.lock"))
+}
 
 version = acceleratedNavigationMod.version
 group = acceleratedNavigationMod.group
@@ -33,10 +237,57 @@ sourceSets {
     gameTest {
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
         runtimeClasspath += output + compileClasspath + sourceSets.main.runtimeClasspath
+        if (terrainModeForConfiguration == 'qualification') {
+            // Forge scans every class in the selected mod source; qualification contains only its fixture.
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/MacroTopologyGameTests.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/RealTerrainTopologyBenchmark.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TopologyStoreFlushObservationVerification.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/Topology*.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/ProductionRemediation*.java'
+            java.exclude 'com/scarasol/acceleratednavigation/topology/**'
+        } else if (terrainModeForConfiguration == 'benchmark') {
+            // The formal run contains no qualification or refresh-diagnostic entrypoints.
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/MacroTopologyGameTests.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationController.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationEntrypoint.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationMod.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TopologyStoreFlushObservationVerification.java'
+            java.exclude 'com/scarasol/acceleratednavigation/topology/TopologyServiceFlushDiagnosticMixin.java'
+            java.exclude 'com/scarasol/acceleratednavigation/topology/TopologyStoreFlushDiagnosticMixin.java'
+        } else if (terrainModeForConfiguration == 'flush') {
+            // The refresh diagnostic contains no qualification or formal benchmark entrypoints.
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/MacroTopologyGameTests.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/RealTerrainTopologyBenchmark.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/ProductionRemediationTerrain.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/ProductionRemediationControls.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/ProductionRemediationMetrics.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationController.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationEntrypoint.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationMod.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationStore.java'
+            java.exclude 'com/scarasol/acceleratednavigation/gametest/TopologyFormalControlAccess.java'
+            def flushTopologyInputs = ['TopologyTestBridge.java', 'TopologyValidationAccess.java',
+                    'TopologyRuntimeFormalControlAccess.java', 'TopologyServiceObservationMixin.java',
+                    'TopologyStoreObservationMixin.java', 'TopologyServiceFlushDiagnosticMixin.java',
+                    'TopologyStoreFlushDiagnosticMixin.java', 'TopologyWorkerRuntimePrewarmMixin.java'] as Set
+            java.exclude { element ->
+                element.path.startsWith('com/scarasol/acceleratednavigation/topology/')
+                        && !flushTopologyInputs.contains(element.name)
+            }
+        }
     }
     test {
         compileClasspath += sourceSets.gameTest.output
         runtimeClasspath += sourceSets.gameTest.output
+    }
+}
+
+tasks.named('compileGameTestJava').configure {
+    if (terrainModeForConfiguration == 'qualification') {
+        outputs.upToDateWhen { false }
+        doFirst {
+            project.delete(destinationDirectory.get().asFile)
+        }
     }
 }
 
@@ -55,9 +306,12 @@ minecraft {
             property 'forge.logging.markers', 'REGISTRIES'
             property 'forge.logging.console.level', 'debug'
 
-            mods {
-                "${acceleratedNavigationMod.id}" {
-                    source sourceSets.main
+            if (!(terrainModeForConfiguration == 'qualification'
+                    && (name == 'server' || name == 'terrainBenchmarkServer'))) {
+                mods {
+                    "${acceleratedNavigationMod.id}" {
+                        source sourceSets.main
+                    }
                 }
             }
         }
@@ -74,16 +328,113 @@ minecraft {
         terrainBenchmarkServer {
             parent minecraft.runs.server
             taskName 'runTerrainBenchmarkServer'
-            workingDirectory project.file('run-terrain-benchmark-current')
-            args '--mixin.config', 'accelerated_navigation.terrain_benchmark.mixins.json'
-            property 'acceleratedNavigation.terrainBenchmark', 'true'
+            workingDirectory project.file(terrainRunDirectoryName)
+            args '--nogui'
+            property 'forge.enabledGameTestNamespaces',
+                    terrainModeForConfiguration == 'qualification'
+                            ? terrainQualificationModId
+                            : acceleratedNavigationMod.id
+            if (terrainModeForConfiguration != 'qualification') {
+                args '--mixin.config', terrainObservationMixinConfig
+                args '--mixin.config', terrainModeForConfiguration == 'flush'
+                        ? terrainFlushMixinConfig
+                        : terrainFormalMixinConfig
+            }
+            if (!terrainFlushVerification) {
+                property 'acceleratedNavigation.terrainBenchmark', 'true'
+                property 'acceleratedNavigation.terrainTestMode', terrainModeForConfiguration
+            }
+            if (terrainCausality || validationEnabled && terrainValidation['case'] == 'causality') {
+                property 'acceleratedNavigation.terrainCausality', 'true'
+                property 'acceleratedNavigation.terrainCausalityOutput',
+                        layout.buildDirectory.file(
+                                validationEnabled ? "reports/production-remediation/${validationSuffix}/observations.jsonl"
+                                        : 'reports/production-causality-diagnostic-20260906/observations.jsonl'
+                        ).get().asFile.absolutePath
+                args '--mixin.config', 'accelerated_navigation.terrain_causality.mixins.json'
+                args '--mixin.config', 'accelerated_navigation.build_causality.mixins.json'
+            }
+            if (validationEnabled && terrainValidation['case'] == 'probe' && terrainValidation.variant == 'on') {
+                property 'acceleratedNavigation.terrainProbe', 'true'
+                property 'acceleratedNavigation.terrainCausalityOutput',
+                        layout.buildDirectory.file("reports/production-remediation/${validationSuffix}/observations.jsonl").get().asFile.absolutePath
+                args '--mixin.config', 'accelerated_navigation.terrain_causality.mixins.json'
+                args '--mixin.config', 'accelerated_navigation.build_causality.mixins.json'
+            }
+            if (validationEnabled) {
+                terrainValidation.findAll { it.value != null }.each { key, value ->
+                    property "acceleratedNavigation.validation.${key}", value
+                }
+                property 'acceleratedNavigation.projectRoot', project.projectDir.absolutePath
+                property 'acceleratedNavigation.validation.observer', findProperty('terrainValidationObserver')?.toString() ?: ''
+                property 'acceleratedNavigation.validation.output',
+                        layout.buildDirectory.dir("reports/production-remediation/${validationSuffix}")
+                                .get().asFile.absolutePath
+                args '--mixin.config', 'accelerated_navigation.production_remediation.mixins.json'
+                if (terrainValidation['case'] == 'M') {
+                    args '--mixin.config', 'accelerated_navigation.metrics_validation.mixins.json'
+                }
+                if (terrainValidation['case'] in ['H', 'W', 'L', 'F']) {
+                    args '--mixin.config', 'accelerated_navigation.handoff_validation.mixins.json'
+                }
+            }
             property 'acceleratedNavigation.terrainReport',
-                    layout.buildDirectory.file(
-                            'reports/real-terrain-topology-0805-current.json'
-                    ).get().asFile.absolutePath
+                    terrainModeForConfiguration == 'qualification'
+                            ? project.file(
+                                    "${terrainRunDirectoryName}/${terrainQualificationCandidateReportName}"
+                            ).absolutePath
+                            : layout.buildDirectory.file(
+                                    "reports/${terrainReportName}"
+                            ).get().asFile.absolutePath
+            if (terrainModeForConfiguration == 'qualification') {
+                property 'acceleratedNavigation.fixtureScenario', terrainFixtureScenario
+                property 'acceleratedNavigation.fixtureControl', terrainFixtureControl
+                property 'acceleratedNavigation.terrainQualificationFailureReport',
+                        layout.buildDirectory.file(
+                                "reports/${terrainQualificationFailureReportName}"
+                        ).get().asFile.absolutePath
+            } else if (terrainModeForConfiguration == 'benchmark') {
+                property 'acceleratedNavigation.terrainQualificationReport',
+                        project.file(
+                                "${terrainRunDirectoryName}/${terrainPreparedManifestName}"
+                        ).absolutePath
+                property 'acceleratedNavigation.minecraftVersion', minecraft_version
+                property 'acceleratedNavigation.forgeVersion', forge_version
+                property 'acceleratedNavigation.terrainBaselineReport',
+                        layout.buildDirectory.file(
+                                "reports/${terrainBenchmarkBaselineReportName}"
+                        ).get().asFile.absolutePath
+            } else if (terrainFlushVerification) {
+                property 'acceleratedNavigation.terrainFlushVerification', 'true'
+                property 'acceleratedNavigation.sourceRoot',
+                        project.file('src/main/java').absolutePath
+                property 'acceleratedNavigation.productionResourcesRoot',
+                        project.file('src/main/resources').absolutePath
+                property 'acceleratedNavigation.gameTestRoot',
+                        project.file('src/gameTest').absolutePath
+                property 'acceleratedNavigation.fixtureResourcesRoot',
+                        project.file('src/gameTest/resources').absolutePath
+                property 'acceleratedNavigation.projectRoot',
+                        project.projectDir.absolutePath
+                property 'acceleratedNavigation.buildScript',
+                        project.file('build.gradle').absolutePath
+                property 'acceleratedNavigation.settingsScript',
+                        project.file('settings.gradle').absolutePath
+                property 'acceleratedNavigation.gradleProperties',
+                        project.file('gradle.properties').absolutePath
+            }
             mods {
-                "${acceleratedNavigationMod.id}" {
+                "${terrainModeForConfiguration == 'qualification'
+                        ? terrainQualificationModId
+                        : acceleratedNavigationMod.id}" {
                     source sourceSets.gameTest
+                }
+            }
+            if (terrainModeForConfiguration != 'qualification') {
+                mods {
+                    "${acceleratedNavigationMod.id}" {
+                        source sourceSets.main
+                    }
                 }
             }
         }
@@ -120,11 +471,15 @@ dependencies {
 
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
+    gameTestAnnotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
 }
 
 mixin {
     add sourceSets.main, 'accelerated_navigation.refmap.json'
-    config 'accelerated_navigation.mixins.json'
+    add sourceSets.gameTest, 'accelerated_navigation.terrain_benchmark.refmap.json'
+    if (terrainModeForConfiguration != 'qualification') {
+        config 'accelerated_navigation.mixins.json'
+    }
     debug.export = true
 }
 
@@ -146,6 +501,26 @@ tasks.named('processResources', ProcessResources).configure {
 
     filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
         expand replaceProperties
+    }
+}
+
+tasks.named('processGameTestResources', ProcessResources).configure {
+    if (terrainModeForConfiguration == 'qualification') {
+        exclude 'accelerated_navigation.terrain_*.mixins.json'
+        exclude 'accelerated_navigation.build_causality.mixins.json'
+        exclude 'accelerated_navigation.production_remediation.mixins.json'
+        exclude 'accelerated_navigation.handoff_validation.mixins.json'
+        exclude 'accelerated_navigation.metrics_validation.mixins.json'
+    } else if (terrainModeForConfiguration == 'flush') {
+        exclude 'META-INF/mods.toml'
+        exclude 'accelerated_navigation.build_causality.mixins.json'
+        exclude 'accelerated_navigation.terrain_formal.mixins.json'
+        exclude 'accelerated_navigation.production_remediation.mixins.json'
+        exclude 'accelerated_navigation.handoff_validation.mixins.json'
+        exclude 'accelerated_navigation.metrics_validation.mixins.json'
+    } else if (terrainModeForConfiguration == 'benchmark') {
+        exclude 'META-INF/mods.toml'
+        exclude 'accelerated_navigation.terrain_flush.mixins.json'
     }
 }
 
@@ -201,36 +576,159 @@ tasks.register('verifyGameTestSourceSetIsolation') {
 }
 
 tasks.register('prepareTerrainBenchmarkServer') {
-    def runDirectory = layout.projectDirectory.dir('run-terrain-benchmark-current')
+    if (!terrainFlushVerification) {
+        usesService terrainQualificationRunLock
+        doFirst {
+            terrainQualificationRunLock.get().acquire()
+        }
+    }
+    def runDirectory = layout.projectDirectory.dir(terrainRunDirectoryName)
     def eulaFile = runDirectory.file('eula.txt')
     def propertiesFile = runDirectory.file('server.properties')
-    def reportFile = layout.buildDirectory.file(
-            'reports/real-terrain-topology-0805-current.json'
+    def resultReportFile = layout.buildDirectory.file(
+            "reports/${terrainReportName}"
     )
-    def worldDirectory = runDirectory.dir('terrain-benchmark-world-0805-20260820-a')
-    outputs.files(eulaFile, propertiesFile)
+    def qualificationCandidateReportFile = runDirectory.file(
+            terrainQualificationCandidateReportName
+    )
+    def qualificationReportFile = terrainQualificationStoreFile
+    def worldDirectory = runDirectory.dir(terrainWorldName)
+    def preparedManifestFile = runDirectory.file(terrainPreparedManifestName)
+    def qualificationFailureReportFile = layout.buildDirectory.file(
+            "reports/${terrainQualificationFailureReportName}"
+    )
+    if (!validationEnabled) outputs.files(eulaFile, propertiesFile)
+    if (terrainModeForConfiguration == 'qualification') {
+        outputs.files(qualificationCandidateReportFile, qualificationFailureReportFile)
+    } else if (terrainModeForConfiguration == 'benchmark' && !validationEnabled) {
+        outputs.files(resultReportFile, preparedManifestFile)
+    } else if (terrainFlushVerification) {
+        outputs.file(resultReportFile)
+    }
     outputs.upToDateWhen { false }
     doLast {
-        if (worldDirectory.asFile.exists()) {
-            throw new GradleException(
-                    "Current-source terrain benchmark world already exists: ${worldDirectory.asFile}"
-            )
+        if (validationEnabled && (runDirectory.asFile.exists()
+                || resultReportFile.get().asFile.parentFile.exists())) {
+            throw new GradleException('Validation instance already exists; select a new batch')
         }
-        reportFile.get().asFile.delete()
+        if (validationEnabled) validationInstanceOwned = true
+        if (!terrainFlushVerification && worldDirectory.asFile.exists()) {
+            def worldRoot = worldDirectory.asFile.toPath().toAbsolutePath().normalize()
+            def sessionLock = worldRoot.resolve('session.lock')
+            if (java.nio.file.Files.isRegularFile(sessionLock)) {
+                try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(
+                        sessionLock, java.nio.file.StandardOpenOption.WRITE)) {
+                    try (java.nio.channels.FileLock ignored = channel.tryLock()) {
+                        if (ignored == null) {
+                            throw new GradleException(
+                                    "Previous terrain test world is still in use: ${worldRoot}")
+                        }
+                    } catch (java.nio.channels.OverlappingFileLockException active) {
+                        throw new GradleException(
+                                "Previous terrain test world is still in use: ${worldRoot}", active)
+                    }
+                } catch (java.nio.file.NoSuchFileException ignored) {
+                    // The world disappeared between the existence check and lock check.
+                }
+            }
+            project.delete(worldRoot.toFile())
+            if (java.nio.file.Files.exists(worldRoot)) {
+                throw new GradleException(
+                        "Could not remove previous terrain test world: ${worldRoot}")
+            }
+        }
+        if (terrainModeForConfiguration == 'qualification') {
+            java.nio.file.Files.deleteIfExists(qualificationFailureReportFile.get().asFile.toPath())
+            java.nio.file.Files.deleteIfExists(qualificationCandidateReportFile.asFile.toPath())
+            project.delete(runDirectory.dir('fqc-02-missing-world').asFile)
+            project.delete(qualificationReportFile.asFile.toPath()
+                    .resolveSibling(qualificationReportFile.asFile.name + '.candidate'))
+        } else if (terrainModeForConfiguration == 'benchmark' && (!validationEnabled || validationUsesFrozenWorld)) {
+            java.nio.file.Files.deleteIfExists(resultReportFile.get().asFile.toPath())
+            java.nio.file.Files.deleteIfExists(preparedManifestFile.asFile.toPath())
+            def qualificationBase = qualificationReportFile.asFile.toPath().toAbsolutePath()
+            def pointer = qualificationBase.resolveSibling(
+                    qualificationBase.fileName.toString() + '.current')
+            if (!java.nio.file.Files.isRegularFile(pointer)) {
+                throw new GradleException(
+                        "No current terrain qualification batch exists: ${pointer}")
+            }
+            def slot = java.nio.file.Files.readString(pointer).trim()
+            if (!(slot in ['a', 'b'])) {
+                throw new GradleException("Invalid terrain qualification slot pointer: ${slot}")
+            }
+            def sourceWorld = qualificationBase.resolveSibling(
+                    qualificationBase.fileName.toString() + '.slots')
+                    .resolve("slot-${slot}").resolve('world')
+            def sourceManifest = qualificationBase.resolveSibling(
+                    qualificationBase.fileName.toString() + '.slots')
+                    .resolve("slot-${slot}").resolve('manifest.json')
+            if (validationEnabled) {
+                def digest = java.security.MessageDigest.getInstance('SHA-256')
+                def manifestHash = digest.digest(Files.readAllBytes(sourceManifest)).encodeHex().toString()
+                if (slot != 'a' || manifestHash != '16eb5bbd262bdf6d10b69535787e270a0a097f6add45feebc3b8ca4b8f40b4ff') {
+                    throw new GradleException('Validation requires the frozen slot-a manifest identity')
+                }
+            }
+            if (!java.nio.file.Files.isDirectory(sourceWorld)
+                    || !java.nio.file.Files.isRegularFile(sourceWorld.resolve('level.dat'))
+                    || !java.nio.file.Files.isRegularFile(sourceManifest)) {
+                throw new GradleException(
+                        "Current terrain qualification world is incomplete: ${sourceWorld}")
+            }
+            def parsedManifest
+            try {
+                parsedManifest = new groovy.json.JsonSlurper().parse(sourceManifest.toFile())
+            } catch (RuntimeException failure) {
+                throw new GradleException(
+                        "Current terrain qualification report cannot be parsed: ${sourceManifest}",
+                        failure)
+            }
+            def expectedKeys = ['routes', 'selectionCoverage'] as Set
+            if (!(parsedManifest instanceof Map)
+                    || (parsedManifest.keySet() as Set) != expectedKeys
+                    || !(parsedManifest.routes instanceof List)
+                    || !(parsedManifest.selectionCoverage instanceof List)) {
+                throw new GradleException(
+                        "Current terrain qualification report has an invalid top-level structure: ${sourceManifest}")
+            }
+            def copyTree
+            copyTree = { java.nio.file.Path source, java.nio.file.Path target ->
+                java.nio.file.Files.createDirectories(target)
+                java.nio.file.Files.walk(source).withCloseable { paths ->
+                    paths.sorted().forEach { java.nio.file.Path path ->
+                            def relative = source.relativize(path)
+                            def destination = target.resolve(relative)
+                            if (java.nio.file.Files.isDirectory(path)) {
+                                java.nio.file.Files.createDirectories(destination)
+                            } else {
+                                java.nio.file.Files.createDirectories(destination.parent)
+                                java.nio.file.Files.copy(path, destination,
+                                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                                        java.nio.file.StandardCopyOption.COPY_ATTRIBUTES)
+                            }
+                    }
+                }
+            }
+            copyTree(sourceWorld, worldDirectory.asFile.toPath())
+            java.nio.file.Files.copy(sourceManifest, preparedManifestFile.asFile.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.COPY_ATTRIBUTES)
+        }
         runDirectory.asFile.mkdirs()
         eulaFile.asFile.setText('eula=true\n', 'UTF-8')
-        propertiesFile.asFile.setText('''\
+        propertiesFile.asFile.setText("""\
 allow-flight=true
 difficulty=normal
 enable-command-block=false
 enable-rcon=false
 enable-status=false
 generate-structures=true
-level-name=terrain-benchmark-world-0805-20260820-a
+level-name=${terrainWorldName}
 level-seed=73939133
 level-type=minecraft:normal
 max-tick-time=-1
-motd=Accelerated Navigation Current Terrain Benchmark
+motd=Accelerated Navigation Terrain Test
 online-mode=false
 server-ip=127.0.0.1
 server-port=0
@@ -238,37 +736,243 @@ simulation-distance=4
 spawn-protection=0
 sync-chunk-writes=true
 view-distance=4
-''', 'UTF-8')
+""", 'UTF-8')
+        if (validationEnabled) {
+            javaexec {
+                classpath = sourceSets.gameTest.runtimeClasspath
+                mainClass = 'com.scarasol.acceleratednavigation.gametest.ProductionRemediationReport'
+                args 'prepare', project.projectDir.absolutePath,
+                        resultReportFile.get().asFile.parentFile.absolutePath,
+                        runDirectory.asFile.absolutePath,
+                        groovy.json.JsonOutput.toJson(terrainValidation)
+            }
+        }
     }
 }
 
-tasks.register('verifyTerrainBenchmarkReport') {
+def cleanupTerrainBenchmarkWorkingCopy = tasks.register(
+        'cleanupTerrainBenchmarkWorkingCopy') {
+    onlyIf { terrainModeForConfiguration == 'benchmark' && (!validationEnabled || validationInstanceOwned) }
+    if (terrainModeForConfiguration == 'benchmark') {
+        usesService terrainQualificationRunLock
+    }
     doLast {
-        def report = layout.buildDirectory.file(
-                'reports/real-terrain-topology-0805-current.json'
-        ).get().asFile
-        if (!report.isFile()) {
-            throw new GradleException('Current-source real terrain benchmark did not produce a report')
+        def worldRoot = project.file(
+                "${terrainRunDirectoryName}/${terrainWorldName}").toPath().toAbsolutePath().normalize()
+        def expectedRoot = project.file(terrainRunDirectoryName).toPath().toAbsolutePath().normalize()
+        if (!worldRoot.startsWith(expectedRoot) || worldRoot == expectedRoot) {
+            throw new GradleException('Working world cleanup escaped its instance directory')
         }
-        def parsed = new groovy.json.JsonSlurper().parse(report)
-        if (parsed.benchmarkKind != 'real_generated_terrain_current_0805') {
-            throw new GradleException('Current-source real terrain report has the wrong kind')
+        Exception cleanupFailure = null
+        try {
+            project.delete(worldRoot.toFile())
+            java.nio.file.Files.deleteIfExists(project.file(
+                    "${terrainRunDirectoryName}/${terrainPreparedManifestName}").toPath())
+            if (java.nio.file.Files.exists(worldRoot)) {
+                throw new GradleException("Could not remove terrain benchmark working copy: ${worldRoot}")
+            }
+        } catch (Exception failure) {
+            cleanupFailure = failure
+        } finally {
+            if (validationEnabled) {
+                def output = layout.buildDirectory.dir("reports/production-remediation/${validationSuffix}").get().asFile.toPath()
+                Files.createDirectories(output)
+                def serverLog = project.file("${terrainRunDirectoryName}/logs/latest.log").toPath()
+                if (Files.isRegularFile(serverLog)) Files.copy(serverLog, output.resolve('server.log'))
+                def execution = tasks.named('runTerrainBenchmarkServer').get().executionResult.orNull
+                def exit = [observerId: findProperty('terrainValidationObserver')?.toString(),
+                            serverProcessExitCode: execution?.exitValue, gradleProcessExitCode: null,
+                            outerProcessExitCode: null, outerExitReason: 'Recorded by the external command observer after Gradle exits',
+                            cleanupComplete: cleanupFailure == null, cleanupFailure: cleanupFailure?.toString(),
+                            serverLogAvailable: Files.isRegularFile(output.resolve('server.log'))]
+                Files.writeString(output.resolve('server-exit.json'), groovy.json.JsonOutput.toJson(exit),
+                        java.nio.file.StandardOpenOption.CREATE_NEW)
+                def launcher = [java: javaToolchains.launcherFor(java.toolchain).get().executablePath.asFile.absolutePath,
+                                classpath: sourceSets.gameTest.runtimeClasspath.asPath,
+                                main: 'com.scarasol.acceleratednavigation.gametest.ProductionRemediationReport']
+                Files.writeString(output.resolve('report-launch.json'), groovy.json.JsonOutput.toJson(launcher),
+                        java.nio.file.StandardOpenOption.CREATE_NEW)
+            }
         }
-        def names = parsed.routes.collect { it.name } as Set
-        def expected = [
-                'surface_8', 'surface_64', 'surface_96', 'surface_512',
-                'cave_8', 'cave_64', 'cave_96',
-                'nether_8', 'nether_64', 'nether_96'
-        ] as Set
-        if (names != expected) {
-            throw new GradleException("Current-source report route mismatch: ${expected - names}")
+        if (cleanupFailure != null) throw cleanupFailure
+    }
+}
+
+tasks.register('validateTerrainBenchmarkMode') {
+    doLast {
+        if (terrainFlushVerification) {
+            return
+        }
+        if (!(terrainTestModeProperty in ['qualification', 'benchmark'])) {
+            throw new GradleException(
+                    'runTerrainBenchmarkServer requires -PterrainTestMode=qualification or benchmark')
         }
     }
 }
+
+tasks.named('prepareTerrainBenchmarkServer').configure {
+    dependsOn tasks.named('validateTerrainBenchmarkMode')
+    if (validationEnabled) dependsOn tasks.named('gameTestClasses')
+}
+
+def readRequiredJsonMap = { File source, String description ->
+    if (!source.isFile()) {
+        throw new GradleException("${description} is missing: ${source}")
+    }
+    def parsed
+    try {
+        parsed = new groovy.json.JsonSlurper().parse(source)
+    } catch (RuntimeException failure) {
+        throw new GradleException("${description} cannot be parsed: ${source}", failure)
+    }
+    if (!(parsed instanceof Map)) {
+        throw new GradleException("${description} has an invalid top-level structure: ${source}")
+    }
+    return parsed
+}
+
+def validateQualificationFailure = { File source, String expectedStage ->
+    def parsed = readRequiredJsonMap(source, 'Terrain qualification failure report')
+    if (parsed.state != 'HARNESS_FAILED' || parsed.failureStage != expectedStage) {
+        throw new GradleException(
+                "Terrain qualification failure report did not record ${expectedStage}: ${source}")
+    }
+}
+
+def forbiddenFormalReportKeys = [
+        'chunkLoading', 'routeManifest', 'samples', 'progress', 'corridor',
+        'workerDelta', 'workerStateAfter', 'metricsAfterRoute', 'metricsAfterQueries',
+        'metricsBeforeQueries', 'metricsAfterLoad', 'metricsAtFailure'
+] as Set
+def assertNoForbiddenFormalFields
+assertNoForbiddenFormalFields = { Object value, String path ->
+    if (value instanceof Map) {
+        value.each { key, nested ->
+            if (forbiddenFormalReportKeys.contains(key.toString())) {
+                throw new GradleException(
+                        "Formal terrain report contains diagnostic field ${path}.${key}")
+            }
+            assertNoForbiddenFormalFields(nested, "${path}.${key}")
+        }
+    } else if (value instanceof Collection) {
+        value.eachWithIndex { nested, index ->
+            assertNoForbiddenFormalFields(nested, "${path}[${index}]")
+        }
+    }
+}
+
+def validateFormalTerrainReport = { File source ->
+    def parsed = readRequiredJsonMap(source, 'Formal terrain benchmark report')
+    if (!(parsed.state in ['DATA_COMPLETE', 'DATA_PARTIAL'])) {
+        throw new GradleException(
+                "Formal terrain benchmark did not publish a production data result: ${parsed.state}")
+    }
+    for (String required : ['runScope', 'routes', 'pressureStages', 'historyBaseline']) {
+        if (!parsed.containsKey(required)) {
+            throw new GradleException(
+                    "Formal terrain benchmark report is missing ${required}: ${source}")
+        }
+    }
+    assertNoForbiddenFormalFields(parsed, '$')
+}
+
+def qualificationPointerSnapshot = [:]
 
 tasks.matching { it.name == 'runTerrainBenchmarkServer' }.configureEach {
+    dependsOn tasks.named('validateTerrainBenchmarkMode')
     dependsOn tasks.named('prepareTerrainBenchmarkServer')
-    finalizedBy tasks.named('verifyTerrainBenchmarkReport')
+    dependsOn tasks.named('verifyGameTestSourceSetIsolation')
+    if (!terrainFlushVerification) {
+        usesService terrainQualificationRunLock
+    }
+    if (terrainModeForConfiguration == 'qualification') {
+        doFirst {
+            def base = terrainQualificationStoreFile.asFile.toPath().toAbsolutePath().normalize()
+            def pointer = base.resolveSibling(base.fileName.toString() + '.current')
+            qualificationPointerSnapshot.exists = java.nio.file.Files.isRegularFile(pointer)
+            qualificationPointerSnapshot.contents = qualificationPointerSnapshot.exists
+                    ? java.nio.file.Files.readString(pointer) : null
+        }
+        doLast {
+            def storePath = terrainQualificationStoreFile.asFile
+            def failureReport = layout.buildDirectory.file(
+                    "reports/${terrainQualificationFailureReportName}").get().asFile
+            def qualificationReport = project.file(
+                    "${terrainRunDirectoryName}/${terrainQualificationCandidateReportName}")
+            def qualificationWorld = project.file(
+                    "${terrainRunDirectoryName}/${terrainWorldName}")
+            def base = storePath.toPath().toAbsolutePath().normalize()
+            def pointer = base.resolveSibling(base.fileName.toString() + '.current')
+            def candidate = base.resolveSibling(base.fileName.toString() + '.candidate')
+            def candidateTemporary = candidate.resolveSibling(candidate.fileName.toString() + '.tmp')
+            def pointerTemporary = pointer.resolveSibling(pointer.fileName.toString() + '.tmp')
+            def assertPointerUnchanged = {
+                boolean exists = java.nio.file.Files.isRegularFile(pointer)
+                String contents = exists ? java.nio.file.Files.readString(pointer) : null
+                if (exists != qualificationPointerSnapshot.exists
+                        || contents != qualificationPointerSnapshot.contents) {
+                    throw new GradleException(
+                            "${terrainFixtureControl} changed the current qualification pointer")
+                }
+            }
+            def assertNoHandoffTemporary = {
+                if (java.nio.file.Files.exists(candidate)
+                        || java.nio.file.Files.exists(candidateTemporary)
+                        || java.nio.file.Files.exists(pointerTemporary)) {
+                    throw new GradleException(
+                            "${terrainFixtureControl} left qualification handoff temporary state")
+                }
+            }
+            if (terrainFixtureControl == 'FQC-01') {
+                javaexec {
+                    classpath = sourceSets.gameTest.runtimeClasspath
+                    mainClass = 'com.scarasol.acceleratednavigation.gametest.TerrainQualificationStore'
+                    args 'finish', storePath.absolutePath, qualificationReport.absolutePath,
+                            failureReport.absolutePath, qualificationWorld.absolutePath
+                }
+                logger.lifecycle("Fixture scenario ${terrainFixtureScenario} control FQC-01 completed")
+            } else if (terrainFixtureControl == 'FQC-02') {
+                def missingWorld = project.file(
+                        "${terrainRunDirectoryName}/fqc-02-missing-world")
+                project.delete(missingWorld)
+                Exception expectedFailure = null
+                try {
+                    javaexec {
+                        classpath = sourceSets.gameTest.runtimeClasspath
+                        mainClass = 'com.scarasol.acceleratednavigation.gametest.TerrainQualificationStore'
+                        args 'finish', storePath.absolutePath, qualificationReport.absolutePath,
+                                failureReport.absolutePath, missingWorld.absolutePath
+                    }
+                } catch (Exception failure) {
+                    expectedFailure = failure
+                }
+                if (expectedFailure == null) {
+                    throw new GradleException('FQC-02 unexpectedly completed its missing-world handoff')
+                }
+                validateQualificationFailure(failureReport, 'input_handoff')
+                assertPointerUnchanged()
+                assertNoHandoffTemporary()
+                throw new GradleException(
+                        'Fixture scenario FQS-01 control FQC-02 produced the expected non-zero handoff failure',
+                        expectedFailure)
+            } else {
+                validateQualificationFailure(failureReport, 'qualification_server_stopped_early')
+                if (qualificationReport.exists()) {
+                    throw new GradleException('FQC-03 published a successful qualification report')
+                }
+                assertPointerUnchanged()
+                assertNoHandoffTemporary()
+                throw new GradleException(
+                        'Fixture scenario FQS-01 control FQC-03 produced the expected non-zero early stop')
+            }
+        }
+    } else if (terrainModeForConfiguration == 'benchmark') {
+        doLast {
+            if (!validationEnabled) validateFormalTerrainReport(layout.buildDirectory.file(
+                    "reports/${terrainReportName}").get().asFile)
+        }
+        finalizedBy cleanupTerrainBenchmarkWorkingCopy
+    }
 }
 
 tasks.named('check').configure {

@@ -1,14 +1,13 @@
 package com.scarasol.acceleratednavigation.mixin;
 
 import com.scarasol.acceleratednavigation.topology.TopologyService;
-import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.ImposterProtoChunk;
 import net.minecraft.world.level.chunk.ProtoChunk;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ProtoChunk.class)
 abstract class ProtoChunkTopologyMixin implements TopologyService.ChunkFactsCarrier {
@@ -17,19 +16,11 @@ abstract class ProtoChunkTopologyMixin implements TopologyService.ChunkFactsCarr
     private TopologyService.ChunkFactsState acceleratedNavigation$facts =
             new TopologyService.ChunkFactsState();
 
-    @Inject(method = "setBlockState", at = @At("RETURN"))
-    private void acceleratedNavigation$recordGeneratedFacts(
-            BlockPos position,
-            BlockState state,
-            boolean moved,
-            CallbackInfoReturnable<BlockState> callback) {
-        if (callback.getReturnValue() == null
-                || !acceleratedNavigation$facts.recordsGeneration()) {
-            return;
-        }
-        acceleratedNavigation$facts.recordGeneratedColumn(
-                position,
-                TopologyService.sampleColumnFacts((ProtoChunk) (Object) this, position));
+    @Inject(method = "<init>", at = @At("RETURN"))
+    private void acceleratedNavigation$bindSections(CallbackInfo callback) {
+        // ImposterProtoChunk has not initialized its wrapped chunk at this point.
+        if ((Object) this instanceof ImposterProtoChunk) return;
+        TopologyService.bindGeneration((ProtoChunk) (Object) this);
     }
 
     @Override

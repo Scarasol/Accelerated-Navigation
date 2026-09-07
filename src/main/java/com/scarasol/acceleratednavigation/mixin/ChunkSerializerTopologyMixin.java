@@ -77,6 +77,10 @@ abstract class ChunkSerializerTopologyMixin {
         if (!(source instanceof TopologyService.ChunkFactsCarrier carrier)) {
             return;
         }
+        if (!TopologyService.canReuseFactVersions(level.getServer())) {
+            callback.getReturnValue().remove(VERSIONS_TAG);
+            return;
+        }
         ListTag encoded = new ListTag();
         carrier.acceleratedNavigation$factsState().versions().entrySet().stream()
                 .sorted(Map.Entry.comparingByKey())
@@ -86,7 +90,7 @@ abstract class ChunkSerializerTopologyMixin {
                     entry.putLong(VERSION_TAG, version.getValue());
                     encoded.add(entry);
                 });
-        if (encoded.isEmpty()) {
+        if (encoded.isEmpty() || !TopologyService.canReuseFactVersions(level.getServer())) {
             callback.getReturnValue().remove(VERSIONS_TAG);
         } else {
             callback.getReturnValue().put(VERSIONS_TAG, encoded);

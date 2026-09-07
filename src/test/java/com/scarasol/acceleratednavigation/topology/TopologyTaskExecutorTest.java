@@ -12,6 +12,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class TopologyTaskExecutorTest {
 
     @Test
+    void finalControlRemainsOnOriginalWorkerAfterShutdownDuringRunningControl() throws Exception {
+        TopologyTaskExecutor executor = new TopologyTaskExecutor(() -> false);
+        CountDownLatch started = new CountDownLatch(1), release = new CountDownLatch(1), finalControl = new CountDownLatch(1);
+        Thread caller = Thread.currentThread();
+        var completedOn = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        try {
+            executor.submitControl(() -> {
+                started.countDown();
+                try { release.await(); } catch (InterruptedException failure) { Thread.currentThread().interrupt(); }
+            });
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            executor.shutdown(() -> { completedOn.set(Thread.currentThread()); finalControl.countDown(); });
+            assertFalse(executor.awaitTermination(20, TimeUnit.MILLISECONDS));
+            release.countDown();
+            assertTrue(finalControl.await(5, TimeUnit.SECONDS));
+            assertTrue(completedOn.get() != caller && completedOn.get().getName().startsWith("accelerated-navigation-topology-"));
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        } finally { release.countDown(); executor.shutdown(); executor.awaitTermination(5, TimeUnit.SECONDS); }
+    }
+
+    @Test
     void shutdownWaitsForRunningAtomicTask() throws Exception {
         TopologyTaskExecutor executor = new TopologyTaskExecutor(() -> false);
         CountDownLatch started = new CountDownLatch(1);

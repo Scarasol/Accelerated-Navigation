@@ -10,6 +10,7 @@
   "mixins": [
     "ChunkSerializerTopologyMixin",
     "LevelChunkTopologyMixin",
+    "LevelChunkSectionTopologyMixin",
     "ProtoChunkTopologyMixin"
   ],
   "client": []

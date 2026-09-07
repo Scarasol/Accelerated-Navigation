@@ -19,6 +19,9 @@ final class SuperClusterTopology {
     private static final Direction[] INTERNAL_DIRECTIONS = {
             Direction.EAST, Direction.UP, Direction.SOUTH
     };
+    private static final Direction[] HORIZONTAL_DIRECTIONS = {
+            Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST
+    };
     private static final int AGGREGATE_ANCHOR_MASK = 0x0fff;
     private static final int AGGREGATE_CHILD_SHIFT = 12;
     private static final int AGGREGATE_EXIT_SHIFT = 15;
@@ -288,34 +291,28 @@ final class SuperClusterTopology {
 
         Long2ObjectOpenHashMap<long[]> masks = new Long2ObjectOpenHashMap<>();
         int sectionYDelta = (target.section().y() - source.section().y()) * BaseClusterTopology.SIDE;
-        int maximumDistance = face.getAxis().isVertical()
-                || source.geometry().channel() == BaseClusterTopology.Channel.VOLUME
-                ? 1 : BaseClusterTopology.MAX_STRUCTURAL_JUMP;
-        for (int distance = 1; distance <= maximumDistance; distance++) {
-            for (int sourceInset = 0; sourceInset < distance; sourceInset++) {
-                int targetInset = distance - sourceInset - 1;
-                for (int v = 0; v < BaseClusterTopology.SIDE; v++) {
-                    for (int u = 0; u < BaseClusterTopology.SIDE; u++) {
-                        int sourceCell = faceCell(face, u, v, sourceInset);
-                        int sourceComponent = source.componentAt(BaseClusterTopology.x(sourceCell),
-                                BaseClusterTopology.y(sourceCell), BaseClusterTopology.z(sourceCell));
-                        if (sourceComponent < 0) continue;
-                        if (face.getAxis().isVertical()) {
-                            addBoundaryMask(masks, sourceComponent, target, face, u, v, v,
-                                    targetInset, 0, face.getStepY());
-                        } else if (source.geometry().channel() == BaseClusterTopology.Channel.VOLUME) {
-                            int targetV = v - sectionYDelta;
-                            if (targetV >= 0 && targetV < BaseClusterTopology.SIDE) {
-                                addBoundaryMask(masks, sourceComponent, target, face, u, v, targetV,
-                                        targetInset, distance, 0);
-                            }
-                        } else {
-                            for (int targetV = 0; targetV < BaseClusterTopology.SIDE; targetV++) {
-                                int dy = sectionYDelta + targetV - v;
-                                if (dy < -BaseClusterTopology.MAX_STRUCTURAL_DROP
-                                        || dy > BaseClusterTopology.MAX_STRUCTURAL_STEP) continue;
-                                addBoundaryMask(masks, sourceComponent, target, face, u, v, targetV,
-                                        targetInset, distance, dy);
+        boolean vertical = face.getAxis().isVertical();
+        boolean volume = source.geometry().channel() == BaseClusterTopology.Channel.VOLUME;
+        int depth = volume ? 1 : vertical
+                ? (face == Direction.UP ? BaseClusterTopology.MAX_STRUCTURAL_STEP
+                : BaseClusterTopology.MAX_STRUCTURAL_DROP) : BaseClusterTopology.MAX_STRUCTURAL_JUMP;
+        Direction[] directions = vertical && !volume ? HORIZONTAL_DIRECTIONS : new Direction[]{face};
+        int maximumDistance = volume ? (vertical ? 0 : 1) : BaseClusterTopology.MAX_STRUCTURAL_JUMP;
+        int minimumDy = volume ? face.getStepY() : -BaseClusterTopology.MAX_STRUCTURAL_DROP;
+        int maximumDy = volume ? face.getStepY() : BaseClusterTopology.MAX_STRUCTURAL_STEP;
+        for (int inset = 0; inset < depth; inset++) {
+            for (int v = 0; v < BaseClusterTopology.SIDE; v++) {
+                for (int u = 0; u < BaseClusterTopology.SIDE; u++) {
+                    int cell = faceCell(face, u, v, inset);
+                    int component = source.componentAt(BaseClusterTopology.x(cell),
+                            BaseClusterTopology.y(cell), BaseClusterTopology.z(cell));
+                    if (component < 0) continue;
+                    int firstDistance = volume && vertical ? 0 : vertical ? 1 : inset + 1;
+                    for (Direction direction : directions) {
+                        for (int distance = firstDistance; distance <= maximumDistance; distance++) {
+                            for (int dy = minimumDy; dy <= maximumDy; dy++) {
+                                addBoundaryMask(masks, component, target, face, cell, faceIndex(u, v),
+                                        inset, direction, distance, dy, sectionYDelta);
                             }
                         }
                     }
@@ -326,31 +323,28 @@ final class SuperClusterTopology {
     }
 
     private static void addBoundaryMask(Long2ObjectOpenHashMap<long[]> masks,
-                                        int sourceComponent,
-                                        BaseClusterTopology target,
-                                        Direction face,
-                                         int u,
-                                         int sourceV,
-                                         int targetV,
-                                         int targetInset,
-                                         int horizontalDistance,
-                                         int dy) {
-        int targetCell = faceCell(face.getOpposite(), u, targetV, targetInset);
+                                         int sourceComponent,
+                                         BaseClusterTopology target,
+                                         Direction face,
+                                         int sourceCell,
+                                         int bit,
+                                         int sourceInset,
+                                         Direction direction,
+                                         int distance,
+                                         int dy,
+                                         int sectionYDelta) {
         int targetComponent = target.componentAt(
-                BaseClusterTopology.x(targetCell),
-                BaseClusterTopology.y(targetCell),
-                BaseClusterTopology.z(targetCell)
+                BaseClusterTopology.x(sourceCell) + direction.getStepX() * distance - face.getStepX() * 16,
+                BaseClusterTopology.y(sourceCell) + dy - sectionYDelta,
+                BaseClusterTopology.z(sourceCell) + direction.getStepZ() * distance - face.getStepZ() * 16
         );
         if (targetComponent < 0) return;
-        long key = boundaryBandKey(sourceComponent, targetComponent, horizontalDistance, dy);
+        int directionBits = distance == 0 ? 0 : direction.get2DDataValue();
+        // Bits: inset 0..1, horizontal direction 2..3, distance 4..5, dy + 4 in 6..8.
+        int descriptor = sourceInset | directionBits << 2 | distance << 4 | (dy + 4) << 6;
+        long key = ((long) sourceComponent << 32) | ((long) targetComponent << 16) | descriptor;
         long[] mask = masks.computeIfAbsent(key, ignored -> new long[4]);
-        int bit = faceIndex(u, sourceV);
         mask[bit >>> 6] |= 1L << bit;
-    }
-
-    private static long boundaryBandKey(int source, int target, int horizontal, int shift) {
-        return ((long) source << 32) | ((long) target << 16)
-                | ((long) horizontal << 8) | (shift + 128L);
     }
 
     private static int boundarySource(long key) {
@@ -361,12 +355,11 @@ final class SuperClusterTopology {
         return (int) ((key >>> 16) & 0xffffL);
     }
 
-    private static int boundaryShift(long key) {
-        return (int) (key & 0xffL) - 128;
-    }
-
-    private static int boundaryHorizontal(long key) {
-        return (int) (key >>> 8) & 0xff;
+    static int bandInset(int descriptor) { return descriptor & 3; }
+    static int bandDistance(int descriptor) { return (descriptor >>> 4) & 3; }
+    static int bandShift(int descriptor) { return ((descriptor >>> 6) & 7) - 4; }
+    static Direction bandDirection(int descriptor) {
+        return bandDistance(descriptor) == 0 ? null : Direction.from2DDataValue((descriptor >>> 2) & 3);
     }
 
     private static void validateChildren(SectionPos origin,
@@ -477,26 +470,18 @@ final class SuperClusterTopology {
                 metadata[aggregate] = Math.min(metadata[aggregate], packedAnchor);
             }
             for (Direction face : Direction.values()) {
-                int slots = potentialParentSlots(origin, topology.section(), face);
-                if (slots == 0) continue;
-                int maximumDistance = face.getAxis().isVertical()
-                        || topology.geometry().channel() == BaseClusterTopology.Channel.VOLUME
-                        ? 1 : BaseClusterTopology.MAX_STRUCTURAL_JUMP;
-                for (int distance = 1; distance <= maximumDistance; distance++) {
-                    for (int inset = 0; inset < distance; inset++) {
-                        for (int v = 0; v < BaseClusterTopology.SIDE; v++) {
-                            for (int u = 0; u < BaseClusterTopology.SIDE; u++) {
-                                int cell = faceCell(face, u, v, inset);
-                                int component = topology.componentAt(
-                                        BaseClusterTopology.x(cell),
-                                        BaseClusterTopology.y(cell),
-                                        BaseClusterTopology.z(cell)
-                                );
-                                if (component < 0) continue;
-                                int aggregate = aggregateByNode[childOffsets[child] + component];
-                                exitMasks[aggregate] |= slots;
-                            }
-                        }
+                int firstShift = face.getAxis().isVertical() ? 0 : -1;
+                int lastShift = face.getAxis().isVertical() ? 0 : 1;
+                for (int yShift = firstShift; yShift <= lastShift; yShift++) {
+                    SectionPos target = SectionPos.of(topology.section().x() + face.getStepX(),
+                            topology.section().y() + face.getStepY() + yShift,
+                            topology.section().z() + face.getStepZ());
+                    int slot = parentSlot(origin, originOf(target));
+                    if (slot < 0) continue;
+                    for (int component = 0; component < topology.componentCount(); component++) {
+                        if (!topology.mayExit(component, target, movement)) continue;
+                        int aggregate = aggregateByNode[childOffsets[child] + component];
+                        exitMasks[aggregate] |= 1 << slot;
                     }
                 }
             }
@@ -506,24 +491,6 @@ final class SuperClusterTopology {
                     << AGGREGATE_EXIT_SHIFT;
         }
         return metadata;
-    }
-
-    private static int potentialParentSlots(SectionPos parentOrigin,
-                                            SectionPos sourceSection,
-                                            Direction face) {
-        int slots = 0;
-        int firstShift = face.getAxis().isVertical() ? 0 : -1;
-        int lastShift = face.getAxis().isVertical() ? 0 : 1;
-        for (int yShift = firstShift; yShift <= lastShift; yShift++) {
-            SectionPos targetSection = SectionPos.of(
-                    sourceSection.x() + face.getStepX(),
-                    sourceSection.y() + face.getStepY() + yShift,
-                    sourceSection.z() + face.getStepZ()
-            );
-            int slot = parentSlot(parentOrigin, originOf(targetSection));
-            if (slot >= 0) slots |= 1 << slot;
-        }
-        return slots;
     }
 
     private static int parentSlot(SectionPos sourceOrigin, SectionPos targetOrigin) {
@@ -733,10 +700,6 @@ final class SuperClusterTopology {
         }
     }
 
-    private static int faceCell(Direction face, int u, int v) {
-        return faceCell(face, u, v, 0);
-    }
-
     private static int faceCell(Direction face, int u, int v, int inset) {
         return switch (face) {
             case DOWN -> BaseClusterTopology.cellIndex(u, inset, v);
@@ -875,7 +838,7 @@ final class SuperClusterTopology {
         private final int[] offsets;
         private final int[] targets;
         private final int[] bandOffsets;
-        private final byte[] verticalShifts;
+        private final short[] descriptors;
         private final long[] capabilities;
         private final long[] masks;
         private final float[] lowerBounds;
@@ -884,7 +847,7 @@ final class SuperClusterTopology {
                               int[] offsets,
                               int[] targets,
                               int[] bandOffsets,
-                              byte[] verticalShifts,
+                              short[] descriptors,
                               long[] capabilities,
                               long[] masks,
                               float[] lowerBounds) {
@@ -892,7 +855,7 @@ final class SuperClusterTopology {
             this.offsets = offsets;
             this.targets = targets;
             this.bandOffsets = bandOffsets;
-            this.verticalShifts = verticalShifts;
+            this.descriptors = descriptors;
             this.capabilities = capabilities;
             this.masks = masks;
             this.lowerBounds = lowerBounds;
@@ -903,50 +866,49 @@ final class SuperClusterTopology {
                                           Long2ObjectOpenHashMap<long[]> sourceMasks) {
             long[] bands = sourceMasks.keySet().toLongArray();
             Arrays.sort(bands);
-            List<Long> edgeKeys = new ArrayList<>();
+            int edgeCount = 0;
+            long previous = -1L;
             for (long band : bands) {
-                long edge = ((long) boundarySource(band) << 32)
-                        | Integer.toUnsignedLong(boundaryTarget(band));
-                if (edgeKeys.isEmpty() || edgeKeys.get(edgeKeys.size() - 1) != edge) edgeKeys.add(edge);
-            }
-            int[] offsets = new int[sourceCount + 1];
-            int[] targets = new int[edgeKeys.size()];
-            int[] bandOffsets = new int[edgeKeys.size() + 1];
-            for (long edge : edgeKeys) offsets[(int) (edge >>> 32) + 1]++;
-            for (int index = 1; index < offsets.length; index++) offsets[index] += offsets[index - 1];
-            int bandCursor = 0;
-            for (int edge = 0; edge < edgeKeys.size(); edge++) {
-                long edgeKey = edgeKeys.get(edge);
-                targets[edge] = (int) edgeKey;
-                bandOffsets[edge] = bandCursor;
-                while (bandCursor < bands.length) {
-                    long bandEdge = ((long) boundarySource(bands[bandCursor]) << 32)
-                            | Integer.toUnsignedLong(boundaryTarget(bands[bandCursor]));
-                    if (bandEdge != edgeKey) break;
-                    bandCursor++;
+                long edge = band >>> 16;
+                if (edge != previous) {
+                    edgeCount++;
+                    previous = edge;
                 }
             }
-            bandOffsets[edgeKeys.size()] = bands.length;
-            byte[] shifts = new byte[bands.length];
+            int[] offsets = new int[sourceCount + 1];
+            int[] targets = new int[edgeCount];
+            int[] bandOffsets = new int[edgeCount + 1];
+            short[] descriptors = new short[bands.length];
             long[] capabilities = new long[bands.length];
             long[] masks = new long[bands.length * 4];
-            float[] lowerBounds = new float[edgeKeys.size()];
+            float[] lowerBounds = new float[edgeCount];
             Arrays.fill(lowerBounds, Float.POSITIVE_INFINITY);
+            int edge = -1;
+            previous = -1L;
             for (int band = 0; band < bands.length; band++) {
-                int shift = boundaryShift(bands[band]);
-                shifts[band] = (byte) shift;
+                long key = bands[band];
+                if ((key >>> 16) != previous) {
+                    edge++;
+                    previous = key >>> 16;
+                    targets[edge] = boundaryTarget(key);
+                    bandOffsets[edge] = band;
+                    offsets[boundarySource(key) + 1]++;
+                }
+                int descriptor = (int) key & 0xffff;
+                descriptors[band] = (short) descriptor;
+                int shift = bandShift(descriptor);
+                int horizontal = bandDistance(descriptor);
+                int requiredShift = horizontal == 0 ? 0 : shift;
                 capabilities[band] = BaseClusterTopology.supportingCapabilities(
-                        Math.max(0, shift), Math.max(0, boundaryHorizontal(bands[band]) - 1),
-                        Math.max(0, -shift));
-                System.arraycopy(sourceMasks.get(bands[band]), 0, masks, band * 4, 4);
-                int source = boundarySource(bands[band]);
-                int edge = offsets[source];
-                while (targets[edge] != boundaryTarget(bands[band])) edge++;
-                int horizontal = boundaryHorizontal(bands[band]);
+                        Math.max(0, requiredShift), Math.max(0, horizontal - 1),
+                        Math.max(0, -requiredShift));
+                System.arraycopy(sourceMasks.get(key), 0, masks, band * 4, 4);
                 lowerBounds[edge] = Math.min(lowerBounds[edge],
                         (float) Math.sqrt(horizontal * horizontal + shift * shift));
             }
-            return new BoundaryLinks(face, offsets, targets, bandOffsets, shifts, capabilities, masks,
+            for (int index = 1; index < offsets.length; index++) offsets[index] += offsets[index - 1];
+            bandOffsets[edgeCount] = bands.length;
+            return new BoundaryLinks(face, offsets, targets, bandOffsets, descriptors, capabilities, masks,
                     lowerBounds);
         }
 
@@ -958,7 +920,7 @@ final class SuperClusterTopology {
         int targetComponent(int edge) { return targets[edge]; }
         int bandStart(int edge) { return bandOffsets[edge]; }
         int bandEnd(int edge) { return bandOffsets[edge + 1]; }
-        int verticalShift(int band) { return verticalShifts[band]; }
+        short descriptor(int band) { return descriptors[band]; }
         long capabilityMask(int band) { return capabilities[band]; }
         boolean supports(int edge, BaseClusterTopology.MovementKey movement) {
             for (int band = bandStart(edge); band < bandEnd(edge); band++) {
@@ -970,7 +932,8 @@ final class SuperClusterTopology {
         float lowerBound(int edge) { return lowerBounds[edge]; }
         int retainedBytes() {
             return 72 + (offsets.length + targets.length + bandOffsets.length) * Integer.BYTES
-                    + verticalShifts.length + capabilities.length * Long.BYTES + masks.length * Long.BYTES
+                    + descriptors.length * Short.BYTES
+                    + capabilities.length * Long.BYTES + masks.length * Long.BYTES
                     + lowerBounds.length * Float.BYTES;
         }
     }

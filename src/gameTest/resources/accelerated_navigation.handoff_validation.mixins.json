@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.scarasol.acceleratednavigation.topology",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "accelerated_navigation.terrain_benchmark.refmap.json",
+  "mixins": ["TopologyServiceHandoffValidationMixin", "TopologyStoreHandoffValidationMixin", "TopologyCacheEvictionValidationMixin",
+    "TopologyPersistenceFaultValidationMixin", "TopologyRecoveryFaultValidationMixin", "TopologyBuildWindowMixin", "TopologySearchWindowMixin",
+    "TopologyShutdownValidationMixin", "TopologyServiceShutdownValidationMixin", "TopologyExecutorShutdownValidationMixin", "TopologyDependencyLimitMixin",
+    "TopologyMixedFailureMixin", "TopologySourceExitValidationMixin"],
+  "injectors": {"defaultRequire": 1}
+}
