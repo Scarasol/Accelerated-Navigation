@@ -7,6 +7,6 @@
   "mixins": ["TopologyGraphValidationMixin", "TopologyEndpointValidationMixin", "TopologyFlightValidationMixin",
     "TopologyNoiseValidationMixin", "TopologyOreValidationMixin", "TopologyGenerationValidationMixin",
     "TopologySectionValidationMixin", "TopologyLoadValidationMixin", "TopologyGenerationStageValidationMixin", "TopologySectionEventValidationMixin",
-    "TopologyResultValidationMixin"],
+    "TopologyResultValidationMixin", "TopologyGenerationSerializationMixin"],
   "injectors": {"defaultRequire": 1}
 }

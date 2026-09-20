@@ -13,5 +13,6 @@ abstract class TopologySectionValidationMixin {
     @Inject(method = "setBlockState(IIILnet/minecraft/world/level/block/state/BlockState;Z)Lnet/minecraft/world/level/block/state/BlockState;", at = @At("RETURN"))
     private void written(int x, int y, int z, BlockState state, boolean checked, CallbackInfoReturnable<BlockState> callback) {
         TopologyGenerationProbe.write((LevelChunkSection) (Object) this, callback.getReturnValue() == state);
+        TopologyGenerationProbe.postloadWrite((LevelChunkSection) (Object) this, x, y, z, callback.getReturnValue(), state);
     }
 }

@@ -16,7 +16,7 @@ abstract class ProtoChunkTopologyMixin implements TopologyService.ChunkFactsCarr
     private TopologyService.ChunkFactsState acceleratedNavigation$facts =
             new TopologyService.ChunkFactsState();
 
-    @Inject(method = "<init>", at = @At("RETURN"))
+    @Inject(method = "<init>*", at = @At("RETURN"))
     private void acceleratedNavigation$bindSections(CallbackInfo callback) {
         // ImposterProtoChunk has not initialized its wrapped chunk at this point.
         if ((Object) this instanceof ImposterProtoChunk) return;

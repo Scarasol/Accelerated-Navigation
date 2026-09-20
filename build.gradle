@@ -116,12 +116,21 @@ if (terrainTestMode == 'qualification'
     throw new GradleException(
             "terrainFixtureControl must be FQC-01, FQC-02 or FQC-03, got: ${terrainFixtureControl}")
 }
-def validationKeys = ['Profile', 'Case', 'Run', 'Batch', 'Variant', 'Control', 'Family']
+def validationKeys = ['Profile', 'Case', 'Run', 'Batch', 'Variant', 'Control', 'Family', 'Selection', 'Plan']
 def terrainValidation = validationKeys.collectEntries { suffix ->
     [(suffix.toLowerCase(Locale.ROOT)): findProperty("terrainValidation${suffix}")?.toString()]
 }
+// Freeze the small input once during configuration; never reread an edited user plan in the server.
+if (terrainValidation.plan != null) {
+    def input = project.file(terrainValidation.plan)
+    if (!input.isFile() || input.length() > 65536) throw new GradleException('Diagnostic plan missing or exceeds 64 KiB')
+    terrainValidation.plan = groovy.json.JsonOutput.toJson(new groovy.json.JsonSlurper().parse(input))
+    if (terrainValidation.profile != 'diagnostic' || terrainValidation['case'] != 'causality'
+            || terrainValidation.selection != null || terrainValidation.family != null) throw new GradleException('Invalid diagnostic plan combination')
+}
+def validationObservers = terrainValidation.plan == null ? null : new groovy.json.JsonSlurper().parseText(terrainValidation.plan).observers
 def validationEnabled = terrainValidation.profile != null
-def validationWCounts = [W01: 4, W02: 4, W03: 2, W04: 12, W05: 5, W06: 3, W07: 15, W08: 5, W09: 3]
+def validationWCounts = [W01: 2, W02: 2, W03: 2, W04: 3, W05: 3, W06: 3, W07: 7, W08: 4, W09: 3]
 if (!validationEnabled && terrainValidation.values().any { it != null }) {
     throw new GradleException('terrainValidation parameters require terrainValidationProfile')
 }
@@ -168,11 +177,27 @@ if (validationEnabled) {
             || !(terrainValidation.family in ['endpoint', 'build', 'search', 'final-validation']))) {
         throw new GradleException('Family is only valid for narrow probe diagnostics')
     }
+    if (terrainValidation.selection != null && !(terrainValidation.profile in ['formal', 'fixture']
+            && (scenario == 'terrain' && terrainValidation.selection == 'prm03-performance-gaps'
+                || scenario == 'L' && terrainValidation.selection == 'prm03-functional-gaps')
+            || terrainValidation.profile in ['formal', 'fixture']
+            && scenario == 'L' && terrainValidation.selection == 'after-qn-build'
+            || terrainValidation.profile == 'fixture'
+            && ([G: 'qn-generation', L: 'qn-build', terrain: 'qn-terminal'][scenario] == terrainValidation.selection
+                || scenario == 'H' && terrainValidation.selection in ['qh-repairs', 'qh-recovery']
+                || scenario == 'F' && terrainValidation.selection in ['qf-remaining', 'qf-preparation', 'qf-exception-cleanup']
+                || scenario == 'L' && terrainValidation.selection == 'ql-parent-replaced'
+                || scenario == 'terrain' && terrainValidation.selection == 'qn-unresolved')
+            || terrainValidation.profile == 'diagnostic' && scenario == 'causality'
+            && terrainValidation.selection in ['qn-hot', 'qn-failures', 'qn-unresolved'])) {
+        throw new GradleException('Invalid targeted validation selection')
+    }
 }
 def validationSuffix = validationEnabled
         ? ("${terrainValidation.batch}/${terrainValidation.run}/${terrainValidation['case']}"
         + (terrainValidation.variant == null ? '' : "/${terrainValidation.variant}")
-        + (terrainValidation.family == null ? '' : "/${terrainValidation.family}")) : null
+        + (terrainValidation.family == null ? '' : "/${terrainValidation.family}")
+        + (terrainValidation.selection == null ? '' : "/${terrainValidation.selection}")) : null
 def validationUsesFrozenWorld = validationEnabled
         && terrainValidation['case'] in ['terrain', 'M', 'probe', 'causality']
 def validationInstanceOwned = false
@@ -266,7 +291,7 @@ sourceSets {
             java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationMod.java'
             java.exclude 'com/scarasol/acceleratednavigation/gametest/TerrainQualificationStore.java'
             java.exclude 'com/scarasol/acceleratednavigation/gametest/TopologyFormalControlAccess.java'
-            def flushTopologyInputs = ['TopologyTestBridge.java', 'TopologyValidationAccess.java',
+            def flushTopologyInputs = ['TopologyTestBridge.java', 'TopologyValidationAccess.java', 'TopologySegmentTrace.java',
                     'TopologyRuntimeFormalControlAccess.java', 'TopologyServiceObservationMixin.java',
                     'TopologyStoreObservationMixin.java', 'TopologyServiceFlushDiagnosticMixin.java',
                     'TopologyStoreFlushDiagnosticMixin.java', 'TopologyWorkerRuntimePrewarmMixin.java'] as Set
@@ -344,7 +369,7 @@ minecraft {
                 property 'acceleratedNavigation.terrainBenchmark', 'true'
                 property 'acceleratedNavigation.terrainTestMode', terrainModeForConfiguration
             }
-            if (terrainCausality || validationEnabled && terrainValidation['case'] == 'causality') {
+            if (terrainCausality || validationEnabled && (terrainValidation['case'] == 'causality' && (validationObservers == null || !validationObservers.isEmpty()) || terrainValidation.selection in ['qn-terminal', 'qn-build', 'qn-unresolved'])) {
                 property 'acceleratedNavigation.terrainCausality', 'true'
                 property 'acceleratedNavigation.terrainCausalityOutput',
                         layout.buildDirectory.file(
@@ -352,14 +377,14 @@ minecraft {
                                         : 'reports/production-causality-diagnostic-20260906/observations.jsonl'
                         ).get().asFile.absolutePath
                 args '--mixin.config', 'accelerated_navigation.terrain_causality.mixins.json'
-                args '--mixin.config', 'accelerated_navigation.build_causality.mixins.json'
+                if (validationObservers == null || validationObservers.contains('build')) args '--mixin.config', 'accelerated_navigation.build_causality.mixins.json'
             }
             if (validationEnabled && terrainValidation['case'] == 'probe' && terrainValidation.variant == 'on') {
                 property 'acceleratedNavigation.terrainProbe', 'true'
                 property 'acceleratedNavigation.terrainCausalityOutput',
                         layout.buildDirectory.file("reports/production-remediation/${validationSuffix}/observations.jsonl").get().asFile.absolutePath
                 args '--mixin.config', 'accelerated_navigation.terrain_causality.mixins.json'
-                args '--mixin.config', 'accelerated_navigation.build_causality.mixins.json'
+                if (validationObservers == null || validationObservers.contains('build')) args '--mixin.config', 'accelerated_navigation.build_causality.mixins.json'
             }
             if (validationEnabled) {
                 terrainValidation.findAll { it.value != null }.each { key, value ->
@@ -717,6 +742,11 @@ tasks.register('prepareTerrainBenchmarkServer') {
         }
         runDirectory.asFile.mkdirs()
         eulaFile.asFile.setText('eula=true\n', 'UTF-8')
+        if (validationEnabled) {
+            def fmlConfig = runDirectory.file('config/fml.toml').asFile
+            fmlConfig.parentFile.mkdirs()
+            fmlConfig.setText('versionCheck=false\n', 'UTF-8')
+        }
         propertiesFile.asFile.setText("""\
 allow-flight=true
 difficulty=normal
@@ -738,13 +768,15 @@ sync-chunk-writes=true
 view-distance=4
 """, 'UTF-8')
         if (validationEnabled) {
+            def optionsFile = runDirectory.file('validation-options.json').asFile
+            optionsFile.setText(groovy.json.JsonOutput.toJson(terrainValidation), 'UTF-8')
             javaexec {
                 classpath = sourceSets.gameTest.runtimeClasspath
                 mainClass = 'com.scarasol.acceleratednavigation.gametest.ProductionRemediationReport'
                 args 'prepare', project.projectDir.absolutePath,
                         resultReportFile.get().asFile.parentFile.absolutePath,
                         runDirectory.asFile.absolutePath,
-                        groovy.json.JsonOutput.toJson(terrainValidation)
+                        optionsFile.absolutePath
             }
         }
     }
@@ -784,6 +816,7 @@ def cleanupTerrainBenchmarkWorkingCopy = tasks.register(
                             serverProcessExitCode: execution?.exitValue, gradleProcessExitCode: null,
                             outerProcessExitCode: null, outerExitReason: 'Recorded by the external command observer after Gradle exits',
                             cleanupComplete: cleanupFailure == null, cleanupFailure: cleanupFailure?.toString(),
+                            preparationFailure: tasks.named('prepareTerrainBenchmarkServer').get().state.failure?.toString(),
                             serverLogAvailable: Files.isRegularFile(output.resolve('server.log'))]
                 Files.writeString(output.resolve('server-exit.json'), groovy.json.JsonOutput.toJson(exit),
                         java.nio.file.StandardOpenOption.CREATE_NEW)
@@ -977,6 +1010,11 @@ tasks.matching { it.name == 'runTerrainBenchmarkServer' }.configureEach {
 
 tasks.named('check').configure {
     dependsOn tasks.named('verifyGameTestSourceSetIsolation')
+}
+
+if (validationEnabled && terrainModeForConfiguration == 'benchmark') {
+    tasks.named('prepareTerrainBenchmarkServer').configure { finalizedBy cleanupTerrainBenchmarkWorkingCopy }
+    cleanupTerrainBenchmarkWorkingCopy.configure { mustRunAfter tasks.named('runTerrainBenchmarkServer') }
 }
 
 idea {

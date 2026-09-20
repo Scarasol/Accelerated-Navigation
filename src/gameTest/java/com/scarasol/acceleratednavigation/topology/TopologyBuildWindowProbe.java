@@ -28,7 +28,7 @@ public final class TopologyBuildWindowProbe implements AutoCloseable {
         if (active != null) throw new IllegalStateException("overlapping build-window controls");
         active = new TopologyBuildWindowProbe(service, window, chunks); return active;
     }
-    static void point(Object runtime, String kind, String phase, SectionPos section, Object input, Object result) {
+    public static void point(Object runtime, String kind, String phase, SectionPos section, Object input, Object result) {
         var probe = active;
         if (probe == null || probe.runtime != runtime || !probe.chunks.contains(section.chunk().toLong())) return;
         boolean pause;
@@ -64,7 +64,7 @@ public final class TopologyBuildWindowProbe implements AutoCloseable {
         Object monitor = readField(readField(runtime, "taskExecutor"), "monitor");
         synchronized (monitor) { monitor.notifyAll(); }
     }
-    static void executorQueued(Object executor) {
+    public static void executorQueued(Object executor) {
         var probe = active;
         if (probe == null || !probe.window.equals("executor/queued") || readField(probe.runtime, "taskExecutor") != executor) return;
         Object monitor = readField(executor, "monitor");
@@ -97,7 +97,7 @@ public final class TopologyBuildWindowProbe implements AutoCloseable {
             catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new IllegalStateException(failure); }
         }
     }
-    static void executorClaimed(Object executor) {
+    public static void executorClaimed(Object executor) {
         var probe = active;
         if (probe == null || !probe.window.equals("executor/claimed") || readField(probe.runtime, "taskExecutor") != executor) return;
         Object task = ((ThreadLocal<?>) readField(executor, "currentTask")).get();
@@ -129,7 +129,7 @@ public final class TopologyBuildWindowProbe implements AutoCloseable {
                     "buildPermit", readField(executor, "buildRunning"));
         }
     }
-    static void searchBoundary(MacroSearch search) {
+    public static void searchBoundary(MacroSearch search) {
         var probe = active;
         if (probe == null || !probe.window.endsWith("/replaced")) return;
         synchronized (probe) { if (probe.closed || probe.reached) return; }

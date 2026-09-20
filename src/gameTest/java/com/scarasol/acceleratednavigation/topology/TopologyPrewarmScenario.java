@@ -20,6 +20,7 @@ public final class TopologyPrewarmScenario implements AutoCloseable {
     private static volatile TopologyPrewarmScenario active;
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final Object runtime;
     private final int desired;
     private final boolean mutated;
@@ -32,7 +33,7 @@ public final class TopologyPrewarmScenario implements AutoCloseable {
     private int stage, changedTick;
 
     public TopologyPrewarmScenario(TopologyService service, ServerLevel level, ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; runtime = readField(service, "runtime");
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); runtime = readField(service, "runtime");
         desired = Integer.parseInt(target.parameters().get("prewarm")); mutated = "mutated".equals(control);
         synchronized (TopologyPrewarmScenario.class) {
             if (active != null) throw new IllegalStateException("overlapping prewarm controls"); active = this;
@@ -46,9 +47,10 @@ public final class TopologyPrewarmScenario implements AutoCloseable {
     }
     public Map<String, Object> tick() {
         if (stage == 0) {
+            tickets.hold(chunkPositions());
             for (long position : chunkPositions()) {
                 ChunkPos pos = new ChunkPos(position); LevelChunk chunk = level.getChunk(pos.x, pos.z); chunks.put(position, chunk);
-                TopologyService.onChunkLoaded(level, chunk);
+                tickets.loaded(chunk);
                 for (int x = 0; x < 16; x++) for (int z = 0; z < 16; z++) for (int y = 288; y <= 291; y++) {
                     chunk.setBlockState(new BlockPos(pos.getMinBlockX() + x, y, pos.getMinBlockZ() + z),
                             y == 288 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(), false);
@@ -58,7 +60,7 @@ public final class TopologyPrewarmScenario implements AutoCloseable {
         }
         if (stage == 1) {
             if (level.getServer().getTickCount() <= changedTick || !settled()) return null;
-            for (LevelChunk chunk : chunks.values()) { TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk); }
+            for (LevelChunk chunk : chunks.values()) { tickets.unload(chunk); tickets.loaded(chunk); }
             stage = 2; return null;
         }
         if (stage == 2) {
@@ -142,10 +144,18 @@ public final class TopologyPrewarmScenario implements AutoCloseable {
     }
     private static void verifyAdmission(int actual, int expected) { require(actual == expected && actual <= 8, "bounded prewarm admission equals the requested workload"); }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
+    public Map<String, Object> observation() {
+        var result = new LinkedHashMap<String, Object>(evidence);
+        result.put("stage", stage); result.put("tickets", tickets.held());
+        result.put("requests", TopologyValidationAccess.requestState(foreground));
+        return result;
+    }
     @Override public void close() {
-        admission = false; if (probe != null) { probe.close(); probe = null; }
-        for (var query : new TopologyService.MacroRequest[]{ready, foreground}) if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); }
-        for (LevelChunk chunk : chunks.values()) TopologyService.onChunkUnloaded(level, chunk);
-        synchronized (TopologyPrewarmScenario.class) { if (active == this) active = null; }
+        try {
+            admission = false; if (probe != null) { probe.close(); probe = null; }
+            for (var query : new TopologyService.MacroRequest[]{ready, foreground}) if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); }
+            for (LevelChunk chunk : chunks.values()) tickets.unload(chunk);
+            synchronized (TopologyPrewarmScenario.class) { if (active == this) active = null; }
+        } finally { tickets.close(); }
     }
 }

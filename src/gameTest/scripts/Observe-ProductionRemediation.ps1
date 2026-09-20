@@ -7,6 +7,8 @@ param(
     [ValidatePattern('^(on|off|[1-9][0-9]*|chunk-write-idle|chunk-write-pending|api-pending)$')][string]$Variant,
     [ValidateSet('normal', 'mutated', 'missed')][string]$Control,
     [ValidateSet('endpoint', 'build', 'search', 'final-validation')][string]$Family,
+    [ValidateSet('qn-generation', 'qn-build', 'qn-terminal', 'qn-hot', 'qn-failures', 'qn-unresolved', 'qh-repairs', 'qh-recovery', 'qf-remaining', 'qf-preparation', 'qf-exception-cleanup', 'ql-parent-replaced', 'after-qn-build', 'prm03-performance-gaps', 'prm03-functional-gaps')][string]$Selection,
+    [string]$Plan,
     [string]$ChildPayload
 )
 $ErrorActionPreference = 'Stop'
@@ -29,11 +31,20 @@ if ($ChildPayload) {
     $childExit = 1
     try {
         $arguments = @('runTerrainBenchmarkServer', '-PterrainTestMode=benchmark')
-        foreach ($name in @('Profile', 'Case', 'Run', 'Batch', 'Variant', 'Control', 'Family', 'Observer')) {
+        foreach ($name in @('Profile', 'Case', 'Run', 'Batch', 'Variant', 'Control', 'Family', 'Selection', 'Observer')) {
             $value = $payload.options.$name
             if ($null -eq $value) { continue }
             if ([string]$value -notmatch '^[A-Za-z0-9-]+$') { throw 'Invalid Gradle property value' }
             $arguments += "-PterrainValidation$name=$value"
+        }
+        if ($payload.plan) {
+            if ([string]$payload.plan -notmatch '^build/reports/production-remediation-observers/[a-f0-9]{32}/plan.json$') { throw 'Invalid archived plan path' }
+            # The observer payload keeps a project-relative path (validated above); the child
+            # resolves it against the project root because Gradle property paths are read
+            # relative to the Gradle project directory, not to the invoking shell.
+            $planPath = [IO.Path]::GetFullPath((Join-Path $projectRoot $payload.plan))
+            if (-not [IO.File]::Exists($planPath)) { throw 'Archived plan is missing' }
+            $arguments += "-PterrainValidationPlan=$planPath"
         }
         $arguments += @('--offline', '--no-daemon', '--console=plain')
         $command = 'call gradlew.bat ' + ($arguments -join ' ') + ' 2>&1'
@@ -91,10 +102,11 @@ if ($ChildPayload) {
 
 foreach ($value in @($ValidationProfile, $Case, $Run, $Batch)) { if (-not $value) { throw 'Profile, Case, Run and Batch are required' } }
 if ($Family -and ($ValidationProfile -ne 'diagnostic' -or $Case -ne 'probe')) { throw 'Family is only valid for probe diagnostics' }
-$suffix = "$Batch/$Run/$Case" + $(if ($Variant) { "/$Variant" } else { '' }) + $(if ($Family) { "/$Family" } else { '' })
+$suffix = "$Batch/$Run/$Case" + $(if ($Variant) { "/$Variant" } else { '' }) + $(if ($Family) { "/$Family" } else { '' }) + $(if ($Selection) { "/$Selection" } else { '' })
 $output = Join-Path $projectRoot "build/reports/production-remediation/$suffix"
 $working = Join-Path $projectRoot "run-production-remediation/$suffix"
 if ((Test-Path -LiteralPath $output) -or (Test-Path -LiteralPath $working)) { throw 'Validation instance already exists; select a new batch' }
+if ($Plan -and ($ValidationProfile -ne 'diagnostic' -or $Case -ne 'causality' -or $Selection -or $Family)) { throw 'Plan requires diagnostic causality without Selection/Family' }
 $observerId = [Guid]::NewGuid().ToString('N')
 $directory = Join-Path $projectRoot "build/reports/production-remediation-observers/$observerId"
 [IO.Directory]::CreateDirectory($directory) | Out-Null
@@ -102,8 +114,17 @@ $options = [ordered]@{Profile=$ValidationProfile; Case=$Case; Run=$Run; Batch=$B
 if ($Variant) { $options.Variant = $Variant }
 if ($Control) { $options.Control = $Control }
 if ($Family) { $options.Family = $Family }
-$payloadPath = Join-Path $directory 'payload.json'
-Write-NewJson $payloadPath ([ordered]@{directory=$directory; output=$output; options=$options})
+if ($Selection) { $options.Selection = $Selection }
+$archivedPlan = $null
+if ($Plan) {
+    $inputPlan = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Plan).Path)
+    if ($inputPlan.Length -gt 65536) { throw 'Plan exceeds 64 KiB' }
+    $null = $encoding.GetString($inputPlan) | ConvertFrom-Json
+    [IO.File]::WriteAllBytes((Join-Path $directory 'plan.json'), $inputPlan)
+    $archivedPlan = "build/reports/production-remediation-observers/$observerId/plan.json"
+}
+$payloadPath = Join-Path $directory 'payload.json' 
+Write-NewJson $payloadPath ([ordered]@{directory=$directory; output=$output; options=$options; plan=$archivedPlan})
 $shellPath = (Get-Process -Id $PID).Path
 $child = Start-Process -FilePath $shellPath `
     -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', (Quoted $PSCommandPath), '-ChildPayload', (Quoted $payloadPath)) `
@@ -137,7 +158,7 @@ if ($launcher.main -ne 'com.scarasol.acceleratednavigation.gametest.ProductionRe
 $report = Start-Process -FilePath $launcher.java -ArgumentList @('-cp', (Quoted $launcher.classpath), $launcher.main, 'finish', (Quoted $projectRoot), (Quoted $output)) `
     -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $directory 'report-stdout.log') -RedirectStandardError (Join-Path $directory 'report-stderr.log')
-if (-not $report.WaitForExit(60000)) {
+if (-not $report.WaitForExit(600000)) {
     $report.Kill($true)
     if (-not $report.WaitForExit(10000)) { throw 'Report process did not exit after termination' }
     Write-NewJson (Join-Path $directory 'report-timeout.json') ([ordered]@{processId=$report.Id})

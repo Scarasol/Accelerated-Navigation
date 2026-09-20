@@ -13,7 +13,7 @@ import net.minecraft.world.level.Level;
 import static com.scarasol.acceleratednavigation.topology.TopologyTestBridge.*;
 
 /** Keeps the actual flush task in its original queue or on its original I/O worker. */
-final class TopologyFlushWindowProbe implements AutoCloseable {
+public final class TopologyFlushWindowProbe implements AutoCloseable {
     private static volatile TopologyFlushWindowProbe active;
     private final Object store, monitor;
     private final ResourceKey<Level> dimension;
@@ -22,20 +22,21 @@ final class TopologyFlushWindowProbe implements AutoCloseable {
     private final List<Map<String, Object>> events = new ArrayList<>();
     private Object task;
     private boolean current, reached, timedOut, closed;
-    private int completed;
+    private int completed, successorRequests;
 
     private TopologyFlushWindowProbe(Object store, ResourceKey<Level> dimension, String window) {
         this.store = store; this.dimension = dimension; this.window = window; monitor = readField(store, "monitor");
     }
-    static synchronized TopologyFlushWindowProbe watch(Object store, ResourceKey<Level> dimension, String window) {
+    public static synchronized TopologyFlushWindowProbe watch(Object store, ResourceKey<Level> dimension, String window) {
         if (active != null) throw new IllegalStateException("overlapping flush controls");
         active = new TopologyFlushWindowProbe(store, dimension, window); return active;
     }
-    static void requested(Object store, ResourceKey<Level> dimension) {
+    public static void requested(Object store, ResourceKey<Level> dimension) {
         var probe = active;
         if (probe == null || probe.store != store || !probe.dimension.equals(dimension)) return;
         synchronized (probe.monitor) {
             if (probe.closed) return;
+            if (probe.reached) { probe.successorRequests++; probe.record("successor-request"); return; }
             probe.record("request");
             if (probe.window.equals("request")) {
                 require(((Set<?>) readField(store, "requestedFlushes")).contains(dimension), "the real request is pending");
@@ -44,7 +45,7 @@ final class TopologyFlushWindowProbe implements AutoCloseable {
             }
         }
     }
-    static void scheduled(Object store, ResourceKey<Level> dimension) {
+    public static void scheduled(Object store, ResourceKey<Level> dimension) {
         var probe = active;
         if (probe == null || probe.store != store || !probe.dimension.equals(dimension)) return;
         synchronized (probe.monitor) {
@@ -54,7 +55,7 @@ final class TopologyFlushWindowProbe implements AutoCloseable {
             probe.record("queued");
         }
     }
-    static Object dequeue(Object store, ArrayDeque<?> queue) {
+    public static Object dequeue(Object store, ArrayDeque<?> queue) {
         var probe = active;
         if (probe == null || probe.store != store) return queue.removeFirst();
         require(Thread.holdsLock(probe.monitor), "dequeue and target queue identity share the store monitor");
@@ -73,7 +74,7 @@ final class TopologyFlushWindowProbe implements AutoCloseable {
         if (selected) probe.record("dequeued");
         return removed;
     }
-    static void point(Object store, ResourceKey<Level> dimension, String point) {
+    public static void point(Object store, ResourceKey<Level> dimension, String point) {
         var probe = active;
         if (probe == null || probe.store != store || !probe.dimension.equals(dimension)) return;
         boolean pause;
@@ -104,7 +105,7 @@ final class TopologyFlushWindowProbe implements AutoCloseable {
     Map<String, Object> evidence() {
         synchronized (monitor) {
             var result = new LinkedHashMap<String, Object>();
-            result.put("events", List.copyOf(events)); result.put("completed", completed); result.put("timedOut", timedOut);
+            result.put("successorRequests", successorRequests); result.put("events", List.copyOf(events)); result.put("completed", completed); result.put("timedOut", timedOut);
             result.put("targetTask", TopologyValidationAccess.token(task)); result.put("current", current);
             result.put("inOriginalQueue", ((ArrayDeque<?>) readField(store, "background")).contains(task));
             result.put("dimension", dimension.location().toString()); return Map.copyOf(result);

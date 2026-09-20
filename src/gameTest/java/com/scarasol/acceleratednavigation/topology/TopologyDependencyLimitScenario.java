@@ -24,6 +24,7 @@ public final class TopologyDependencyLimitScenario implements AutoCloseable {
     private static final BlockPos START = new BlockPos(3076, 289, 3076), GOAL = new BlockPos(3080, 289, 3076);
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final Object runtime;
     private final int desired;
     private final boolean mutated;
@@ -38,8 +39,8 @@ public final class TopologyDependencyLimitScenario implements AutoCloseable {
     private int stage, changedTick;
 
     public TopologyDependencyLimitScenario(TopologyService service, ServerLevel level, ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; runtime = readField(service, "runtime");
-        desired = Integer.parseInt(target.parameters().get("live")); mutated = control.equals("mutated");
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); runtime = readField(service, "runtime");
+        desired = Integer.parseInt(target.parameters().get("live")); mutated = "mutated".equals(control);
         for (int index = 0; index < desired; index++) dependencies.add(new MacroSearch.DependencyKey(
                 MacroSearch.DependencyKind.BASE_CLUSTER, SectionPos.of(196 + index, 18, 192)));
         synchronized (TopologyDependencyLimitScenario.class) {
@@ -53,9 +54,10 @@ public final class TopologyDependencyLimitScenario implements AutoCloseable {
     public Map<String, Object> tick() {
         if (timedOut || build != null && build.timedOut()) throw new AssertionError("dependency ownership window timed out");
         if (stage == 0) {
+            tickets.hold(chunkPositions());
             for (long position : chunkPositions()) {
                 ChunkPos pos = new ChunkPos(position); LevelChunk chunk = level.getChunk(pos.x, pos.z); chunks.put(position, chunk);
-                TopologyService.onChunkLoaded(level, chunk);
+                tickets.loaded(chunk);
                 for (int x = 0; x < 16; x++) for (int z = 0; z < 16; z++) for (int y = 288; y <= 291; y++) {
                     chunk.setBlockState(new BlockPos(pos.getMinBlockX() + x, y, pos.getMinBlockZ() + z),
                             y == 288 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(), false);
@@ -111,7 +113,7 @@ public final class TopologyDependencyLimitScenario implements AutoCloseable {
         evidence.put("inputMethod", "explicit known loaded section dependencies supplied on the original MacroQuery worker after search creation; real completed dependencies consumed before admitting the seventeenth");
         evidence.put("afterCancellation", workerMetrics(service)); evidence.put("outcome", "PASS"); return Map.copyOf(evidence);
     }
-    static void beforeSearch(Object query) {
+    public static void beforeSearch(Object query) {
         var scenario = active;
         if (scenario == null || !scenario.armed || scenario.closed || scenario.seeded
                 || readField(query, "this$0") != scenario.runtime || !START.equals(readField(query, "startPosition"))) return;
@@ -165,11 +167,19 @@ public final class TopologyDependencyLimitScenario implements AutoCloseable {
     }
     private boolean settled() { return Boolean.TRUE.equals(TopologyValidationAccess.chunkSettlement(service, level.dimension(), chunkPositions()).get("settled")); }
     private void cancelAndRelease() { queries.forEach(TopologyService.MacroRequest::cancel); advance.countDown(); release.countDown(); if (build != null) build.release(); }
+    public Map<String, Object> observation() {
+        var result = new LinkedHashMap<String, Object>(evidence);
+        result.put("stage", stage); result.put("tickets", tickets.held());
+        result.put("requests", queries.stream().map(TopologyValidationAccess::requestState).toList());
+        return result;
+    }
     @Override public void close() {
-        closed = true; armed = false; cancelAndRelease();
-        queries.forEach(TopologyValidationAccess::forgetRequest); if (build != null) build.close();
-        chunks.values().forEach(chunk -> TopologyService.onChunkUnloaded(level, chunk));
-        synchronized (TopologyDependencyLimitScenario.class) { if (active == this) active = null; }
+        try {
+            closed = true; armed = false; cancelAndRelease();
+            queries.forEach(TopologyValidationAccess::forgetRequest); if (build != null) build.close();
+            chunks.values().forEach(chunk -> tickets.unload(chunk));
+            synchronized (TopologyDependencyLimitScenario.class) { if (active == this) active = null; }
+        } finally { tickets.close(); }
     }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
 }

@@ -22,6 +22,7 @@ public final class TopologyEndpointFailureScenario implements AutoCloseable {
     private static volatile TopologyEndpointFailureScenario active;
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final ProductionRemediationPlan.Target target;
     private final boolean mutated, alternate;
     private final Object runtime;
@@ -38,7 +39,7 @@ public final class TopologyEndpointFailureScenario implements AutoCloseable {
     private int stage, faultStage, next, changedTick;
 
     public TopologyEndpointFailureScenario(TopologyService service, ServerLevel level, ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; this.target = target; mutated = "mutated".equals(control);
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); this.target = target; mutated = "mutated".equals(control);
         alternate = target.kind().equals("F01/alternate");
         start = new BlockPos(alternate ? 1535 : 1537, 289, 1537);
         goal = new BlockPos(alternate ? 1528 : 1569, 289, 1537);
@@ -56,9 +57,10 @@ public final class TopologyEndpointFailureScenario implements AutoCloseable {
 
     public Map<String, Object> tick() {
         if (stage == 0) {
+            tickets.hold(chunkPositions());
             for (BlockPos pos : anchors) {
                 LevelChunk chunk = level.getChunk(pos.getX() >> 4, pos.getZ() >> 4); chunks.add(chunk);
-                TopologyService.onChunkLoaded(level, chunk);
+                tickets.loaded(chunk);
                 chunk.setBlockState(pos, Blocks.AIR.defaultBlockState(), false);
                 chunk.setBlockState(pos.above(), Blocks.AIR.defaultBlockState(), false);
                 chunk.setBlockState(pos.below(), Blocks.STONE.defaultBlockState(), false);
@@ -77,7 +79,7 @@ public final class TopologyEndpointFailureScenario implements AutoCloseable {
         }
         if (stage == 1) {
             if (!settled() || level.getServer().getTickCount() <= changedTick) return null;
-            for (LevelChunk chunk : chunks) { TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk); }
+            for (LevelChunk chunk : chunks) { tickets.unload(chunk); tickets.loaded(chunk); }
             stage = 2; return null;
         }
         if (stage == 2) {
@@ -195,10 +197,18 @@ public final class TopologyEndpointFailureScenario implements AutoCloseable {
         }
         return true;
     }
+    public Map<String, Object> observation() {
+        var result = new LinkedHashMap<String, Object>(evidence);
+        result.put("stage", stage); result.put("tickets", tickets.held());
+        result.put("requests", TopologyValidationAccess.requestState(query));
+        return result;
+    }
     @Override public void close() {
-        if (fault != null) { fault.close(); fault = null; }
-        if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); query = null; }
-        for (LevelChunk chunk : chunks) TopologyService.onChunkUnloaded(level, chunk);
-        synchronized (TopologyEndpointFailureScenario.class) { if (active == this) active = null; }
+        try {
+            if (fault != null) { fault.close(); fault = null; }
+            if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); query = null; }
+            for (LevelChunk chunk : chunks) tickets.unload(chunk);
+            synchronized (TopologyEndpointFailureScenario.class) { if (active == this) active = null; }
+        } finally { tickets.close(); }
     }
 }

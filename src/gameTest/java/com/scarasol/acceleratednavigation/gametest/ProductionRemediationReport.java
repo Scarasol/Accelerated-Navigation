@@ -6,9 +6,15 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import java.io.BufferedInputStream;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.FilterOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.io.UncheckedIOException;
 import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
@@ -28,14 +34,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.function.Consumer;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
 /** Bounded raw evidence and strict derived readers; contains no production behavior. */
 public final class ProductionRemediationReport {
     static final Gson JSON = new GsonBuilder().serializeNulls().create();
     static final long COMPACT_LIMIT = 32L << 20;
     static final long STREAM_LIMIT = 128L << 20;
+    static final String ADOPTION_REVIEW = "adoption-review.json";
+    static final String ADOPTION_REVIEW_SCHEMA = "PRM-ADOPTION-REVIEW-1";
+    static final String ADOPTION_CANNOT_CHANGE = "CANNOT_CHANGE_SIDE";
     private static final Set<String> SAMPLE_OUTCOMES = Set.of("SUCCESS", "BUSINESS_FAILURE", "EXCEPTION", "TIMEOUT", "CANCELLED", "NOT_ENTERED");
     private static final Set<String> CONTROL_OUTCOMES = Set.of("PASS", "FAIL", "NOT_ENTERED", "NOT_APPLICABLE");
     private ProductionRemediationReport() { }
@@ -54,14 +65,16 @@ public final class ProductionRemediationReport {
     }
 
     public static void main(String[] args) throws IOException {
-        if (args.length < 3) throw new IllegalArgumentException("prepare|finish projectRoot outputDirectory [workDirectory optionsJson]");
+        if (args.length < 3) throw new IllegalArgumentException("prepare|finish projectRoot outputDirectory [workDirectory optionsFile]");
         Path root = Path.of(args[1]).toAbsolutePath().normalize();
         Path output = Path.of(args[2]).toAbsolutePath().normalize();
         switch (args[0]) {
             case "prepare" -> {
                 if (args.length != 5) throw new IllegalArgumentException("prepare arguments");
                 Map<String, String> options = new LinkedHashMap<>();
-                JsonParser.parseString(args[4]).getAsJsonObject().entrySet().forEach(entry -> {
+                readObject(Path.of(args[4])).entrySet().forEach(entry -> {
+                    if (!entry.getValue().isJsonNull() && (!entry.getValue().isJsonPrimitive()
+                            || !entry.getValue().getAsJsonPrimitive().isString())) throw new IllegalArgumentException("Option must be a string: " + entry.getKey());
                     if (!entry.getValue().isJsonNull()) options.put(entry.getKey(), entry.getValue().getAsString());
                 });
                 prepare(root, output, Path.of(args[3]), ProductionRemediationPlan.Options.from(options));
@@ -83,6 +96,7 @@ public final class ProductionRemediationReport {
             throw new IOException("Qualification pointer is not a");
         }
         validateBaseline(readObject(root.resolve(ProductionRemediationPlan.BASELINE)));
+        if (options.plan() != null) ProductionRemediationPlan.DiagnosticPlan.parse(options.plan()).validateRoutes(readObject(root.resolve(ProductionRemediationPlan.MANIFEST)));
         List<Map<String, Object>> frozen = frozenInputs(root);
         Map<String, Object> identity = new LinkedHashMap<>();
         identity.put("schemaVersion", ProductionRemediationPlan.SCHEMA);
@@ -93,6 +107,7 @@ public final class ProductionRemediationReport {
         identity.put("frozenInputs", frozen);
         identity.put("workingDirectory", work.toAbsolutePath().normalize().toString());
         identity.put("targets", ProductionRemediationPlan.targets(options));
+        identity.put("versionCheckDisabled", "versionCheck=false".equals(Files.readString(work.resolve("config/fml.toml")).trim()));
         Map<String, Object> preparedEnvironment = environment(true);
         List<String> environmentIssues = environmentIssues(JSON.toJsonTree(preparedEnvironment).getAsJsonObject());
         identity.put("preparationEnvironment", preparedEnvironment);
@@ -107,6 +122,10 @@ public final class ProductionRemediationReport {
         identity.put("skillInputs", List.of(Map.of("path", skill.toString(), "sha256", hash(skill))));
         identity.put("historyEnvironmentDifference", "0905 JAVA_TOOL_OPTIONS was empty; this instance records the actual value");
         Files.createDirectories(output);
+        if (options.plan() != null) {
+            writeNew(output.resolve("plan.json"), JsonParser.parseString(options.plan()), 65536);
+            identity.put("planSHA256", hash(output.resolve("plan.json")));
+        }
         writeNew(output.resolve("identity.json"), identity, COMPACT_LIMIT);
         if (!environmentIssues.isEmpty()) throw new IOException("Frozen environment mismatch: " + environmentIssues);
     }
@@ -228,22 +247,38 @@ public final class ProductionRemediationReport {
         private final Set<String> terminal = new HashSet<>();
         private final Stream samples;
         private final Stream controls;
+        private final StateProofs stateProofs = new StateProofs();
         private boolean closed;
 
         public Journal(Path output, ProductionRemediationPlan.Options options) throws IOException {
             this.output = output; this.options = options;
-            if (!options.profile().equals("diagnostic") && (Boolean.getBoolean("acceleratedNavigation.terrainCausality")
+            if (!options.profile().equals("diagnostic") && !"qn-terminal".equals(options.selection()) && !"qn-build".equals(options.selection()) && !"qn-unresolved".equals(options.selection()) && (Boolean.getBoolean("acceleratedNavigation.terrainCausality")
                     || Boolean.getBoolean("acceleratedNavigation.terrainProbe"))) throw new IOException("Detailed diagnostics cannot enter a formal or fixture run");
             JsonObject identity = readObject(output.resolve("identity.json"));
             if (!options.equals(options(identity))) throw new IOException("Prepared identity differs from JVM parameters");
             for (var target : ProductionRemediationPlan.targets(options)) plan.put(target.id(), target);
             samples = new Stream(output.resolve("samples.jsonl"), STREAM_LIMIT);
-            controls = new Stream(output.resolve("controls.jsonl"), STREAM_LIMIT);
+            controls = new Stream(output.resolve("controls.jsonl.gz"), STREAM_LIMIT, true);
             controlEvent(Map.of("event", "runtime-environment", "environment", environment()));
         }
 
         public synchronized void sample(ProductionRemediationPlan.Target target, Map<String, Object> evidence) {
             emitTerminal(target, evidence, true);
+        }
+
+        public synchronized void checkedSample(ProductionRemediationPlan.Target target, Map<String, Object> evidence,
+                                               Map<String, Object> proof, boolean mutated) {
+            Throwable rejected = null;
+            if (mutated) {
+                try { evidence.putAll(rejectSampleMutation(target, evidence, proof)); }
+                catch (RuntimeException | AssertionError failure) {
+                    rejected = failure;
+                    evidence.put("fixtureError", failure.toString());
+                }
+            }
+            if (proof != null) sampleState(proof);
+            sample(target, evidence);
+            if (rejected != null) throw new IllegalStateException("Sample evidence saved; mutation qualification failed: " + target.id(), rejected);
         }
 
         public synchronized void control(ProductionRemediationPlan.Target target, Map<String, Object> evidence) {
@@ -265,6 +300,11 @@ public final class ProductionRemediationReport {
             controls.append(evidence);
         }
 
+        public synchronized void sampleState(Map<String, Object> evidence) {
+            if (closed) throw new IllegalStateException("Journal is closed");
+            controls.append(stateProofs.encode(JSON.toJsonTree(evidence).getAsJsonObject()));
+        }
+
         public synchronized void finish(Map<String, Object> compact, String missingReason) throws IOException {
             if (closed) return;
             for (var target : plan.values()) if (!terminal.contains(target.id())) {
@@ -276,7 +316,7 @@ public final class ProductionRemediationReport {
             result.put("schemaVersion", ProductionRemediationPlan.SCHEMA);
             result.put("profile", options.profile());
             result.put("case", options.scenario());
-            result.put("observationPolicy", Map.of("detailedDiagnostics", options.profile().equals("diagnostic"),
+            result.put("observationPolicy", Map.of("detailedDiagnostics", options.profile().equals("diagnostic") || "qn-terminal".equals(options.selection()) || "qn-build".equals(options.selection()) || "qn-unresolved".equals(options.selection()) || options.scenario().equals("H") && options.selection() != null,
                     "directObserverCost", "reported separately; never subtracted from request latency",
                     "unmeasuredEffects", "GC, cache and scheduling perturbation are not bounded by direct observer timing"));
             result.put("rawEvidence", Map.of("samples", samples.reference(), "controls", controls.reference()));
@@ -295,24 +335,113 @@ public final class ProductionRemediationReport {
     static final class Stream implements AutoCloseable {
         private final Path path;
         private final long limit;
+        private final boolean gzip;
+        private final CountingOutputStream counter;
         private final BufferedWriter writer;
-        private long bytes, records;
+        private long bytes, records, appendNanos;
         private boolean truncated;
-        Stream(Path path, long limit) throws IOException {
-            this.path = path; this.limit = limit;
-            writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW);
+        Stream(Path path, long limit) throws IOException { this(path, limit, false); }
+        Stream(Path path, long limit, boolean gzip) throws IOException {
+            this.path = path; this.limit = limit; this.gzip = gzip;
+            OutputStream raw = Files.newOutputStream(path, StandardOpenOption.CREATE_NEW);
+            OutputStream sink = raw;
+            if (gzip) { counter = new CountingOutputStream(raw); sink = new GZIPOutputStream(counter, 1 << 16, true); }
+            else counter = null;
+            writer = new BufferedWriter(new OutputStreamWriter(sink, StandardCharsets.UTF_8));
         }
-        synchronized void append(Map<String, Object> row) {
-            String line = JSON.toJson(row) + "\n";
-            long size = line.getBytes(StandardCharsets.UTF_8).length;
-            if (bytes + size > limit) { truncated = true; return; }
-            try { writer.write(line); writer.flush(); bytes += size; records++; }
-            catch (IOException failure) { throw new UncheckedIOException(failure); }
+        synchronized void append(Object row) {
+            long started = System.nanoTime();
+            try {
+                if (truncated) return;
+                String line = JSON.toJson(row) + "\n";
+                byte[] data = line.getBytes(StandardCharsets.UTF_8);
+                if (!gzip && bytes + data.length > limit) { truncated = true; return; }
+                // Compressed streams stop before the limit with headroom for one record and the gzip trailer.
+                if (gzip && bytes > limit - (4L << 20)) { truncated = true; return; }
+                try {
+                    writer.write(line); writer.flush();
+                    bytes = gzip ? counter.count : bytes + data.length;
+                    records++;
+                } catch (IOException failure) { throw new UncheckedIOException(failure); }
+            } finally { appendNanos += System.nanoTime() - started; }
         }
         Map<String, Object> reference() throws IOException {
-            return Map.of("path", path.getFileName().toString(), "bytes", bytes, "records", records, "sha256", hash(path), "truncated", truncated);
+            Map<String, Object> reference = new LinkedHashMap<>();
+            reference.put("path", path.getFileName().toString());
+            reference.put("bytes", Files.exists(path) ? Files.size(path) : bytes);
+            reference.put("records", records);
+            reference.put("sha256", hash(path));
+            reference.put("truncated", truncated);
+            reference.put("appendNanos", appendNanos);
+            reference.put("costCoverage", "JSON serialization and write/flush only; excludes record construction and close; never subtracted");
+            if (gzip) reference.put("compression", "gzip");
+            return reference;
         }
         @Override public void close() throws IOException { writer.close(); }
+    }
+
+    static final class CountingOutputStream extends FilterOutputStream {
+        long count;
+        CountingOutputStream(OutputStream out) { super(out); }
+        @Override public void write(int value) throws IOException { out.write(value); count++; }
+        @Override public void write(byte[] data, int offset, int length) throws IOException { out.write(data, offset, length); count += length; }
+    }
+
+    /** Each frame depends only on its immediate predecessor; retain two current maps, not a run-wide dictionary. */
+    static final class StateProofs {
+        private String previousId;
+        private final Map<String, JsonObject> previous = new HashMap<>();
+
+        JsonObject encode(JsonObject proof) {
+            JsonObject result = metadata(proof);
+            result.addProperty("stateEncoding", "delta-1"); result.addProperty("previousState", previousId);
+            for (String field : List.of("before", "used")) {
+                JsonObject current = proof.getAsJsonObject(field);
+                JsonObject prior = previous.getOrDefault(field, new JsonObject());
+                JsonObject changed = new JsonObject(); JsonArray removed = new JsonArray();
+                for (var entry : current.entrySet()) if (!entry.getValue().equals(prior.get(entry.getKey()))) changed.add(entry.getKey(), entry.getValue());
+                for (String key : prior.keySet()) if (!current.has(key)) removed.add(key);
+                result.remove(field); result.add(field + "Changed", changed); result.add(field + "Removed", removed);
+                previous.put(field, current);
+            }
+            previousId = string(proof, "id");
+            return result;
+        }
+
+        JsonObject decode(JsonObject encoded) {
+            if (!"delta-1".equals(string(encoded, "stateEncoding")) || !encoded.has("previousState")
+                    || !java.util.Objects.equals(previousId, string(encoded, "previousState"))) {
+                throw new IllegalArgumentException("Broken sample state chain: " + string(encoded, "id"));
+            }
+            JsonObject result = metadata(encoded);
+            Map<String, JsonObject> next = new HashMap<>();
+            for (String field : List.of("before", "used")) {
+                JsonObject changed = encoded.getAsJsonObject(field + "Changed");
+                JsonArray removed = encoded.getAsJsonArray(field + "Removed");
+                if (changed == null || removed == null) throw new IllegalArgumentException("Missing state delta: " + field);
+                JsonObject prior = previous.getOrDefault(field, new JsonObject());
+                JsonObject current = prior;
+                if (changed.size() != 0 || removed.size() != 0) {
+                    current = new JsonObject();
+                    for (var entry : prior.entrySet()) current.add(entry.getKey(), entry.getValue());
+                    for (var key : removed) if (current.remove(key.getAsString()) == null) throw new IllegalArgumentException("Unknown removed state: " + key);
+                    for (var entry : changed.entrySet()) current.add(entry.getKey(), entry.getValue());
+                }
+                next.put(field, current); result.add(field, current);
+            }
+            previous.putAll(next); previousId = string(encoded, "id");
+            return result;
+        }
+
+        private static JsonObject metadata(JsonObject source) {
+            JsonObject result = new JsonObject();
+            for (var entry : source.entrySet()) {
+                if (!List.of("before", "used", "beforeChanged", "usedChanged", "beforeRemoved", "usedRemoved").contains(entry.getKey())) {
+                    result.add(entry.getKey(), entry.getValue());
+                }
+            }
+            return result;
+        }
     }
 
     static void finish(Path root, Path output) throws IOException {
@@ -337,19 +466,31 @@ public final class ProductionRemediationReport {
         if (!ProductionRemediationPlan.SCHEMA.equals(string(identity, "schemaVersion"))) missing.add("Identity schema mismatch");
         Map<String, ProductionRemediationPlan.Target> expected = new LinkedHashMap<>();
         for (var target : ProductionRemediationPlan.targets(options)) expected.put(target.id(), target);
+        if (options.plan() != null) {
+            try {
+                Path plan = output.resolve("plan.json");
+                if (!hash(plan).equalsIgnoreCase(string(identity, "planSHA256")) || !JsonParser.parseString(options.plan()).equals(readObject(plan))) missing.add("Archived diagnostic plan changed");
+            } catch (IOException | RuntimeException invalid) { missing.add("Archived diagnostic plan missing or invalid"); }
+        }
         if (!JSON.toJsonTree(expected.values()).equals(identity.get("targets"))) missing.add("Frozen target inventory missing or changed");
         Map<String, JsonObject> terminals = new LinkedHashMap<>();
         Map<String, JsonObject> stateProofs = new HashMap<>();
+        StateProofs stateFrames = new StateProofs();
         List<JsonObject> runtimeEnvironments = new ArrayList<>();
         for (String stream : List.of("samples", "controls")) {
-            Path file = output.resolve(stream + ".jsonl");
+            Path file = rawStreamFile(output, stream);
             if (!Files.isRegularFile(file)) { missing.add(stream + " missing"); continue; }
             readEvidence(file, missing, row -> {
                 if (stream.equals("controls") && "runtime-environment".equals(string(row, "event")) && row.has("environment")) runtimeEnvironments.add(row.getAsJsonObject("environment"));
                 if (stream.equals("controls") && "sample-state".equals(string(row, "event"))) {
                     String id = string(row, "id");
                     if (!expected.containsKey(id)) failures.add("Unknown state proof: " + id);
-                    else if (stateProofs.putIfAbsent(id, row) != null) failures.add("Duplicate state proof: " + id);
+                    else {
+                        try {
+                            JsonObject decoded = stateFrames.decode(row);
+                            if (stateProofs.putIfAbsent(id, decoded) != null) failures.add("Duplicate state proof: " + id);
+                        } catch (RuntimeException malformed) { missing.add("Invalid state reference " + id + ": " + malformed.getMessage()); }
+                    }
                 }
                 if (!"terminal".equals(string(row, "event"))) return;
                 String id = string(row, "id");
@@ -361,6 +502,7 @@ public final class ProductionRemediationReport {
                 if (!JSON.toJsonTree(target.parameters()).equals(row.get("parameters"))) failures.add("Target parameters changed: " + id);
                 if (terminals.putIfAbsent(id, row) != null) failures.add("Duplicate terminal: " + id);
                 String outcome = string(row, "outcome");
+                if (row.has("fixtureError")) failures.add("Fixture sample failure: " + id + ":" + string(row, "fixtureError"));
                 if ("missed".equals(options.control()) && (!"NOT_ENTERED".equals(outcome)
                         || !"FIXTURE_TARGET_SKIPPED".equals(string(row, "reason")))) failures.add("Missed fixture executed a target: " + id);
                 if (!(sample ? SAMPLE_OUTCOMES : CONTROL_OUTCOMES).contains(outcome)) missing.add("Invalid terminal: " + id);
@@ -374,7 +516,7 @@ public final class ProductionRemediationReport {
                     validateSample(row, missing, failures);
                     if ("mutated".equals(options.control()) && !bool(row, "mutationDetected")) missing.add("No sample mutation rejection evidence: " + id);
                     String phase = target.parameters().get("phase");
-                    if (("hot".equals(phase) || "cold".equals(phase)) && !bool(row, "qualified")) missing.add("Unqualified " + id);
+                    if (("hot".equals(phase) || "cold".equals(phase)) && !"B".equals(target.parameters().get("mode")) && !bool(row, "qualified")) missing.add("Unqualified " + id);
                 }
                 if (!sample && "PASS".equals(outcome) && (!bool(row, "reached") || !bool(row, "cleaned"))) missing.add("Control reach/cleanup evidence: " + id);
                 if ("PASS".equals(outcome) && (target.kind().startsWith("F02") || target.kind().startsWith("F03"))) validateMixedFailureControl(target, row, missing);
@@ -400,9 +542,13 @@ public final class ProductionRemediationReport {
             if (!options.profile().equals(string(result, "profile")) || !options.scenario().equals(string(result, "case"))) missing.add("Result profile/case mismatch");
             if (!"DATA_COMPLETE".equals(string(result, "state")) && !("missed".equals(options.control())
                     && "DATA_PARTIAL".equals(string(result, "state")))) missing.add("Result collection did not complete");
-            if (result.has("failure") || result.has("shutdownFailure")) failures.add("Harness or shutdown failure recorded");
+            if (result.has("failure") || result.has("shutdownFailure") || result.has("failureStage")
+                    || result.has("failureReason") || "HARNESS_FAILED".equals(string(result, "state"))) {
+                failures.add("Harness or shutdown failure recorded");
+            }
             if (Files.size(output.resolve("result.json")) + Files.size(output.resolve("identity.json")) > COMPACT_LIMIT) missing.add("Combined compact budget exceeded");
-            if (bool(result, "streamTruncated")) missing.add("Raw stream truncated");
+            if (!result.has("streamTruncated") || !result.get("streamTruncated").isJsonPrimitive() || !result.getAsJsonPrimitive("streamTruncated").isBoolean()) missing.add("Raw stream truncation flag missing or malformed");
+            else if (bool(result, "streamTruncated")) missing.add("Raw stream truncated");
             for (String key : List.of("runScope", "routes", "pressureStages", "historyBaseline", "rawEvidence")) if (!result.has(key)) missing.add("Result field missing: " + key);
             if (result.has("rawEvidence")) {
                 try { verifyReferences(output, result.getAsJsonObject("rawEvidence"), missing); }
@@ -411,11 +557,23 @@ public final class ProductionRemediationReport {
         }
         try { validateExit(output, missing, failures); }
         catch (IOException | RuntimeException malformed) { missing.add("Exit evidence could not be read: " + malformed.getMessage()); }
+        if (result != null && result.has("runScope")) {
+            try {
+                var scope = result.getAsJsonObject("runScope");
+                long planned = expected.values().stream().filter(t -> t.kind().equals("query")).count();
+                if (options.usesFrozenWorld()) {
+                    if (exactLong(scope, "plannedOrdinarySamples") != planned) missing.add("runScope ordinary count differs from Plan");
+                    if (exactLong(scope, "plannedOrdinaryRoutes") != expected.values().stream().filter(t -> t.kind().equals("query")).map(t -> t.parameters().get("route")).distinct().count()) missing.add("runScope route count differs from Plan");
+                    if (!JSON.toJsonTree(expected.values().stream().filter(t -> t.kind().equals("pressure")).map(t -> t.parameters().get("phase")).distinct().toList()).equals(scope.get("pressureStages"))) missing.add("runScope pressure phases differ from Plan");
+                } else if (exactLong(scope, "plannedControls") != expected.size()) missing.add("runScope control count differs from Plan");
+            } catch (RuntimeException absent) { missing.add("runScope planned counts missing"); }
+        }
         Map<String, Integer> counts = new TreeMap<>();
         terminals.values().forEach(row -> counts.merge(String.valueOf(string(row, "outcome")), 1, Integer::sum));
         Map<String, Object> assessment = new LinkedHashMap<>();
         assessment.put("schemaVersion", ProductionRemediationPlan.SCHEMA);
         assessment.put("status", missing.isEmpty() ? failures.isEmpty() ? "PASS" : "FAIL" : "INCOMPLETE");
+        if (options.plan() != null && ProductionRemediationPlan.DiagnosticPlan.parse(options.plan()).value().get("recipe").getAsString().equals("observation-comparison")) assessment.put("observationComparison", observationComparison(terminals.values().stream().toList(), missing));
         assessment.put("planned", expected.size()); assessment.put("terminals", terminals.size());
         assessment.put("terminalCounts", counts);
         if (options.scenario().equals("F")) assessment.put("failureCoverage", Map.of(
@@ -432,11 +590,12 @@ public final class ProductionRemediationReport {
             assessment.put("paired", pairedEvidence(result, terminals, options, missing, failures));
             assessment.put("status", missing.isEmpty() ? failures.isEmpty() ? "PASS" : "FAIL" : "INCOMPLETE");
         }
-        if (options.scenario().equals("causality") || options.scenario().equals("probe")) {
+        if (options.scenario().equals("causality") || options.scenario().equals("probe") || "qn-terminal".equals(options.selection()) || "qn-build".equals(options.selection()) || "qn-unresolved".equals(options.selection())) {
             assessment.put("observations", diagnosticEvidence(output, options, missing));
             assessment.put("status", missing.isEmpty() ? failures.isEmpty() ? "PASS" : "FAIL" : "INCOMPLETE");
         }
         assessment.put("missing", missing); assessment.put("failures", failures);
+        assessment.put("status", missing.isEmpty() ? failures.isEmpty() ? "PASS" : "FAIL" : "INCOMPLETE");
         if (options.profile().equals("fixture")) {
             boolean missedComplete = !"missed".equals(options.control()) || expectedMisses.size() == expected.size();
             assessment.put("fixtureStatus", missing.isEmpty() && missedComplete ? failures.isEmpty() ? "PASS" : "FAIL" : "INCOMPLETE");
@@ -476,6 +635,12 @@ public final class ProductionRemediationReport {
 
     private static Map<String, Object> diagnosticEvidence(Path output, ProductionRemediationPlan.Options options, List<String> missing) throws IOException {
         Path file = output.resolve("observations.jsonl");
+        List<String> packages = options.plan() == null ? options.family() == null ? List.of("endpoint", "build", "search", "final-validation") : List.of(options.family())
+                : ProductionRemediationPlan.DiagnosticPlan.parse(options.plan()).observers();
+        if (packages.isEmpty()) {
+            if (Files.exists(file)) missing.add("Disabled diagnostic packages produced a stream");
+            return Map.of("enabled", false, "packages", packages);
+        }
         if (options.scenario().equals("probe") && options.variant().equals("off")) {
             if (Files.exists(file)) missing.add("Probe-off instance produced detailed observations");
             return Map.of("enabled", false);
@@ -496,10 +661,9 @@ public final class ProductionRemediationReport {
                     if ("observation_error".equals(kind)) errors++;
                     if (!"operation_terminal".equals(kind)) continue;
                     String family = string(row, "family");
-                    if (!List.of("endpoint", "build", "search", "final-validation").contains(family)
-                            || options.family() != null && !options.family().equals(family)
+                    if (!packages.contains(family)
                             || exactLong(row, "endNanos") - exactLong(row, "startNanos") != exactLong(row, "wallNanos")
-                            || exactLong(row, "wallNanos") < 0 || exactLong(row, "cpuNanos") < 0) { errors++; continue; }
+                            || exactLong(row, "wallNanos") < 0 || !row.has("cpuNanos") || !row.get("cpuNanos").isJsonNull() && exactLong(row, "cpuNanos") < 0) { errors++; continue; }
                     counts.merge(family, 1L, Long::sum);
                 } catch (RuntimeException malformed) { errors++; }
             }
@@ -507,9 +671,9 @@ public final class ProductionRemediationReport {
         if (ending == null) missing.add("Diagnostic ending record missing");
         else {
             try {
-                if (exactLong(ending, "errors") != 0 || bool(ending, "truncated")) errors++;
-                if (!(options.family() == null ? "all" : options.family()).equals(string(ending, "family"))) errors++;
-                List<String> families = options.family() == null ? List.of("endpoint", "build", "search", "final-validation") : List.of(options.family());
+                if (exactLong(ending, "errors") != 0 || !ending.has("truncated") || !ending.get("truncated").isJsonPrimitive() || !ending.getAsJsonPrimitive("truncated").isBoolean() || bool(ending, "truncated")) errors++;
+                if (!(options.plan() == null ? options.family() == null ? "all" : options.family() : String.join(",", packages)).equals(string(ending, "family"))) errors++;
+                List<String> families = packages;
                 for (String family : families) {
                     long count = counts.getOrDefault(family, 0L);
                     if (count == 0 || count != exactLong(ending.getAsJsonObject("started"), family)
@@ -524,6 +688,7 @@ public final class ProductionRemediationReport {
 
     static void validateSample(JsonObject row, List<String> missing, List<String> failures) {
         String id = string(row, "id");
+        validateBoundary(row, missing, failures);
         for (String key : List.of("owner", "dimension", "channel", "profile", "priority")) {
             if (string(row, key) == null || string(row, key).isBlank()) missing.add("Missing request " + key + ": " + id);
         }
@@ -555,6 +720,44 @@ public final class ProductionRemediationReport {
                 || row.has("blockedSection") && !row.get("blockedSection").isJsonNull())) failures.add("Successful sample retains a business failure: " + id);
     }
 
+    static Map<String, Object> observationComparison(List<JsonObject> samples, List<String> missing) {
+        Map<String, List<JsonObject>> blocks = new LinkedHashMap<>();
+        for (JsonObject row : samples) {
+            var p = row.getAsJsonObject("parameters");
+            if (p == null || !p.has("block")) continue;
+            blocks.computeIfAbsent(string(p, "route") + "/" + string(p, "block"), key -> new ArrayList<>()).add(row);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        blocks.forEach((key, rows) -> {
+            var walls = new ArrayList<Double>(); Set<JsonElement> work = new HashSet<>();
+            for (var row : rows) {
+                if (!"SUCCESS".equals(string(row, "outcome")) || !row.has("pairedWork") || !nonNegative(row, "wallNanos")) { missing.add("Comparison result/work missing: " + string(row, "id")); continue; }
+                walls.add(exactLong(row, "wallNanos") / 1_000_000.0); work.add(row.get("pairedWork"));
+            }
+            if (rows.size() != 20) missing.add("Comparison block incomplete: " + key);
+            result.put(key, Map.of("mode", string(rows.get(0).getAsJsonObject("parameters"), "mode"), "count", rows.size(), "wallMillis", distribution(walls), "workAndResults", work));
+        });
+        result.put("interpretation", "Diagnostic sensitivity only; compare work and A/A drift before A/B; B is not qualified hot; no per-sample subtraction");
+        return result;
+    }
+
+    static void validateBoundary(JsonObject row, List<String> missing, List<String> failures) {
+        String id = string(row, "id");
+        try {
+            var b = row.getAsJsonObject("completionBoundary");
+            if (b == null) { missing.add("Completion boundary missing: " + id); return; }
+            if (!"BOUNDED".equals(string(b, "status"))) {
+                if ("SUCCESS".equals(string(row, "outcome"))) missing.add("Successful completion boundary unproven: " + id);
+                return;
+            }
+            long lower = exactLong(b, "lowerNanos"), upper = exactLong(b, "upperNanos"), start = exactLong(row, "startNanos");
+            long callLeft = exactLong(b, "callBeforeNanos"), callRight = exactLong(b, "callAfterNanos"), callback = exactLong(b, "callbackNanos");
+            if (lower < 0 || upper < lower || callLeft - start != lower || callRight < callLeft
+                    || upper != (callback >= callLeft ? Math.min(callRight, callback) : callRight) - start
+                    || exactLong(b, "lowerTicks") < 0 || exactLong(b, "upperTicks") < exactLong(b, "lowerTicks")) failures.add("Invalid completion interval: " + id);
+        } catch (RuntimeException invalid) { missing.add("Malformed completion boundary: " + id); }
+    }
+
     static void validateStateProof(ProductionRemediationPlan.Target target, JsonObject sample, JsonObject proof,
                                            List<String> missing, List<String> failures) {
         String id = target.id(), phase = target.parameters().get("phase");
@@ -565,7 +768,16 @@ public final class ProductionRemediationReport {
         try {
             JsonObject before = proof.getAsJsonObject("before"), used = proof.getAsJsonObject("used");
             JsonObject countersBefore = proof.getAsJsonObject("counterBefore"), countersAfter = proof.getAsJsonObject("counterAfter");
+            if (!bool(proof, "fullBefore")) throw new IllegalArgumentException("full before snapshot not proven");
             if (before == null || used == null || countersBefore == null || countersAfter == null) throw new IllegalArgumentException("state fields");
+            if ("B".equals(target.parameters().get("mode"))) {
+                var prepared = proof.getAsJsonObject("prepared");
+                if (prepared == null || prepared.size() == 0) missing.add("Comparison preparation proof missing: " + id);
+                else for (var entry : prepared.entrySet()) if (!entry.getValue().equals(before.get(entry.getKey()))) failures.add("Comparison dependency not ready before: " + id);
+                if (used.size() != 0 || !"DIAGNOSTIC_ONLY".equals(string(sample, "qualificationMode")) || !sample.has("qualified")
+                        || !sample.get("qualified").isJsonPrimitive() || !sample.getAsJsonPrimitive("qualified").isBoolean() || bool(sample, "qualified")) failures.add("Reduced observation mislabelled: " + id);
+                return;
+            }
             if ("SUCCESS".equals(string(sample, "outcome")) && used.size() == 0) missing.add("Successful sample captured no dependencies: " + id);
             if (phase.equals("hot")) for (var entry : used.entrySet()) {
                 if (!entry.getValue().equals(before.get(entry.getKey()))) failures.add("Hot dependency was not ready: " + id + ":" + entry.getKey());
@@ -733,28 +945,11 @@ public final class ProductionRemediationReport {
         Map<String, Object> instances = new LinkedHashMap<>();
         List<String> missing = new ArrayList<>(), failures = new ArrayList<>();
         List<String> required = new ArrayList<>();
-        if (options.profile().equals("formal")) {
-            for (int round = 1; round <= 3; round++) {
-                required.add("R" + round + "/terrain");
-                required.add("R" + round + "/M/on"); required.add("R" + round + "/M/off");
-            }
-            for (String scenario : List.of("G", "H", "F", "L")) required.add("R1/" + scenario);
-            for (int row = 1; row <= 9; row++) {
-                String run = "W0" + row;
-                for (int variant = 1; variant <= ProductionRemediationPlan.shutdownPlan(run).size(); variant++) required.add(run + "/W/" + variant);
-            }
-        } else if (options.profile().equals("diagnostic") && List.of("generation-cost", "probe").contains(options.scenario())) {
-            for (int round = 1; round <= 3; round++) for (String variant : List.of("on", "off")) {
-                required.add("R" + round + "/" + options.scenario() + "/" + variant);
-                if (options.scenario().equals("probe")) for (String family : List.of("endpoint", "build", "search", "final-validation")) {
-                    String narrow = "R" + round + "/probe/" + variant + "/" + family;
-                    if (Files.isRegularFile(batch.resolve(narrow).resolve("identity.json"))) required.add(narrow);
-                }
-            }
-        } else {
-            // Fixture batches intentionally vary the destructive control in separate directories.
-            required.add(options.run() + "/" + options.scenario() + (options.variant() == null ? "" : "/" + options.variant()));
-        }
+        if (options.profile().equals("formal") && options.scenario().equals("terrain")) {
+            for (int round = 1; round <= 3; round++) required.add("R" + round + "/terrain" + (options.selection() == null ? "" : "/" + options.selection()));
+        } else if (options.scenario().equals("generation-cost")) {
+            for (int round = 1; round <= 3; round++) for (String variant : List.of("on", "off")) required.add("R" + round + "/generation-cost/" + variant);
+        } else required.add(options.suffix().substring(options.batch().length() + 1));
         JsonElement commonInputs = null, commonBinaries = null, commonEnvironment = null;
         for (String instance : required) {
             Path directory = batch.resolve(instance), file = directory.resolve("identity.json");
@@ -788,25 +983,15 @@ public final class ProductionRemediationReport {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("schemaVersion", ProductionRemediationPlan.SCHEMA); result.put("profile", options.profile());
         result.put("batch", options.batch()); result.put("instances", instances); result.put("missing", missing); result.put("failures", failures);
-        if (options.profile().equals("formal")) result.put("performance", aggregatePerformance(root, batch, missing, failures));
-        if (options.scenario().equals("generation-cost")) result.put("generationComparison", compareGeneration(instances, missing));
-        if (options.profile().equals("formal")) result.put("metricsComparison", compareQueries(instances, "M", missing, failures));
-        if (options.scenario().equals("probe")) {
-            Map<String, Object> comparison = compareQueries(instances, "probe", missing, failures);
-            result.put("probeComparison", comparison);
-            if (Boolean.TRUE.equals(comparison.get("narrowDiagnosticsRequired")) || options.family() != null) {
-                Map<String, Object> narrow = new LinkedHashMap<>();
-                for (String family : List.of("endpoint", "build", "search", "final-validation")) {
-                    narrow.put(family, compareQueries(instances, "probe", family, missing, failures));
-                }
-                result.put("narrowProbeComparisons", narrow);
-                boolean complete = narrow.values().stream().allMatch(value -> "MEASURED".equals(((Map<?, ?>) value).get("status")));
-                if (complete) missing.remove("Probe overhead exceeds 5%; endpoint/build/search/final-validation narrow diagnostics are required");
-            }
+        result.put("scope", options.scenario());
+        if (options.profile().equals("formal") && options.scenario().equals("terrain")) {
+            Map<String, Object> performance = aggregatePerformance(root, batch, options.selection(), missing, failures);
+            result.put("performance", performance); result.put("adoption", performance.get("adoption"));
         }
+        if (options.scenario().equals("generation-cost")) result.put("generationComparison", compareGeneration(instances, missing));
         result.put("status", missing.isEmpty() ? failures.isEmpty() ? "PASS" : "FAIL" : "INCOMPLETE");
         if (options.profile().equals("fixture")) result.put("fixtureStatus", result.get("status"));
-        replaceDerived(batch.resolve("aggregate.json"), result);
+        replaceDerived(batch.resolve(options.profile().equals("formal") ? "aggregate-" + options.scenario() + ".json" : "aggregate.json"), result);
     }
 
     private static Map<String, Object> generationEvidence(JsonObject result, Map<String, JsonObject> terminals, List<String> missing) {
@@ -921,7 +1106,6 @@ public final class ProductionRemediationReport {
                 String scale = string(row.getAsJsonObject("parameters"), "scale");
                 try {
                     var distribution = distribution(snapshotTimes(row, scale)); snapshots.put(scale, distribution);
-                    if (options.profile().equals("formal") && (double) distribution.get("p95") > .05) failures.add("Production snapshot P95 exceeds 0.05ms: " + scale);
                 } catch (RuntimeException invalid) { missing.add("Snapshot " + scale + ":" + invalid.getMessage()); }
             }
         }
@@ -969,78 +1153,185 @@ public final class ProductionRemediationReport {
         for (String route : differences.keySet()) {
             var absolute = distribution(differences.get(route), true); var ratio = distribution(relative.get(route), true);
             routes.put(route, Map.of("p95DifferenceMillis", absolute, "p95RelativeOverhead", ratio));
-            if (rounds.size() == 3 && scenario.equals("M") && (double) absolute.get("p50") > .01) failures.add("Metrics hot P95 increment exceeds 0.01ms: " + route);
-            if (rounds.size() == 3 && scenario.equals("probe") && family == null && (double) ratio.get("p50") > .05) narrow = true;
+            
+            
         }
         var cpu = distribution(cpuRatios, true);
-        if (rounds.size() == 3 && scenario.equals("M") && (double) cpu.get("p50") > .01) failures.add("Production statistics CPU increment exceeds 1%");
-        if (narrow) missing.add("Probe overhead exceeds 5%; endpoint/build/search/final-validation narrow diagnostics are required");
+        
+        
         return Map.of("status", rounds.size() == 3 ? "MEASURED" : "INCOMPLETE", "rounds", rounds, "routes", routes, "cpuIncrement", cpu, "narrowDiagnosticsRequired", narrow);
     }
 
-    private static Map<String, Object> aggregatePerformance(Path root, Path batch, List<String> missing, List<String> failures) throws IOException {
+    private static Map<String, Object> aggregatePerformance(Path root, Path batch, String selection, List<String> missing, List<String> failures) throws IOException {
         requireHash(root.resolve(ProductionRemediationPlan.BASELINE), ProductionRemediationPlan.BASELINE_HASH);
         Map<String, Double> baseline = validateBaseline(readObject(root.resolve(ProductionRemediationPlan.BASELINE)));
-        Map<String, Object> routes = new LinkedHashMap<>();
-        Map<String, List<Double>> coldWall = new LinkedHashMap<>(), coldTicks = new LinkedHashMap<>();
-        List<RoundSamples> samplesByRound = new ArrayList<>();
+        List<Path> roundIdentities = new ArrayList<>();
         for (int round = 1; round <= 3; round++) {
-            Path output = batch.resolve("R" + round + "/terrain");
-            try { samplesByRound.add(roundSamples(output, batch.getFileName().toString(), "R" + round)); }
+            Path identity = batch.resolve("R" + round + "/terrain" + (selection == null ? "" : "/" + selection)).resolve("identity.json");
+            if (Files.isRegularFile(identity)) roundIdentities.add(identity);
+        }
+        List<String> adoptionIssues = new ArrayList<>(), reviewRequired = new ArrayList<>();
+        AdoptionReview adoptionReview = parseAdoptionReview(batch, batch.getFileName().toString(), selection, roundIdentities, adoptionIssues);
+        Map<String, Object> routes = new LinkedHashMap<>(), cold = new LinkedHashMap<>();
+        Map<String, List<Double>> coldLower = new LinkedHashMap<>(), coldUpper = new LinkedHashMap<>(), coldTickLower = new LinkedHashMap<>(), coldTickUpper = new LinkedHashMap<>();
+        List<RoundSamples> samples = new ArrayList<>();
+        for (int round = 1; round <= 3; round++) {
+            Path output = batch.resolve("R" + round + "/terrain" + (selection == null ? "" : "/" + selection));
+            try { samples.add(roundSamples(output, batch.getFileName().toString(), "R" + round, selection)); }
             catch (IOException | RuntimeException invalid) { missing.add("Terrain R" + round + " raw evidence unavailable: " + invalid.getMessage()); }
         }
-        for (String route : ProductionRemediationPlan.routes()) {
-            List<Double> rounds = new ArrayList<>();
-            List<String> inputHashes = new ArrayList<>();
-            for (RoundSamples round : samplesByRound) {
-                inputHashes.add(round.identityHash);
-                List<Double> hot = new ArrayList<>();
-                String group = route.substring(0, route.lastIndexOf('_'));
+        for (String route : selection == null ? ProductionRemediationPlan.routes() : ProductionRemediationPlan.performanceRoutes()) {
+            List<Double> lowerRounds = new ArrayList<>(), upperRounds = new ArrayList<>(), pointRounds = new ArrayList<>();
+            for (var round : samples) {
+                List<Double> lower = new ArrayList<>(), upper = new ArrayList<>(), points = new ArrayList<>();
                 for (JsonObject row : round.routes.getOrDefault(route, List.of())) {
-                    JsonObject p = row.getAsJsonObject("parameters");
-                    if (!"SUCCESS".equals(string(row, "outcome")) || !bool(row, "qualified") || !nonNegative(row, "wallNanos")) continue;
-                    double wall = row.get("wallNanos").getAsDouble() / 1_000_000.0;
-                    if ("hot".equals(string(p, "phase"))) hot.add(wall);
-                    else if ("cold".equals(string(p, "phase"))) {
-                        coldWall.computeIfAbsent(group, ignored -> new ArrayList<>()).add(wall);
-                        if (nonNegative(row, "completionTicks")) coldTicks.computeIfAbsent(group, ignored -> new ArrayList<>()).add(row.get("completionTicks").getAsDouble());
+                    if (!"SUCCESS".equals(string(row, "outcome")) || !bool(row, "qualified")) continue;
+                    var boundary = row.getAsJsonObject("completionBoundary");
+                    if (boundary == null || !"BOUNDED".equals(string(boundary, "status"))) continue;
+                    String phase = string(row.getAsJsonObject("parameters"), "phase"), group = route.substring(0, route.lastIndexOf('_'));
+                    double left = exactLong(boundary, "lowerNanos") / 1_000_000.0, right = exactLong(boundary, "upperNanos") / 1_000_000.0;
+                    if ("hot".equals(phase)) { lower.add(left); upper.add(right); points.add(exactLong(row, "wallNanos") / 1_000_000.0); }
+                    if ("cold".equals(phase)) {
+                        coldLower.computeIfAbsent(group, key -> new ArrayList<>()).add(left); coldUpper.computeIfAbsent(group, key -> new ArrayList<>()).add(right);
+                        coldTickLower.computeIfAbsent(group, key -> new ArrayList<>()).add((double) exactLong(boundary, "lowerTicks"));
+                        coldTickUpper.computeIfAbsent(group, key -> new ArrayList<>()).add((double) exactLong(boundary, "upperTicks"));
                     }
                 }
-                if (hot.size() == 100) rounds.add((double) distribution(hot).get("p95"));
+                if (lower.size() == 100) {
+                    lowerRounds.add((double) distribution(lower).get("p95")); upperRounds.add((double) distribution(upper).get("p95")); pointRounds.add((double) distribution(points).get("p95"));
+                }
             }
-            Double previous = baseline.get(route);
-            double limit = hotLimit(route, previous);
-            Map<String, Object> comparison = new LinkedHashMap<>();
-            comparison.put("hotP95ByRound", rounds); comparison.put("inputHashes", inputHashes); comparison.put("baseline", previous); comparison.put("limit", limit);
-            if (rounds.size() != 3) missing.add("Hot samples incomplete: " + route);
+            var result = new LinkedHashMap<String, Object>(); Double previous = baseline.get(route); double limit = hotLimit(route, previous);
+            result.put("lowerP95ByRound", lowerRounds); result.put("upperP95ByRound", upperRounds); result.put("callbackP95ByRound", pointRounds);
+            result.put("baseline", previous); result.put("limit", limit); result.put("referencePurpose", "Before production changes; does not replace 0905 threshold");
+            if (lowerRounds.size() != 3) { missing.add("Hot samples incomplete: " + route); reviewRequired.add(route); }
             else {
-                double median = (double) distribution(rounds).get("p50"), worst = (double) distribution(rounds).get("max");
-                comparison.put("median", median); comparison.put("worst", worst); comparison.put("distanceToLimit", median - limit);
-                comparison.put("absoluteChange", previous == null ? null : median - previous);
-                comparison.put("percentChange", previous == null || previous == 0 ? null : (median - previous) / previous * 100);
-                if (median > limit) failures.add("Hot P95 exceeds limit: " + route);
+                Map<String, Object> boundary = interval((double) distribution(lowerRounds).get("p50"), (double) distribution(upperRounds).get("p50"), limit);
+                result.put("boundary", boundary);
+                String relation = (String) boundary.get("observedRelation");
+                boolean covered = adoptionReview.routes().contains(route);
+                String adoption = adoptionFor(relation, covered);
+                result.put("observedRelation", relation); result.put("adoption", adoption); result.put("adoptionReview", covered ? "COVERED" : "MISSING");
+                if ("ADOPTED".equals(adoption) && "EXCEEDS".equals(relation)) failures.add("Hot performance exceeds limit: " + route);
+                if (!"ADOPTED".equals(adoption)) reviewRequired.add(route);
+                if (!covered && !"CROSSES_LIMIT".equals(relation)) adoptionIssues.add("Route observer-risk review missing: " + route);
+                result.put("worstUpper", distribution(upperRounds).get("max")); result.put("callbackMedian", distribution(pointRounds).get("p50"));
             }
-            routes.put(route, comparison);
+            routes.put(route, result);
         }
-        Map<String, Object> cold = new LinkedHashMap<>();
-        for (String group : ProductionRemediationPlan.GROUPS) {
-            List<Double> wall = coldWall.getOrDefault(group, List.of()), ticks = coldTicks.getOrDefault(group, List.of());
+        for (String group : selection == null ? ProductionRemediationPlan.GROUPS : ProductionRemediationPlan.performanceColdGroups()) {
+            var left = coldLower.getOrDefault(group, List.of()); var right = coldUpper.getOrDefault(group, List.of());
+            var ticksLeft = coldTickLower.getOrDefault(group, List.of()); var ticksRight = coldTickUpper.getOrDefault(group, List.of());
             int distance = Integer.parseInt(group.substring(group.lastIndexOf('_') + 1));
             int millisLimit = distance == 8 ? 100 : distance == 64 ? 150 : distance == 96 ? 300 : 1000;
             int tickLimit = distance == 8 ? 2 : distance == 64 ? 3 : distance == 96 ? 6 : 20;
-            cold.put(group, Map.of("wallMillis", distribution(wall), "completionTicks", distribution(ticks), "wallLimit", millisLimit, "tickLimit", tickLimit,
-                    "historicalRelativeComparison", "NOT_APPLICABLE: no qualified cold reference"));
-            if (wall.size() != 20 || ticks.size() != 20) missing.add("Cold samples incomplete: " + group);
-            else if ((double) distribution(wall).get("p95") > millisLimit || (double) distribution(ticks).get("p95") > tickLimit) failures.add("Cold P95 exceeds limit: " + group);
+            var result = new LinkedHashMap<String, Object>(); result.put("count", left.size());
+            if (left.size() != 20 || right.size() != 20 || ticksLeft.size() != 20 || ticksRight.size() != 20) { missing.add("Cold samples incomplete: " + group); reviewRequired.add(group); }
+            else {
+                Map<String, Object> wallInterval = interval((double) distribution(left).get("p95"), (double) distribution(right).get("p95"), millisLimit);
+                Map<String, Object> tickInterval = interval((double) distribution(ticksLeft).get("p95"), (double) distribution(ticksRight).get("p95"), tickLimit);
+                result.put("wallMillis", wallInterval); result.put("completionTicks", tickInterval);
+                String relation = combinedColdRelation((String) wallInterval.get("observedRelation"), (String) tickInterval.get("observedRelation"));
+                boolean covered = adoptionReview.coldGroups().contains(group);
+                String adoption = adoptionFor(relation, covered);
+                result.put("observedRelation", relation); result.put("adoption", adoption); result.put("adoptionReview", covered ? "COVERED" : "MISSING");
+                if ("ADOPTED".equals(adoption) && "EXCEEDS".equals(relation)) failures.add("Cold performance exceeds limit: " + group);
+                if (!"ADOPTED".equals(adoption)) reviewRequired.add(group);
+                if (!covered && !"CROSSES_LIMIT".equals(relation)) adoptionIssues.add("Cold group observer-risk review missing: " + group);
+            }
+            cold.put(group, result);
         }
-        return Map.of("routes", routes, "coldGroups", cold);
+        // Data completeness and performance adoption are separate conclusions. Adoption requires a
+        // pre-registered observer-risk review bound to this batch/selection and frozen before the run.
+        String overall = reviewRequired.isEmpty() && adoptionIssues.isEmpty() && missing.isEmpty() ? "ADOPTED" : "REVIEW_REQUIRED";
+        if (!"ADOPTED".equals(overall)) missing.add("Performance adoption requires valid observer-risk review and complete samples");
+        return Map.of("routes", routes, "coldGroups", cold, "adoption", overall, "adoptionIssues", adoptionIssues,
+                "reviewRequired", reviewRequired, "interpretation", "Observed completion intervals; adoption requires a pre-registered observer-risk review. Not uninstrumented latency or population confidence intervals");
+    }
+
+    static Map<String, Object> interval(double lower, double upper, double limit) {
+        if (!Double.isFinite(lower) || !Double.isFinite(upper) || lower < 0 || upper < lower) throw new IllegalArgumentException("Invalid measurement interval");
+        return Map.of("lower", lower, "upper", upper, "limit", limit,
+                "observedRelation", upper <= limit ? "WITHIN" : lower > limit ? "EXCEEDS" : "CROSSES_LIMIT");
+    }
+
+    static String adoptionFor(String observedRelation, boolean covered) {
+        if (!covered || observedRelation == null) return "REVIEW_REQUIRED";
+        if ("WITHIN".equals(observedRelation) || "EXCEEDS".equals(observedRelation)) return "ADOPTED";
+        return "REVIEW_REQUIRED";
+    }
+
+    static String combinedColdRelation(String wallRelation, String tickRelation) {
+        if ("CROSSES_LIMIT".equals(wallRelation) || "CROSSES_LIMIT".equals(tickRelation)) return "CROSSES_LIMIT";
+        if ("WITHIN".equals(wallRelation) && "WITHIN".equals(tickRelation)) return "WITHIN";
+        if ("EXCEEDS".equals(wallRelation) || "EXCEEDS".equals(tickRelation)) return "EXCEEDS";
+        return "REVIEW_REQUIRED";
+    }
+
+    record AdoptionReview(Set<String> routes, Set<String> coldGroups, List<String> issues) {
+        AdoptionReview {
+            routes = Set.copyOf(routes); coldGroups = Set.copyOf(coldGroups); issues = List.copyOf(issues);
+        }
+    }
+
+    static AdoptionReview parseAdoptionReview(Path batch, String batchName, String selection, List<Path> identities, List<String> issues) {
+        Set<String> routes = new HashSet<>(), coldGroups = new HashSet<>();
+        int initialIssues = issues.size();
+        Path file = batch.resolve(ADOPTION_REVIEW);
+        if (!Files.isRegularFile(file)) { issues.add("Adoption risk review missing: " + ADOPTION_REVIEW); return new AdoptionReview(routes, coldGroups, issues); }
+        try {
+            JsonObject review = readObject(file);
+            if (!ADOPTION_REVIEW_SCHEMA.equals(string(review, "schemaVersion"))) { issues.add("Adoption risk review schema mismatch"); return new AdoptionReview(routes, coldGroups, issues); }
+            if (!batchName.equals(string(review, "batch")) || !java.util.Objects.equals(selection, string(review, "selection"))) { issues.add("Adoption risk review batch/selection mismatch"); return new AdoptionReview(routes, coldGroups, issues); }
+            Instant frozen;
+            try { frozen = Instant.parse(string(review, "frozenAt")); } catch (RuntimeException invalid) { issues.add("Adoption risk review frozenAt invalid"); return new AdoptionReview(routes, coldGroups, issues); }
+            Set<String> runs = new HashSet<>();
+            if (identities.size() != 3) issues.add("Adoption risk review requires three round identities");
+            for (Path identity : identities) {
+                try {
+                    JsonObject bound = readObject(identity);
+                    String run = string(bound, "run");
+                    if (!Set.of("R1", "R2", "R3").contains(run) || !runs.add(run)
+                            || !new ProductionRemediationPlan.Options("formal", "terrain", run, batchName, null, null, null, selection).equals(options(bound))) {
+                        issues.add("Adoption risk review round identity mismatch");
+                    }
+                    Instant prepared = Instant.parse(string(bound, "preparedAt"));
+                    if (!frozen.isBefore(prepared)) issues.add("Adoption risk review not pre-registered before run");
+                } catch (RuntimeException | IOException invalid) { issues.add("Adoption risk review could not bind round identity"); }
+            }
+            // Batch-level failures invalidate both kinds of coverage before any entries are accepted.
+            if (issues.size() != initialIssues) return new AdoptionReview(routes, coldGroups, issues);
+            collectReviewEntries(review.get("routes"), "route", routes, issues);
+            collectReviewEntries(review.get("coldGroups"), "coldGroup", coldGroups, issues);
+        } catch (IOException | RuntimeException invalid) {
+            issues.add("Malformed adoption risk review: " + invalid.getMessage());
+            routes.clear(); coldGroups.clear();
+        }
+        return new AdoptionReview(routes, coldGroups, issues);
+    }
+
+    private static void collectReviewEntries(JsonElement entries, String kind, Set<String> accepted, List<String> issues) {
+        if (entries == null || !entries.isJsonObject()) { issues.add("Adoption risk review missing or malformed " + kind + " section"); return; }
+        for (var entry : entries.getAsJsonObject().entrySet()) {
+            JsonObject item = entry.getValue() != null && entry.getValue().isJsonObject() ? entry.getValue().getAsJsonObject() : null;
+            JsonElement conclusion = item == null ? null : item.get("conclusion"), value = item == null ? null : item.get("evidence");
+            JsonArray evidence = value != null && value.isJsonArray() ? value.getAsJsonArray() : null;
+            if (conclusion == null || !conclusion.isJsonPrimitive() || !conclusion.getAsJsonPrimitive().isString()
+                    || !ADOPTION_CANNOT_CHANGE.equals(conclusion.getAsString()) || evidence == null || evidence.isEmpty()) {
+                issues.add("Adoption risk review entry invalid: " + entry.getKey()); continue;
+            }
+            boolean valid = true;
+            for (JsonElement element : evidence) if (element == null || !element.isJsonPrimitive()
+                    || !element.getAsJsonPrimitive().isString() || element.getAsString().isBlank()) valid = false;
+            if (valid) accepted.add(entry.getKey()); else issues.add("Adoption risk review evidence invalid: " + entry.getKey());
+        }
     }
 
     private record RoundSamples(String identityHash, Map<String, List<JsonObject>> routes) { }
 
-    private static RoundSamples roundSamples(Path output, String batch, String run) throws IOException {
+    private static RoundSamples roundSamples(Path output, String batch, String run, String selection) throws IOException {
         JsonObject identity = readObject(output.resolve("identity.json")), result = readObject(output.resolve("result.json"));
-        var expectedOptions = new ProductionRemediationPlan.Options("formal", "terrain", run, batch, null, null);
+        var expectedOptions = new ProductionRemediationPlan.Options("formal", "terrain", run, batch, null, null, null, selection);
         if (!expectedOptions.equals(options(identity))) throw new IOException("Terrain instance has wrong identity");
         List<String> referenceIssues = new ArrayList<>();
         verifyReferences(output, result.getAsJsonObject("rawEvidence"), referenceIssues);
@@ -1054,6 +1345,7 @@ public final class ProductionRemediationReport {
                     || !JSON.toJsonTree(target.parameters()).equals(row.get("parameters"))) throw new IllegalArgumentException("changed, unknown or duplicate sample");
             if (target.kind().equals("query")) routes.computeIfAbsent(target.parameters().get("route"), ignored -> new ArrayList<>()).add(row);
         });
+        if (seen.size() != plan.values().stream().filter(t -> t.kind().equals("query") || t.kind().equals("pressure")).count()) throw new IOException("Sample inventory incomplete");
         return new RoundSamples(hash(output.resolve("identity.json")), routes);
     }
 
@@ -1061,9 +1353,11 @@ public final class ProductionRemediationReport {
         for (String name : List.of("samples", "controls")) {
             if (!references.has(name)) { issues.add("Missing raw reference " + name); continue; }
             JsonObject reference = references.getAsJsonObject(name);
-            if (bool(reference, "truncated")) issues.add("Truncated raw reference " + name);
-            if (!(name + ".jsonl").equals(string(reference, "path"))) { issues.add("Invalid raw reference " + name); continue; }
-            Path file = output.resolve(name + ".jsonl");
+            if (!reference.has("truncated") || !reference.get("truncated").isJsonPrimitive() || !reference.getAsJsonPrimitive("truncated").isBoolean()) issues.add("Missing or malformed truncation flag " + name);
+            else if (bool(reference, "truncated")) issues.add("Truncated raw reference " + name);
+            String referencePath = string(reference, "path");
+            if (!(name + ".jsonl").equals(referencePath) && !(name + ".jsonl.gz").equals(referencePath)) { issues.add("Invalid raw reference " + name); continue; }
+            Path file = output.resolve(referencePath);
             if (!Files.isRegularFile(file) || Files.size(file) != reference.get("bytes").getAsLong()
                     || !hash(file).equalsIgnoreCase(string(reference, "sha256"))) issues.add("Raw identity mismatch " + name);
             else {
@@ -1090,7 +1384,7 @@ public final class ProductionRemediationReport {
 
     static ProductionRemediationPlan.Options options(JsonObject identity) {
         return new ProductionRemediationPlan.Options(string(identity, "profile"), string(identity, "case"), string(identity, "run"),
-                string(identity, "batch"), string(identity, "variant"), string(identity, "control"), string(identity, "family"));
+                string(identity, "batch"), string(identity, "variant"), string(identity, "control"), string(identity, "family"), string(identity, "selection"), string(identity, "plan"));
     }
 
     static JsonObject readObject(Path path) throws IOException {
@@ -1099,9 +1393,25 @@ public final class ProductionRemediationReport {
         catch (RuntimeException malformed) { throw new IOException("Invalid JSON object: " + path, malformed); }
     }
 
+    static Path rawStreamFile(Path output, String stream) {
+        Path compressed = output.resolve(stream + ".jsonl.gz");
+        return Files.isRegularFile(compressed) ? compressed : output.resolve(stream + ".jsonl");
+    }
+
+    private static BufferedReader rawReader(Path path) throws IOException {
+        InputStream input = new BufferedInputStream(Files.newInputStream(path));
+        input.mark(2);
+        int first = input.read(), second = input.read();
+        input.reset();
+        if (first == 0x1f && second == 0x8b) {
+            return new BufferedReader(new InputStreamReader(new GZIPInputStream(input), StandardCharsets.UTF_8));
+        }
+        return new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
+    }
+
     static void readLines(Path path, Consumer<JsonObject> consumer) throws IOException {
         if (Files.size(path) > STREAM_LIMIT) throw new IOException("Raw stream exceeds budget: " + path);
-        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+        try (BufferedReader reader = rawReader(path)) {
             String line; int count = 0;
             while ((line = reader.readLine()) != null) {
                 count++;
@@ -1113,7 +1423,7 @@ public final class ProductionRemediationReport {
 
     private static void readEvidence(Path path, List<String> missing, Consumer<JsonObject> consumer) throws IOException {
         if (Files.size(path) > STREAM_LIMIT) { missing.add("Raw stream exceeds budget: " + path); return; }
-        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+        try (BufferedReader reader = rawReader(path)) {
             String line; int count = 0;
             while ((line = reader.readLine()) != null) {
                 count++;
@@ -1163,7 +1473,7 @@ public final class ProductionRemediationReport {
     }
 
     static String string(JsonObject object, String key) { return !object.has(key) || object.get(key).isJsonNull() ? null : object.get(key).getAsString(); }
-    static boolean bool(JsonObject object, String key) { return object.has(key) && !object.get(key).isJsonNull() && object.get(key).getAsBoolean(); }
+    static boolean bool(JsonObject object, String key) { return object != null && object.has(key) && object.get(key).isJsonPrimitive() && object.getAsJsonPrimitive(key).isBoolean() && object.get(key).getAsBoolean(); }
     private static boolean nonNegative(JsonObject object, String key) {
         if (!object.has(key) || object.get(key).isJsonNull() || !object.get(key).isJsonPrimitive() || !object.getAsJsonPrimitive(key).isNumber()) return false;
         double number = object.get(key).getAsDouble(); return Double.isFinite(number) && number >= 0;

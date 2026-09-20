@@ -17,7 +17,7 @@ public final class BaseClusterTopology {
     public static final int SIDE = 16;
     public static final int CELL_COUNT = SIDE * SIDE * SIDE;
     static final int PACKED_FACT_BYTES = CELL_COUNT / 2;
-    static final int FACTS_ALGORITHM_VERSION = 4;
+    static final int FACTS_ALGORITHM_VERSION = 5;
     public static final int VOLUME_OPEN = 1;
     public static final int GROUND_OPEN = 1 << 1;
     public static final int FLUID = 1 << 2;

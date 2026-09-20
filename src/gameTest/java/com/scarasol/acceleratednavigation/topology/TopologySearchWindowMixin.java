@@ -1,4 +1,6 @@
-package com.scarasol.acceleratednavigation.topology;
+package com.scarasol.acceleratednavigation.gametest.mixin;
+
+import com.scarasol.acceleratednavigation.topology.*;
 
 import com.scarasol.acceleratednavigation.api.ResumableSearch;
 import org.spongepowered.asm.mixin.Mixin;

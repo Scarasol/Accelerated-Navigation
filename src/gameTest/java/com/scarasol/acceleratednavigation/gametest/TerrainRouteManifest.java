@@ -1183,6 +1183,16 @@ final class TerrainRouteManifest {
             Bounds bounds = new Bounds(r.minX, r.maxX, r.minY, r.maxY, r.minZ, r.maxZ);
             DiscoveryBudget budget = new DiscoveryBudget(bounds, Long.MAX_VALUE, Long.MAX_VALUE);
             budget.beginStep(Long.MAX_VALUE);
+            boolean validStart = walkable(level, route.start.toBlockPos(), budget);
+            boolean validGoal = walkable(level, route.goal.toBlockPos(), budget);
+            result.put("currentStartWalkable", validStart);
+            result.put("currentGoalWalkable", validGoal);
+            if (!validStart || !validGoal) {
+                result.put("referenceStatus", validStart ? "INVALID_GOAL" : "INVALID_START");
+                result.put("referenceNodes", 0); result.put("referenceLength", 0);
+                result.put("referenceNanos", System.nanoTime() - began);
+                return new DiagnosticReference(List.of(), Map.copyOf(result));
+            }
             SearchState search = new SearchState(route.start.toBlockPos(), bounds,
                     new int[]{route.requestedDistance}, route.requestedDistance, level, budget);
             BlockPos goal = route.goal.toBlockPos();

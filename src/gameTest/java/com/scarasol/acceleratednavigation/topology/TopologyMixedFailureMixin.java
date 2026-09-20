@@ -1,8 +1,11 @@
-package com.scarasol.acceleratednavigation.topology;
+package com.scarasol.acceleratednavigation.gametest.mixin;
+
+import com.scarasol.acceleratednavigation.topology.*;
 
 import java.util.List;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Coerce;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -19,7 +22,7 @@ abstract class TopologyMixedFailureMixin {
     }
 
     @Redirect(method = "applyResolvedDependencies", at = @At(value = "INVOKE", target = "Lcom/scarasol/acceleratednavigation/topology/MacroSearch;dependencyUnavailable(Lcom/scarasol/acceleratednavigation/topology/MacroSearch$DependencyKey;Lcom/scarasol/acceleratednavigation/topology/MacroSearch$Unavailability;)V"))
-    private void unavailable(MacroSearch search, MacroSearch.DependencyKey key, MacroSearch.Unavailability reason) {
+    private void unavailable(MacroSearch search, MacroSearch.DependencyKey key, @Coerce Object reason) {
         TopologyMixedFailureScenario.unavailable(search, key, reason);
     }
 

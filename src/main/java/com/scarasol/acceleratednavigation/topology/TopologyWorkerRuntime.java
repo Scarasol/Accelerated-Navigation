@@ -453,15 +453,16 @@ final class TopologyWorkerRuntime {
             ClusterEntry entry = clusters.computeIfAbsent(event.key(), ClusterEntry::new);
             LatestFacts latest = entry.latest.get();
             if (latest.loadIdentity() == event.loadIdentity()
-                    && latest.state() == FactState.PERSISTENCE_UNAVAILABLE
+                    && (latest.state() == FactState.PERSISTENCE_UNAVAILABLE
+                        || latest.state() == FactState.RECOVERY_FAILED)
                     && event.state() != FactState.UNLOADED) {
                 event = new SectionEvent(event.key(), event.loadIdentity(), event.previousVersion(),
-                        event.version(), FactState.PERSISTENCE_UNAVAILABLE, null, Map.of());
+                        event.version(), latest.state(), null, Map.of());
             }
             if (latest.loadIdentity() > event.loadIdentity()
                     || latest.loadIdentity() == event.loadIdentity()
                     && (latest.revision() > event.version()
-                    || terminalStateRejects(latest.state(), event.state()))) {
+                    || latest.state() == FactState.UNLOADED && event.state() != FactState.UNLOADED)) {
                 return;
             }
             SectionEvent queued = pendingSectionEvents.get(event.key());
@@ -487,12 +488,6 @@ final class TopologyWorkerRuntime {
             if (schedule) eventTaskOutstanding = true;
         }
         if (schedule) scheduleEventTask();
-    }
-
-    private static boolean terminalStateRejects(FactState current, FactState next) {
-        if (current == FactState.UNLOADED) return next != FactState.UNLOADED;
-        return current == FactState.RECOVERY_FAILED
-                && next != FactState.RECOVERY_FAILED && next != FactState.UNLOADED;
     }
 
     private static boolean sameSectionEvent(@Nullable SectionEvent first,
@@ -561,7 +556,7 @@ final class TopologyWorkerRuntime {
                                                   SectionEvent next) {
         if (previous == null || next.loadIdentity() > previous.loadIdentity()) return next;
         if (next.loadIdentity() < previous.loadIdentity()
-                || terminalStateRejects(previous.state(), next.state())) return previous;
+                || previous.state() == FactState.UNLOADED && next.state() != FactState.UNLOADED) return previous;
         if (next.state() == FactState.UNLOADED
                 || next.state() == FactState.RECOVERY_FAILED) return next;
         if (next.version() < previous.version()) return previous;
@@ -831,9 +826,12 @@ final class TopologyWorkerRuntime {
             setFactTail(entry, null);
             entry.baselineFailed = false;
         }
-        if (event.state() == FactState.PERSISTENCE_UNAVAILABLE) {
-            entry.persistenceUnavailableVersion = event.version();
-            entry.baselineFailed = false;
+        if (event.state() == FactState.PERSISTENCE_UNAVAILABLE
+                || event.state() == FactState.RECOVERY_FAILED) {
+            if (event.state() == FactState.PERSISTENCE_UNAVAILABLE) {
+                entry.persistenceUnavailableVersion = event.version();
+                entry.baselineFailed = false;
+            }
             entry.writeRequired = false;
             setFactTail(entry, null);
         }
@@ -5726,6 +5724,12 @@ final class TopologyWorkerRuntime {
             if (!recoveryPreparationPending) {
                 return;
             }
+            // The previous worker has returned; finish its dependency ownership
+            // before creating the next segment's graph or requests.
+            clearRequests();
+            buildFailure = null;
+            parentFallbackPending = false;
+
             MacroSearch.Endpoint from = pendingRecoveryFrom;
             SectionPos origin = pendingRecoveryOrigin;
             int aggregate = pendingRecoveryAggregate;

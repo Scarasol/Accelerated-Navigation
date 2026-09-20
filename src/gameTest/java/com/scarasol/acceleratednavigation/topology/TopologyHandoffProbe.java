@@ -50,7 +50,8 @@ public final class TopologyHandoffProbe implements AutoCloseable {
 
     public synchronized void observeRuntime(Object service) { runtime = readField(service, "runtime"); }
 
-    static boolean pause(String point, TopologyWorkerRuntime.FactDecision decision, Runnable resume, Object facts) {
+    public static boolean pause(String point, Object operation, Runnable resume, Object facts) {
+        var decision = (TopologyWorkerRuntime.FactDecision) operation;
         TopologyHandoffProbe probe = active;
         if (probe == null) return false;
         synchronized (probe) {
@@ -87,7 +88,8 @@ public final class TopologyHandoffProbe implements AutoCloseable {
         events.add(Map.copyOf(row));
     }
 
-    static Runnable queued(Object service, Runnable action, TopologyWorkerRuntime.FactDecision decision) {
+    public static Runnable queued(Object service, Runnable action, Object operation) {
+        var decision = (TopologyWorkerRuntime.FactDecision) operation;
         TopologyHandoffProbe probe = active;
         if (probe != null) synchronized (probe) {
             if (probe.matches(decision) && decision.version() == probe.version && "B2".equals(probe.barrier)) {
@@ -97,7 +99,7 @@ public final class TopologyHandoffProbe implements AutoCloseable {
         return action;
     }
 
-    static boolean beforeDrain(Object service) {
+    public static boolean beforeDrain(Object service) {
         TopologyHandoffProbe probe = active;
         if (probe == null) return false;
         synchronized (probe) {
@@ -108,15 +110,16 @@ public final class TopologyHandoffProbe implements AutoCloseable {
         }
     }
 
-    static BiConsumer<Object, Throwable> formation(TopologyWorkerRuntime.FactDecision decision, BiConsumer<Object, Throwable> callback) {
+    public static BiConsumer<Object, Throwable> formation(Object operation, BiConsumer<Object, Throwable> callback) {
         return (result, failure) -> {
             Runnable deliver = () -> callback.accept(result, failure);
             if (!(result instanceof TopologyStore.Formation formed) || formed.facts() == null
-                    || !pause("B5", decision, deliver, formed.facts())) deliver.run();
+                    || !pause("B5", operation, deliver, formed.facts())) deliver.run();
         };
     }
 
-    static void accepted(TopologyStore.WriteReceipt receipt) {
+    public static void accepted(Object value) {
+        var receipt = (TopologyStore.WriteReceipt) value;
         var probe = active;
         if (probe == null) return;
         var decision = (TopologyWorkerRuntime.FactDecision) readField(receipt, "decision");
@@ -132,7 +135,8 @@ public final class TopologyHandoffProbe implements AutoCloseable {
         });
     }
 
-    static boolean completion(Object service, TopologyWorkerRuntime.FactDecision decision, boolean formed, boolean written) {
+    public static boolean completion(Object service, Object operation, boolean formed, boolean written) {
+        var decision = (TopologyWorkerRuntime.FactDecision) operation;
         Runnable resume = () -> invoke(service, "completePersistence", decision, formed, written);
         TopologyHandoffProbe probe = active;
         if (probe != null) synchronized (probe) {
@@ -147,7 +151,14 @@ public final class TopologyHandoffProbe implements AutoCloseable {
         return pause("B7", decision, resume, decision.facts());
     }
 
-    static void resumeFormation(Object store, Object receipt) {
+    public static boolean beforeWrite(Object store, Object value) {
+        var receipt = (TopologyStore.WriteReceipt) value;
+        var formed = receipt.formed.getNow(null);
+        return formed != null && formed.facts() != null && pause("B6", readField(receipt, "decision"),
+                () -> invoke(store, "continueWrite", receipt), formed.facts());
+    }
+
+    public static void resumeFormation(Object store, Object receipt) {
         synchronized (readField(store, "monitor")) {
             @SuppressWarnings("unchecked") ArrayDeque<Object> queue = (ArrayDeque<Object>) readField(store, "foreground");
             invoke(store, "enqueueLocked", queue, (Runnable) () -> invoke(store, "formDelta", receipt));

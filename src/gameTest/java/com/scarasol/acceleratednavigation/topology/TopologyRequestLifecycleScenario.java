@@ -23,6 +23,7 @@ public final class TopologyRequestLifecycleScenario implements AutoCloseable {
     private static final BlockPos START = new BlockPos(2052, 289, 2052), GOAL = new BlockPos(2060, 289, 2060);
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final ProductionRemediationPlan.Target target;
     private final boolean mutated;
     private final List<TopologyService.MacroRequest> requests = new ArrayList<>();
@@ -33,7 +34,7 @@ public final class TopologyRequestLifecycleScenario implements AutoCloseable {
     private int stage, writtenTick, profileIndex, cycle;
 
     public TopologyRequestLifecycleScenario(TopologyService service, ServerLevel level, ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; this.target = target; mutated = "mutated".equals(control);
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); this.target = target; mutated = "mutated".equals(control);
         for (int value = 0; value < 16; value++) profiles.add(new BaseClusterTopology.TraversalProfile(
                 (value & 1) == 0 ? .6F : 1.4F, (value & 2) == 0 ? .9F : 1.95F,
                 (value & 4) == 0 ? 0 : 1, 0, (value & 8) == 0 ? 0 : 4, false));
@@ -43,7 +44,8 @@ public final class TopologyRequestLifecycleScenario implements AutoCloseable {
     public ChunkPos chunkPosition() { return CHUNK; }
     public Map<String, Object> tick() {
         if (stage == 0) {
-            chunk = level.getChunk(CHUNK.x, CHUNK.z); TopologyService.onChunkLoaded(level, chunk);
+            tickets.hold(Set.of(chunkPosition().toLong()));
+            chunk = level.getChunk(CHUNK.x, CHUNK.z); tickets.loaded(chunk);
             for (int x = 0; x < 16; x++) for (int z = 0; z < 16; z++) for (int y = 287; y <= 292; y++) {
                 chunk.setBlockState(new BlockPos(2048 + x, y, 2048 + z), y == 288 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(), false);
             }
@@ -164,8 +166,16 @@ public final class TopologyRequestLifecycleScenario implements AutoCloseable {
     }
     private void forget() { for (var query : requests) TopologyValidationAccess.forgetRequest(query); requests.clear(); }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
+    public Map<String, Object> observation() {
+        var result = new LinkedHashMap<String, Object>(evidence);
+        result.put("stage", stage); result.put("tickets", tickets.held());
+        result.put("requests", requests.stream().map(TopologyValidationAccess::requestState).toList());
+        return result;
+    }
     @Override public void close() {
-        for (var query : requests) query.cancel(); forget();
-        if (chunk != null) { TopologyService.onChunkUnloaded(level, chunk); chunk = null; }
+        try {
+            for (var query : requests) query.cancel(); forget();
+            if (chunk != null) { tickets.unload(chunk); chunk = null; }
+        } finally { tickets.close(); }
     }
 }

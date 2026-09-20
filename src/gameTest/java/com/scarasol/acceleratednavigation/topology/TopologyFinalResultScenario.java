@@ -24,6 +24,7 @@ public final class TopologyFinalResultScenario implements AutoCloseable {
     private static final BlockPos CHANGED = new BlockPos(1813, 292, 1799);
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final String terminal;
     private final boolean mutated;
     private final List<LevelChunk> chunks = new ArrayList<>();
@@ -41,7 +42,7 @@ public final class TopologyFinalResultScenario implements AutoCloseable {
                             MacroSearch.Progress progress, long attempt, int retries) { }
 
     public TopologyFinalResultScenario(TopologyService service, ServerLevel level, ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; terminal = target.parameters().get("terminal"); mutated = "mutated".equals(control);
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); terminal = target.parameters().get("terminal"); mutated = "mutated".equals(control);
     }
     public Set<Long> chunkPositions() { return Set.of(ChunkPos.asLong(112, 112), ChunkPos.asLong(113, 112), ChunkPos.asLong(114, 112)); }
     public CompletableFuture<Void> pendingDiskEdit() { return diskEdit; }
@@ -66,8 +67,9 @@ public final class TopologyFinalResultScenario implements AutoCloseable {
 
     public Map<String, Object> tick() {
         if (stage == 0) {
+            tickets.hold(chunkPositions());
             for (int x = 112; x <= 114; x++) {
-                LevelChunk chunk = level.getChunk(x, 112); chunks.add(chunk); TopologyService.onChunkLoaded(level, chunk);
+                LevelChunk chunk = level.getChunk(x, 112); chunks.add(chunk); tickets.loaded(chunk);
                 for (int localX = 0; localX < 16; localX++) for (int z = 1792; z <= 1799; z++) for (int y = 287; y <= 294; y++) {
                     BlockPos pos = new BlockPos(x * 16 + localX, y, z);
                     chunk.setBlockState(pos, y == 288 && z == 1793 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(), false);
@@ -77,7 +79,7 @@ public final class TopologyFinalResultScenario implements AutoCloseable {
         }
         if (stage == 1) {
             if (tickCount() <= changedTick || !settled()) return null;
-            for (LevelChunk chunk : chunks) { TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk); }
+            for (LevelChunk chunk : chunks) { tickets.unload(chunk); tickets.loaded(chunk); }
             stage = 2; return null;
         }
         if (stage == 2) {
@@ -199,11 +201,22 @@ public final class TopologyFinalResultScenario implements AutoCloseable {
         return true;
     }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
+    public Map<String, Object> observation() {
+        var result = new LinkedHashMap<String, Object>(evidence);
+        result.put("stage", stage); result.put("tickets", tickets.held());
+        result.put("requests", TopologyValidationAccess.requestState(query));
+        if (resultProbe != null) result.put("validationMessages", resultProbe.evidence());
+        if (fault != null) result.put("fault", fault.snapshot());
+        result.put("terminalBeforeLate", beforeLate == null ? null : beforeLate.toString());
+        return result;
+    }
     @Override public void close() {
-        if (fault != null) { fault.close(); fault = null; }
-        if (failureProbe != null) { failureProbe.close(); failureProbe = null; }
-        if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); query = null; }
-        if (resultProbe != null) { resultProbe.close(); resultProbe = null; }
-        for (LevelChunk chunk : chunks) TopologyService.onChunkUnloaded(level, chunk);
+        try {
+            if (fault != null) { fault.close(); fault = null; }
+            if (failureProbe != null) { failureProbe.close(); failureProbe = null; }
+            if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); query = null; }
+            if (resultProbe != null) { resultProbe.close(); resultProbe = null; }
+            for (LevelChunk chunk : chunks) tickets.unload(chunk);
+        } finally { tickets.close(); }
     }
 }

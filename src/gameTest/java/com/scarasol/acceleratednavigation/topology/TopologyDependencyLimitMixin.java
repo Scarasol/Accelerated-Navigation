@@ -1,4 +1,6 @@
-package com.scarasol.acceleratednavigation.topology;
+package com.scarasol.acceleratednavigation.gametest.mixin;
+
+import com.scarasol.acceleratednavigation.topology.*;
 
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;

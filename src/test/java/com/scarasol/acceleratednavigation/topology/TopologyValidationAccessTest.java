@@ -73,6 +73,32 @@ class TopologyValidationAccessTest {
         finally { TopologyValidationAccess.endCapture(capture); }
     }
 
+    @Test void preparationReplacesPinnedFactsAfterProductionPublishesANewVersion() throws Exception {
+        try (Owner owner = new Owner(); var lease = TopologyValidationAccess.factsLease(owner)) {
+            SectionPos section = SectionPos.of(0, 0, 0);
+            var key = new TopologyWorkerRuntime.ClusterKey(Level.OVERWORLD, section);
+            for (int version = 1; version <= 2; version++) {
+                byte[] cells = new byte[4096]; cells[0] = (byte) version;
+                var facts = BaseClusterTopology.PackedFacts.fromCells(cells);
+                owner.runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(key, 1, version, version,
+                        TopologyWorkerRuntime.FactState.AVAILABLE, facts, Map.of()));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                boolean published;
+                do {
+                    published = TopologyValidationAccess.snapshot(owner, Level.OVERWORLD).objects().values().stream()
+                            .anyMatch(stamp -> stamp.token() == TopologyValidationAccess.token(facts));
+                    if (!published) Thread.sleep(1);
+                } while (!published && System.nanoTime() < deadline);
+                assertTrue(published);
+                assertTrue(TopologyValidationAccess.prepareFacts(owner, Level.OVERWORLD, lease, Set.of(section)).isEmpty());
+                assertEquals(1, lease.sections()); assertEquals(facts.retainedBytes(), lease.bytes());
+                assertEquals(1, owner.runtime.metrics().activeReferences());
+            }
+            lease.close(); lease.close();
+            assertEquals(0, owner.runtime.metrics().activeReferences());
+        }
+    }
+
     @Test void cleanupRequiresTheTargetReceiptAndPinsToSettleButIgnoresAnotherChunk() throws Exception {
         var decisions = new LinkedBlockingQueue<TopologyWorkerRuntime.FactDecision>();
         try (Owner owner = new Owner(new TopologyStore(temporary), decisions)) {
@@ -108,6 +134,65 @@ class TopologyValidationAccessTest {
             assertEquals(false, TopologyValidationAccess.chunkSettlement(owner, Level.OVERWORLD,
                     Set.of(unrelated.section().chunk().toLong())).get("settled"));
         }
+    }
+
+    @Test void completedCallMustReturnBeforeArchivalEvenWhenItsCallbackRunsInline() throws Exception {
+        var clock = new TopologyValidationAccess.Completion();
+        var future = new java.util.concurrent.CompletableFuture<String>();
+        var observed = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+        future.whenComplete((value, error) -> {
+            clock.observe(System.nanoTime(), 7); observed.countDown();
+            try { if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("callback release timeout"); }
+            catch (InterruptedException e) { throw new AssertionError(e); }
+        });
+        long start = System.nanoTime();
+        Thread winner = new Thread(() -> clock.invoke(() -> future.complete("result"), () -> 7, "complete"));
+        winner.start();
+        try {
+            assertTrue(observed.await(5, TimeUnit.SECONDS)); assertTrue(future.isDone()); assertFalse(clock.ready());
+            assertThrows(IllegalStateException.class, () -> clock.evidence(start, 7));
+            assertFalse(clock.invoke(() -> future.completeExceptionally(new IllegalStateException()), () -> 7, "exception"));
+        } finally { release.countDown(); winner.join(5000); }
+        assertFalse(winner.isAlive()); assertTrue(clock.ready());
+        var proof = clock.evidence(start, 7); assertEquals("complete", proof.get("writer"));
+        assertTrue((long) proof.get("upperNanos") >= (long) proof.get("lowerNanos"));
+        assertEquals((long) proof.get("callbackNanos") - start, proof.get("upperNanos"));
+    }
+
+    @Test void synchronousExceptionAndRepeatedCancellationKeepTheirOwnEvidence() {
+        for (boolean exceptional : new boolean[]{false, true}) {
+            var clock = new TopologyValidationAccess.Completion(); var future = new java.util.concurrent.CompletableFuture<String>();
+            long start = System.nanoTime();
+            assertTrue(clock.invoke(() -> exceptional ? future.completeExceptionally(new IllegalStateException("expected")) : future.complete("ok"), () -> 2, exceptional ? "exception" : "complete"));
+            var proof = clock.evidence(start, 2); assertEquals("BOUNDED", proof.get("status"));
+            assertEquals((long) proof.get("callAfterNanos") - start, proof.get("upperNanos"));
+        }
+        var clock = new TopologyValidationAccess.Completion(); var cancelled = new java.util.concurrent.CompletableFuture<String>();
+        long start = System.nanoTime();
+        assertTrue(clock.invoke(() -> cancelled.cancel(false), () -> 1, "cancel"));
+        assertTrue(clock.invoke(() -> cancelled.cancel(false), () -> 1, "cancel"));
+        assertFalse(clock.invoke(() -> cancelled.complete("late"), () -> 1, "complete"));
+        assertEquals("UNPROVEN", clock.evidence(start, 1).get("status"));
+    }
+
+    @Test void completionMeasurementFailureReleasesArchivalAndDoesNotInventABoundary() {
+        for (int failureCall : new int[]{1, 2}) {
+            var clock = new TopologyValidationAccess.Completion();
+            var calls = new java.util.concurrent.atomic.AtomicInteger();
+            assertThrows(IllegalStateException.class, () -> clock.invoke(() -> true, () -> {
+                if (calls.incrementAndGet() == failureCall) throw new IllegalStateException("clock unavailable");
+                return 1;
+            }, "complete"));
+            assertTrue(clock.ready());
+            assertEquals("UNPROVEN", clock.evidence(0, 0).get("status"));
+        }
+    }
+
+    @Test void preparationComparesVersionsAndAllowsUnlistedButReadyDependencies() {
+        var a = new TopologyValidationAccess.Stamp(1, 2, 3, 4); var b = new TopologyValidationAccess.Stamp(1, 2, 4, 4);
+        var ready = new TopologyValidationAccess.Snapshot(Map.of("base/a", a, "base/extra", b), java.util.List.of(), true, true, 0);
+        assertTrue(TopologyValidationAccess.validateExpected(ready, Map.of("base/a", a)).isEmpty());
+        assertFalse(TopologyValidationAccess.validateExpected(ready, Map.of("base/a", b)).isEmpty());
     }
 
     private static final class Owner implements AutoCloseable {

@@ -29,6 +29,90 @@ public final class TopologyValidationAccess {
 
     private TopologyValidationAccess() { }
 
+    /** The innermost fixture owns tickets, including temporary release for deliberate unloads. */
+    public static final class ScenarioTickets implements AutoCloseable {
+        private final net.minecraft.server.level.ServerLevel level;
+        private final Set<Long> held = new java.util.LinkedHashSet<>();
+        public ScenarioTickets(net.minecraft.server.level.ServerLevel level) { this.level = level; }
+        public void hold(Set<Long> positions) {
+            for (long value : positions) if (!held.contains(value)) {
+                ChunkPos pos = new ChunkPos(value);
+                level.getChunkSource().addRegionTicket(net.minecraft.server.level.TicketType.FORCED, pos, 0, pos); held.add(value);
+            }
+        }
+        private void release(ChunkPos pos) {
+            if (held.contains(pos.toLong())) {
+                level.getChunkSource().removeRegionTicket(net.minecraft.server.level.TicketType.FORCED, pos, 0, pos); held.remove(pos.toLong());
+            }
+        }
+        public void unload(net.minecraft.world.level.chunk.LevelChunk chunk) { release(chunk.getPos()); TopologyService.onChunkUnloaded(level, chunk); }
+        public void loaded(net.minecraft.world.level.chunk.LevelChunk chunk) { hold(Set.of(chunk.getPos().toLong())); TopologyService.onChunkLoaded(level, chunk); }
+        public Set<Long> held() { return Set.copyOf(held); }
+        @Override public void close() { for (long pos : Set.copyOf(held)) release(new ChunkPos(pos)); }
+    }
+
+    public static Map<String, Object> requestState(TopologyService.MacroRequest request) {
+        if (request == null) return Map.of("submitted", false);
+        var result = new LinkedHashMap<String, Object>(requestIdentity(request));
+        result.put("submitted", true); result.put("done", request.future().isDone()); result.put("cancelled", request.future().isCancelled());
+        result.put("progress", request.progress()); result.put("requestToken", token(request));
+        if (request.future().isDone()) {
+            try { result.put("corridorPresent", request.future().join() != null); }
+            catch (RuntimeException failure) { result.put("exception", failure.toString()); }
+        }
+        return result;
+    }
+
+    public interface CompletionAccess { Completion completion(); }
+
+    /** One request, no global future interception. Publish only after the winning call returns. */
+    public static final class Completion {
+        private int active;
+        private long lower, upper, observed;
+        private int lowerTick, upperTick, observedTick;
+        private String writer;
+        public boolean invoke(java.util.function.BooleanSupplier action, java.util.function.IntSupplier tick, String kind) {
+            synchronized (this) { active++; }
+            int leftTick = 0, rightTick = 0; long left = 0, right = 0;
+            boolean won = false, measured = false;
+            try {
+                left = System.nanoTime();
+                leftTick = tick.getAsInt();
+                won = action.getAsBoolean();
+                right = System.nanoTime();
+                rightTick = tick.getAsInt(); measured = true;
+                return won;
+            } finally {
+                synchronized (this) {
+                    // cancel(true) includes repeat cancellation; it cannot identify the first write.
+                    if (won && measured && !kind.equals("cancel") && writer == null) {
+                        lower = left; upper = right; lowerTick = leftTick; upperTick = rightTick; writer = kind;
+                    }
+                    active--;
+                }
+            }
+        }
+        public synchronized void observe(long nanos, int tick) { if (observed == 0) { observed = nanos; observedTick = tick; } }
+        public synchronized boolean ready() { return active == 0; }
+        public synchronized Map<String, Object> evidence(long start, int startTick) {
+            if (active != 0) throw new IllegalStateException("Completion call has not returned");
+            var result = new LinkedHashMap<String, Object>();
+            result.put("status", writer == null ? "UNPROVEN" : "BOUNDED");
+            result.put("reason", writer == null ? "CANCEL_EXTERNAL_OR_UNOBSERVED_WRITER" : "WINNING_COMPLETION_RETURNED");
+            if (writer != null) {
+                long right = observed >= lower ? Math.min(upper, observed) : upper;
+                int tick = observed >= lower && observed <= upper ? Math.min(upperTick, observedTick) : upperTick;
+                result.put("writer", writer); result.put("callBeforeNanos", lower); result.put("callAfterNanos", upper);
+                result.put("callbackNanos", observed); result.put("lowerNanos", lower - start); result.put("upperNanos", right - start);
+                result.put("lowerTicks", lowerTick - startTick); result.put("upperTicks", tick - startTick);
+            }
+            return result;
+        }
+
+    }
+
+    public static Completion completion(Object request) { return request instanceof CompletionAccess access ? access.completion() : null; }
+
     public record Stamp(long token, long load, long version, long validity) { }
     public record Snapshot(Map<String, Stamp> objects, List<String> unavailableFacts,
                            boolean idle, boolean handoffsReleased, long topologyTick) { }
@@ -68,7 +152,8 @@ public final class TopologyValidationAccess {
         boolean idle = ((Collection<?>) readField(runtime, "macroRequests")).isEmpty()
                 && map(runtime, "resolveFlights").isEmpty() && map(runtime, "macroFlights").isEmpty()
                 && (int) readField(runtime, "buildDemands") == 0 && (int) readField(runtime, "dependencyConsumers") == 0
-                && (int) readField(runtime, "prewarmAdmitted") == 0 && !(boolean) readField(runtime, "eventBatchActive")
+                && (int) readField(runtime, "prewarmAdmitted") == 0 && (int) readField(runtime, "pendingExecutorSubmissions") == 0
+                && !(boolean) readField(runtime, "eventBatchActive")
                 && map(runtime, "pendingSectionEvents").isEmpty() && map(runtime, "processingSectionEvents").isEmpty()
                 && map(runtime, "pendingRequestEvents").isEmpty() && map(runtime, "processingRequestEvents").isEmpty()
                 && map(runtime, "pendingChunkUnloads").isEmpty() && map(runtime, "persistenceHolds").isEmpty();
@@ -145,7 +230,6 @@ public final class TopologyValidationAccess {
     public static final class FactsLease implements AutoCloseable {
         private final Object runtime;
         private final Map<Object, BaseClusterTopology.PackedFacts> pinned = new IdentityHashMap<>();
-        private final Set<TopologyWorkerRuntime.ClusterKey> keys = new HashSet<>();
         private boolean closed;
         private FactsLease(Object runtime) { this.runtime = runtime; }
         public long bytes() {
@@ -162,7 +246,7 @@ public final class TopologyValidationAccess {
                     invoke(runtime, "unpinFacts", entry.getKey(), entry.getValue());
                     invoke(runtime, "releaseUnusedFacts", entry.getKey());
                 }
-                pinned.clear(); keys.clear(); invoke(runtime, "evictBaseCache");
+                pinned.clear(); invoke(runtime, "evictBaseCache");
             }
         }
     }
@@ -176,6 +260,19 @@ public final class TopologyValidationAccess {
         List<Object> reads = new ArrayList<>();
         List<String> missing = new ArrayList<>();
         synchronized (readField(lease.runtime, "runtimeLock")) {
+            var held = lease.pinned.entrySet().iterator();
+            while (held.hasNext()) {
+                var pin = held.next();
+                Object entry = pin.getKey();
+                var key = (TopologyWorkerRuntime.ClusterKey) readField(entry, "key");
+                if (key.dimension().equals(dimension) && sections.contains(key.section())
+                        && map(lease.runtime, "clusters").get(key) == entry
+                        && Boolean.TRUE.equals(invoke(entry, "current"))
+                        && readField(entry, "facts") == pin.getValue()) continue;
+                invoke(lease.runtime, "unpinFacts", entry, pin.getValue());
+                invoke(lease.runtime, "releaseUnusedFacts", entry);
+                held.remove();
+            }
             for (SectionPos section : sections) {
                 var key = new TopologyWorkerRuntime.ClusterKey(dimension, section);
                 Object entry = map(lease.runtime, "clusters").get(key);
@@ -187,12 +284,12 @@ public final class TopologyValidationAccess {
                     if (loaded != null) reads.add(loaded);
                     continue;
                 }
-                if (lease.keys.add(key)) {
+                if (!lease.pinned.containsKey(entry)) {
                     BaseClusterTopology.PackedFacts facts = (BaseClusterTopology.PackedFacts) current;
                     invoke(lease.runtime, "removeIdleFact", entry);
                     invoke(lease.runtime, "pinFacts", entry, facts);
                     lease.pinned.put(entry, facts);
-                } else if (lease.pinned.get(entry) != current) missing.add("FACTS_CHANGED:" + key);
+                }
             }
         }
         for (Object loaded : reads) invoke(service, "readPersisted", loaded);
@@ -205,7 +302,7 @@ public final class TopologyValidationAccess {
             var section = (TopologyWorkerRuntime.ClusterKey) key;
             if (section.dimension().equals(dimension) && chunks.contains(section.section().chunk().toLong())) result.add(section.section());
         }
-        return Set.copyOf(result);
+        return java.util.Collections.unmodifiableSet(result);
     }
 
     public static final class Capture {
@@ -310,6 +407,7 @@ public final class TopologyValidationAccess {
     }
 
     public static void forgetRequest(Object serverRequest) {
+        TopologySegmentTrace.clear(serverRequest);
         Object worker = readField(serverRequest, "workerRequest");
         if (worker != null) REQUEST_SEARCHES.remove(token(worker));
     }

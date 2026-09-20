@@ -55,7 +55,7 @@ public final class TopologyHandoffFaultProbe implements AutoCloseable {
                 && key.section().chunk().equals(readField(chunkKey, "chunk"));
     }
 
-    static void read(Object owner, Object chunkKey) throws IOException {
+    public static void read(Object owner, Object chunkKey) throws IOException {
         TopologyHandoffFaultProbe probe = active;
         if (probe != null) synchronized (probe) {
             if (!probe.matches(owner, chunkKey)) return;
@@ -64,7 +64,7 @@ public final class TopologyHandoffFaultProbe implements AutoCloseable {
         }
     }
 
-    static void write(Object owner, Object chunkKey) throws IOException {
+    public static void write(Object owner, Object chunkKey) throws IOException {
         TopologyHandoffFaultProbe probe = active;
         if (probe != null) synchronized (probe) {
             if (!probe.matches(owner, chunkKey)) return;
@@ -73,7 +73,8 @@ public final class TopologyHandoffFaultProbe implements AutoCloseable {
         }
     }
 
-    static void formed(TopologyStore.WriteReceipt receipt) {
+    public static void formed(Object value) {
+        var receipt = (TopologyStore.WriteReceipt) value;
         TopologyHandoffFaultProbe probe = active;
         if (probe != null) synchronized (probe) {
             var decision = (TopologyWorkerRuntime.FactDecision) readField(receipt, "decision");
@@ -146,7 +147,7 @@ public final class TopologyHandoffFaultProbe implements AutoCloseable {
         return completion;
     }
 
-    static byte[] corruptRecord(byte[] original, int sectionY, String kind) throws IOException {
+    public static byte[] corruptRecord(byte[] original, int sectionY, String kind) throws IOException {
         if (kind.equals("truncated")) {
             if (original.length == 0) throw new IOException("empty record");
             return Arrays.copyOf(original, original.length - 1);

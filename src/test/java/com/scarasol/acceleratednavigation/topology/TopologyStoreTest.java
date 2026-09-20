@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.DataOutputStream;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
@@ -91,6 +92,39 @@ class TopologyStoreTest {
             writeFull(store, section, 1L, facts(1));
             assertEquals(TopologyStore.ReadStatus.FOUND,
                     store.read(Level.OVERWORLD, section).join().status());
+        }
+    }
+
+    @Test
+    void rejectsPreviousFactsAlgorithmAndPersistsReplacement() throws Exception {
+        SectionPos section = SectionPos.of(0, 0, 0);
+        var expected = facts(1);
+        try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
+            writeFull(store, section, 1, expected).get(5, TimeUnit.SECONDS);
+        }
+        Path dimensionDirectory = temporaryDirectory.resolve("minecraft").resolve("overworld");
+        try (RegionFile region = new RegionFile(dimensionDirectory.resolve("r.0.0.mca"),
+                dimensionDirectory, false)) {
+            byte[] record;
+            try (var input = region.getChunkDataInputStream(new ChunkPos(0, 0))) {
+                record = input.readAllBytes();
+            }
+            assertEquals(5, ByteBuffer.wrap(record).getInt(8));
+            ByteBuffer.wrap(record).putInt(8, 4);
+            try (var output = region.getChunkDataOutputStream(new ChunkPos(0, 0))) {
+                output.write(record);
+            }
+        }
+        try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
+            assertEquals(TopologyStore.ReadStatus.CORRUPT,
+                    store.read(Level.OVERWORLD, section).get(5, TimeUnit.SECONDS).status());
+            writeFull(store, section, 2, expected).get(5, TimeUnit.SECONDS);
+        }
+        try (TopologyStore store = new TopologyStore(temporaryDirectory)) {
+            var read = store.read(Level.OVERWORLD, section).get(5, TimeUnit.SECONDS);
+            assertEquals(TopologyStore.ReadStatus.FOUND, read.status());
+            assertEquals(2, read.record().version());
+            assertFacts(expected, read.record().facts());
         }
     }
 

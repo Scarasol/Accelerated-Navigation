@@ -515,6 +515,7 @@ public final class TopologyService {
             if (failure instanceof VirtualMachineError fatal) throw fatal;
             if (failure instanceof ThreadDeath fatal) throw fatal;
             section.recoveryFailed = true;
+            section.persistencePending = false;
             failedRecoveries++;
             runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                     section.key, section.chunk.identity, section.version, section.version,
@@ -535,10 +536,7 @@ public final class TopologyService {
 
     private RecoveryResult scanSection(LoadedSection section) {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
-        long[] fullCells = new long[BaseClusterTopology.CELL_COUNT / Long.SIZE];
         long[] collidingCells = new long[BaseClusterTopology.CELL_COUNT / Long.SIZE];
-        long[] failedCells = new long[BaseClusterTopology.CELL_COUNT / Long.SIZE];
-        BlockState[] states = new BlockState[BaseClusterTopology.CELL_COUNT];
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         SectionPos origin = section.key.section();
         int degraded = 0;
@@ -552,58 +550,15 @@ public final class TopologyService {
                     cursor.set(origin.minBlockX() + x, origin.minBlockY() + y,
                             origin.minBlockZ() + z);
                     BlockState state = section.chunk.chunk.getBlockState(cursor);
-                    states[cell] = state;
-                    if (state.getBlock().getClass() != LiquidBlock.class
-                            && !state.getBlock().hasDynamicShape()) {
-                        try {
-                            if (state.isCollisionShapeFullBlock(
-                                    EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) {
-                                setCollisionBit(fullCells, cell);
-                                setCollisionBit(collidingCells, cell);
-                            }
-                        } catch (RuntimeException failure) {
-                            setCollisionBit(failedCells, cell);
-                            degraded++;
-                            if (firstFailure == null) {
-                                firstFailure = failure;
-                                firstPosition = cursor.immutable();
-                                firstState = state.toString();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (int y = 0; y < BaseClusterTopology.SIDE; y++) {
-            for (int z = 0; z < BaseClusterTopology.SIDE; z++) {
-                for (int x = 0; x < BaseClusterTopology.SIDE; x++) {
-                    int cell = BaseClusterTopology.cellIndex(x, y, z);
-                    BlockState state = states[cell];
-                    int flags;
-                    boolean collides;
                     boolean fluid = !state.getFluidState().isEmpty();
-                    cursor.set(origin.minBlockX() + x, origin.minBlockY() + y,
-                            origin.minBlockZ() + z);
-                    if (collisionBit(failedCells, cell)) {
-                        flags = BaseClusterTopology.VOLUME_OPEN
-                                | BaseClusterTopology.GROUND_OPEN
-                                | BaseClusterTopology.EXACT_REQUIRED
-                                | (fluid ? BaseClusterTopology.FLUID : 0);
-                        collides = true;
-                    } else try {
-                        int classified = collisionBit(fullCells, cell)
-                                || !state.getBlock().hasDynamicShape()
-                                && enclosedByFullCells(x, y, z, fullCells)
-                                ? (fluid ? BaseClusterTopology.FLUID : 0) | COLLIDES
-                                : collisionClassification(state, true);
-                        flags = classified & FACT_MASK;
-                        collides = (classified & COLLIDES) != 0;
+                    int classified;
+                    try {
+                        classified = collisionClassification(state);
                     } catch (RuntimeException failure) {
-                        flags = BaseClusterTopology.VOLUME_OPEN
+                        classified = BaseClusterTopology.VOLUME_OPEN
                                 | BaseClusterTopology.GROUND_OPEN
-                                | BaseClusterTopology.EXACT_REQUIRED
+                                | BaseClusterTopology.EXACT_REQUIRED | COLLIDES
                                 | (fluid ? BaseClusterTopology.FLUID : 0);
-                        collides = true;
                         degraded++;
                         if (firstFailure == null) {
                             firstFailure = failure;
@@ -611,25 +566,14 @@ public final class TopologyService {
                             firstState = state.toString();
                         }
                     }
-                    if (y > 0 && collisionBit(collidingCells, cell - 256)
-                            && (flags & BaseClusterTopology.VOLUME_OPEN) != 0) {
-                        flags |= BaseClusterTopology.GROUND_OPEN;
-                    }
-                    cells[cell] = (byte) flags;
-                    if (collides) setCollisionBit(collidingCells, cell);
+                    cells[cell] = (byte) addSupport(classified,
+                            y > 0 && collisionBit(collidingCells, cell - 256));
+                    if ((classified & COLLIDES) != 0) setCollisionBit(collidingCells, cell);
                 }
             }
         }
         return new RecoveryResult(BaseClusterTopology.PackedFacts.fromCells(cells),
                 degraded, firstPosition, firstState, firstFailure);
-    }
-
-    private static boolean enclosedByFullCells(int x, int y, int z, long[] full) {
-        if (x == 0 || x == 15 || y == 0 || y == 15 || z == 0 || z == 15) return false;
-        int cell = BaseClusterTopology.cellIndex(x, y, z);
-        return collisionBit(full, cell - 1) && collisionBit(full, cell + 1)
-                && collisionBit(full, cell - 16) && collisionBit(full, cell + 16)
-                && collisionBit(full, cell - 256) && collisionBit(full, cell + 256);
     }
 
     private static void setCollisionBit(long[] bits, int cell) {
@@ -706,7 +650,7 @@ public final class TopologyService {
             section.implicitAllAirBase = false;
             section.readRequest++;
             section.readInFlight = false;
-            section.persistencePending = true;
+            section.persistencePending = !section.recoveryFailed;
             runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                     section.key, section.chunk.identity, original, targetVersion,
                     TopologyWorkerRuntime.FactState.AVAILABLE, null, changes));
@@ -1078,9 +1022,9 @@ public final class TopologyService {
         Objects.requireNonNull(getter, "getter");
         Objects.requireNonNull(position, "position");
         BlockState current = getter.getBlockState(position);
-        int currentCollision = collisionClassification(current, false);
+        int currentCollision = collisionClassification(current);
         int belowCollision = (position.getY() & 15) == 0 ? 0 : collisionClassification(
-                getter.getBlockState(position.below()), false);
+                getter.getBlockState(position.below()));
         int currentFlags = addSupport(
                 currentCollision, (belowCollision & COLLIDES) != 0);
         if (position.getY() + 1 >= getter.getMaxBuildHeight()) {
@@ -1088,7 +1032,7 @@ public final class TopologyService {
         }
         BlockPos abovePosition = position.above();
         int aboveCollision = collisionClassification(
-                getter.getBlockState(abovePosition), false);
+                getter.getBlockState(abovePosition));
         int aboveFlags = addSupport(aboveCollision,
                 (abovePosition.getY() & 15) != 0 && (currentCollision & COLLIDES) != 0);
         return (currentFlags & FACT_MASK)
@@ -1103,8 +1047,7 @@ public final class TopologyService {
         return flags;
     }
 
-    private static int collisionClassification(BlockState state,
-                                                boolean staticFullChecked) {
+    private static int collisionClassification(BlockState state) {
         boolean fluid = !state.getFluidState().isEmpty();
         int flags = fluid ? BaseClusterTopology.FLUID : 0;
         if (state.getBlock().getClass() == LiquidBlock.class) {
@@ -1115,7 +1058,7 @@ public final class TopologyService {
             return flags | BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
                     | BaseClusterTopology.EXACT_REQUIRED | COLLIDES;
         }
-        if (!staticFullChecked && state.isCollisionShapeFullBlock(
+        if (state.isCollisionShapeFullBlock(
                 EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) return flags | COLLIDES;
         VoxelShape shape = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         if (Block.isShapeFullBlock(shape)) return flags | COLLIDES;

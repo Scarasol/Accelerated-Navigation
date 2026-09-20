@@ -15,6 +15,15 @@ import net.minecraft.world.level.Level;
 /** Test-only bridge for package-private production owners. */
 public final class TopologyTestBridge {
 
+    private static final ClassValue<Map<String, Field>> FIELDS = new ClassValue<>() {
+        @Override protected Map<String, Field> computeValue(Class<?> type) {
+            return new java.util.concurrent.ConcurrentHashMap<>();
+        }
+    };
+    private static final ClassValue<Method[]> METHODS = new ClassValue<>() {
+        @Override protected Method[] computeValue(Class<?> type) { return type.getDeclaredMethods(); }
+    };
+
     private TopologyTestBridge() {
     }
 
@@ -214,9 +223,7 @@ public final class TopologyTestBridge {
 
     public static Object readField(Object target, String name) {
         try {
-            Field field = target.getClass().getDeclaredField(name);
-            field.setAccessible(true);
-            return field.get(target);
+            return field(target.getClass(), name).get(target);
         } catch (ReflectiveOperationException failure) {
             throw new IllegalStateException("test bridge could not read " + name, failure);
         }
@@ -224,9 +231,7 @@ public final class TopologyTestBridge {
 
     public static void writeField(Object target, String name, Object value) {
         try {
-            Field field = target.getClass().getDeclaredField(name);
-            field.setAccessible(true);
-            field.set(target, value);
+            field(target.getClass(), name).set(target, value);
         } catch (ReflectiveOperationException failure) {
             throw new IllegalStateException("test bridge could not write " + name, failure);
         }
@@ -234,7 +239,7 @@ public final class TopologyTestBridge {
 
     public static Object invoke(Object target, String name, Object... arguments) {
         Method selected = null;
-        for (Method method : target.getClass().getDeclaredMethods()) {
+        for (Method method : METHODS.get(target.getClass())) {
             if (!method.getName().equals(name) || method.getParameterCount() != arguments.length) continue;
             Class<?>[] types = method.getParameterTypes();
             boolean matches = true;
@@ -264,5 +269,17 @@ public final class TopologyTestBridge {
 
     private static void put(Map<String, Long> target, String key, long value) {
         target.put(key, value);
+    }
+
+    private static Field field(Class<?> type, String name) {
+        return FIELDS.get(type).computeIfAbsent(name, key -> {
+            try {
+                Field field = type.getDeclaredField(key);
+                field.setAccessible(true);
+                return field;
+            } catch (ReflectiveOperationException failure) {
+                throw new IllegalStateException("test bridge could not locate " + type.getName() + "." + key, failure);
+            }
+        });
     }
 }

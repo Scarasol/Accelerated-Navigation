@@ -6,6 +6,7 @@ import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import com.scarasol.acceleratednavigation.topology.BaseClusterTopology;
 import com.scarasol.acceleratednavigation.topology.MacroSearch;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
+import com.scarasol.acceleratednavigation.topology.TopologyValidationAccess;
 import com.scarasol.acceleratednavigation.topology.TopologyCausalityObservation;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
@@ -62,6 +63,8 @@ public final class RealTerrainTopologyBenchmark {
     private static final int PRESSURE_REQUESTS_PER_DIMENSION = 512;
     private static final long PRESSURE_TIMEOUT_NANOS = 120_000_000_000L;
     private static final long PRESSURE_SETTLE_TIMEOUT_NANOS = 30_000_000_000L;
+    static final com.scarasol.acceleratednavigation.topology.TopologySegmentTrace.TickTimeline tickTimeline =
+            new com.scarasol.acceleratednavigation.topology.TopologySegmentTrace.TickTimeline();
     private static ServerLifecycle controller;
 
     private RealTerrainTopologyBenchmark() {
@@ -79,6 +82,7 @@ public final class RealTerrainTopologyBenchmark {
             throw new IllegalStateException(
                     "production terrain benchmark requires terrainTestMode=benchmark");
         }
+        tickTimeline.clear();
         boolean independent = System.getProperty("acceleratedNavigation.validation.profile") != null
                 && !ProductionRemediationPlan.Options.configured().usesFrozenWorld();
         controller = independent ? new ProductionRemediationControls(event.getServer()) : new Controller(event.getServer());
@@ -89,6 +93,8 @@ public final class RealTerrainTopologyBenchmark {
         if (controller == null || event.phase != TickEvent.Phase.END) {
             return;
         }
+        if (com.scarasol.acceleratednavigation.topology.TopologySegmentTrace.ENABLED)
+            tickTimeline.record(System.nanoTime(), event.getServer().getTickCount());
         try {
             controller.tick();
         } catch (RuntimeException failure) {
@@ -134,6 +140,7 @@ public final class RealTerrainTopologyBenchmark {
 
     static void clearController() {
         controller = null;
+        tickTimeline.clear();
     }
 
     private static final class Controller implements ServerLifecycle {
@@ -259,9 +266,15 @@ public final class RealTerrainTopologyBenchmark {
                 ChunkLoad load = chunksToLoad.pollFirst();
                 if (load == null) {
                     routeManifest = loadAndValidateManifest();
-                    List<RouteSpec> plannedRoutes = routeSpecsFromManifest(routeManifest);
+                    List<RouteSpec> plannedRoutes = validation != null
+                            ? validation.routeNames().stream().map(name -> {
+                                var route = routeIndex(routeManifest).get(name);
+                                if (route == null) throw new IllegalStateException("Missing planned route " + name);
+                                return new RouteSpec(Terrain.valueOf(route.terrain.toUpperCase(java.util.Locale.ROOT)), route);
+                            }).toList()
+                            : routeSpecsFromManifest(routeManifest);
                     if (validation != null) plannedRoutes = plannedRoutes.stream().filter(route -> validation.selected(route.route().name)).toList();
-                    if (TopologyCausalityObservation.CAUSALITY) {
+                    if (TopologyCausalityObservation.CAUSALITY && validation == null) {
                         Set<String> selected = Set.of("surface_512_01", "surface_512_02",
                                 "surface_512_03", "surface_512_04", "nether_96_06",
                                 "surface_96_01", "cave_96_01", "nether_96_01");
@@ -419,6 +432,23 @@ public final class RealTerrainTopologyBenchmark {
 
         private void recordRunScope(TerrainRouteManifest.Manifest manifest,
                                     List<RouteSpec> plannedRoutes) {
+            if (validation != null) {
+                runScope.put("routeSource", "original frozen manifest endpoints; independent queries, not pressure replay");
+                runScope.put("plannedOrdinaryRoutes", plannedRoutes.size());
+                List<Object> inputs = new ArrayList<>();
+                for (RouteSpec spec : plannedRoutes) {
+                    String route = spec.route().name;
+                    Map<String, Integer> phases = new LinkedHashMap<>();
+                    for (int i = 0; i < validation.count(route); i++) phases.merge(validation.phase(route, i), 1, Integer::sum);
+                    inputs.add(Map.of("route", route, "phases", phases));
+                }
+                runScope.put("ordinaryInputs", inputs);
+                runScope.put("plannedOrdinarySamples", plannedRoutes.stream().mapToInt(route -> validation.count(route.route().name)).sum());
+                runScope.put("pressureStages", validation.pressureEnabled() ? ProductionRemediationPlan.STAGES : List.of());
+                int pressureCount = validation.pressureEnabled() ? PRESSURE_REQUESTS_PER_DIMENSION : 0;
+                runScope.put("plannedPressureRequestsPerStage", Map.of("minecraft:overworld", pressureCount, "minecraft:the_nether", pressureCount));
+                return;
+            }
             List<Map<String, Object>> usedSelections = new ArrayList<>();
             List<Map<String, Object>> unrunSelections = new ArrayList<>();
             for (TerrainRouteManifest.SelectionCoverage selection : manifest.selectionCoverage) {
@@ -497,14 +527,17 @@ public final class RealTerrainTopologyBenchmark {
                 }
             }
             formalControl.acceleratedNavigation$clearCompletedCorridors();
-            long startedNanos = System.nanoTime();
+            TopologyCausalityObservation.endpointWorld(topology, activeRoute.level,
+                    activeRoute.spec.route().name, currentSamplePhase(), activeRoute.sampleIndex,
+                    activeRoute.start, activeRoute.goal);
+            UUID owner = sampleOwner();
             long startedCpuNanos = processCpuNanos();
             int startedTick = server.getTickCount();
+            long startedNanos = System.nanoTime();
             try {
                 TopologyService.MacroRequest request = topology.requestMacroQuery(
                         activeRoute.level,
-                        UUID.nameUUIDFromBytes(("terrain-benchmark:" + activeRoute.spec.route().name
-                                + ":" + activeRoute.sampleIndex).getBytes(StandardCharsets.UTF_8)),
+                        owner,
                         activeRoute.start,
                         activeRoute.goal,
                         BaseClusterTopology.Channel.GROUND,
@@ -518,16 +551,13 @@ public final class RealTerrainTopologyBenchmark {
                         startedTick,
                         future.isDone());
                 activeSample = sample;
-                String diagnosticRoute = activeRoute.spec.route().name;
-                ServerLevel diagnosticLevel = activeRoute.level;
-                BlockPos diagnosticStart = activeRoute.start, diagnosticGoal = activeRoute.goal;
-                int diagnosticSample = activeRoute.sampleIndex;
                 future.whenComplete((corridor, failure) -> {
-                    TopologyCausalityObservation.logical(diagnosticRoute, "ordinary", diagnosticSample,
-                            diagnosticLevel, diagnosticStart, diagnosticGoal, request, corridor != null, failure);
+                    long observed = System.nanoTime(); int tick = server.getTickCount();
+                    var completion = TopologyValidationAccess.completion(request);
+                    if (completion != null) completion.observe(observed, tick);
                     SampleTerminal terminal = SampleTerminal.completed(
-                            System.nanoTime(), processCpuNanos(), corridor,
-                            unwrapCompletionFailure(failure)).withObservedTick(server.getTickCount());
+                            observed, processCpuNanos(), corridor,
+                            unwrapCompletionFailure(failure)).withObservedTick(tick);
                     server.execute(() -> deliverSampleTerminal(sample, terminal));
                 });
                 phase = Phase.WAIT_SAMPLE;
@@ -583,6 +613,10 @@ public final class RealTerrainTopologyBenchmark {
                 phase = Phase.WAIT_CANCELLATION_SETTLE;
                 return;
             }
+            var completion = TopologyValidationAccess.completion(sample.request);
+            if (completion != null && !completion.ready()) return;
+            TopologyCausalityObservation.logical(activeRoute.spec.route().name, currentSamplePhase(), activeRoute.sampleIndex,
+                    activeRoute.level, activeRoute.start, activeRoute.goal, sample.request, terminal.corridor != null, terminal.failure);
             recordValidationSample(sample, terminal, null);
             activeRoute.recordCompleted(
                     currentSamplePhase(),
@@ -747,8 +781,9 @@ public final class RealTerrainTopologyBenchmark {
             BlockPos start = route.start.toBlockPos();
             BlockPos goal = route.goal.toBlockPos();
             UUID owner = UUID.nameUUIDFromBytes(("terrain-pressure:" + stage.name + ":" + dimension.dimension + ":" + ownerIndex).getBytes(StandardCharsets.UTF_8));
-            long started = System.nanoTime();
+            TopologyCausalityObservation.endpointWorld(topology, level, route.name, stage.name, ownerIndex, start, goal);
             int startTick = server.getTickCount();
+            long started = System.nanoTime();
             try {
                 TopologyService.MacroRequest request = topology.requestMacroQuery(
                         level,
@@ -761,11 +796,12 @@ public final class RealTerrainTopologyBenchmark {
                 PressureRequest pressureRequest = new PressureRequest(route, request, ownerIndex, started, startTick);
                 dimension.requests.add(pressureRequest);
                 request.future().whenComplete((corridor, failure) -> {
-                    TopologyCausalityObservation.logical(route.name, stage.name, ownerIndex,
-                            level, start, goal, request, corridor != null, failure);
+                    long observed = System.nanoTime(); int tick = server.getTickCount();
+                    var completion = TopologyValidationAccess.completion(request);
+                    if (completion != null) completion.observe(observed, tick);
                     PressureTerminal terminal = PressureTerminal.completed(
-                            System.nanoTime(), corridor, unwrapCompletionFailure(failure),
-                            request.progress().failure().name(), server.getTickCount());
+                            observed, corridor, unwrapCompletionFailure(failure),
+                            request.progress().failure().name(), tick);
                     server.execute(() -> deliverPressureTerminal(
                             stage, dimension, pressureRequest, terminal));
                 });
@@ -786,6 +822,11 @@ public final class RealTerrainTopologyBenchmark {
             long now = System.nanoTime();
             Map<String, Long> after = observation.acceleratedNavigation$snapshotMetrics();
             dimension.updatePeaks(after);
+            for (PressureRequest request : dimension.requests) if (request.terminal != null && !request.evidenceRecorded) {
+                var completion = TopologyValidationAccess.completion(request.request);
+                if (completion != null && !completion.ready()) return;
+                recordValidationPressure(stage, dimension, request, request.terminal);
+            }
             boolean complete = dimension.requests.stream()
                     .allMatch(request -> request.terminal != null);
             if (!complete && now - dimension.startedNanos < PRESSURE_TIMEOUT_NANOS) {
@@ -799,7 +840,7 @@ public final class RealTerrainTopologyBenchmark {
                         if (request.terminal == null) {
                             request.timeoutRequested = true;
                             recordValidationPressure(stage, dimension, request,
-                                    new PressureTerminal(now, false, "TIMEOUT", server.getTickCount()));
+                                    new PressureTerminal(now, false, "TIMEOUT", server.getTickCount(), null));
                             request.request.cancel();
                             dimension.cancelledRequests++;
                         }
@@ -843,7 +884,7 @@ public final class RealTerrainTopologyBenchmark {
                 return;
             }
             request.terminal = terminal;
-            recordValidationPressure(stage, dimension, request, terminal);
+
         }
 
         private void recordValidationPressure(PressureStageRun stage, PressureDimensionRun dimension,
@@ -855,7 +896,7 @@ public final class RealTerrainTopologyBenchmark {
             String outcome = request.timeoutRequested ? "TIMEOUT" : terminal.success ? "SUCCESS"
                     : terminal.outcome.startsWith("EXCEPTION:") ? "EXCEPTION" : terminal.outcome.equals("CANCELLED") ? "CANCELLED" : "BUSINESS_FAILURE";
             validation.pressure(stage.name, level == nether, request.ownerIndex, level,
-                    request.route.start.toBlockPos(), request.route.goal.toBlockPos(), owner, request.request, outcome, null,
+                    request.route.start.toBlockPos(), request.route.goal.toBlockPos(), owner, request.request, outcome, terminal.failure,
                     request.submittedNanos, terminal.completedNanos, request.startTick, terminal.completedTick);
         }
 
@@ -873,7 +914,7 @@ public final class RealTerrainTopologyBenchmark {
         }
 
         private void finishAndStop() {
-            if (TopologyCausalityObservation.CAUSALITY && diagnosticRouteCursor < routes.size()) {
+            if (TopologyCausalityObservation.CAUSALITY && TopologyCausalityObservation.enabled("search") && diagnosticRouteCursor < routes.size()) {
                 RouteRun route = routes.get(diagnosticRouteCursor++);
                 var reference = TerrainRouteManifest.diagnosticReference(route.level, route.spec.route());
                 TopologyCausalityObservation.referencePath(topology, route.level, route.spec.route().name,
@@ -1091,7 +1132,10 @@ public final class RealTerrainTopologyBenchmark {
         private final String outcome;
         private final int completedTick;
 
-        private PressureTerminal(long completedNanos, boolean success, String outcome, int completedTick) {
+        @Nullable private final Throwable failure;
+
+        private PressureTerminal(long completedNanos, boolean success, String outcome, int completedTick, @Nullable Throwable failure) {
+            this.failure = failure;
             this.completedNanos = completedNanos;
             this.success = success;
             this.outcome = outcome;
@@ -1104,14 +1148,14 @@ public final class RealTerrainTopologyBenchmark {
                                                   String productionFailure, int completedTick) {
             if (failure != null) {
                 return new PressureTerminal(completedNanos, false,
-                        "EXCEPTION:" + failure.getClass().getSimpleName(), completedTick);
+                        "EXCEPTION:" + failure.getClass().getSimpleName(), completedTick, failure);
             }
             if (corridor != null) {
-                return new PressureTerminal(completedNanos, true, "SUCCEEDED", completedTick);
+                return new PressureTerminal(completedNanos, true, "SUCCEEDED", completedTick, null);
             }
             String outcome = productionFailure == null || "NONE".equals(productionFailure)
                     ? "NO_RESULT" : productionFailure;
-            return new PressureTerminal(completedNanos, false, outcome, completedTick);
+            return new PressureTerminal(completedNanos, false, outcome, completedTick, null);
         }
     }
 

@@ -4,6 +4,7 @@ import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import com.scarasol.acceleratednavigation.topology.BaseClusterTopology;
 import com.scarasol.acceleratednavigation.topology.MacroSearch;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
+import com.scarasol.acceleratednavigation.topology.TopologyTestBridge;
 import com.scarasol.acceleratednavigation.topology.TopologyValidationAccess;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -29,7 +30,7 @@ final class ProductionRemediationTerrain {
     private final ProductionRemediationPlan.Options options;
     private final ProductionRemediationReport.Journal journal;
     private final ProductionRemediationMetrics metrics;
-    private final Map<String, List<ProductionRemediationPlan.Target>> ordinary = new HashMap<>();
+    private final Map<String, List<ProductionRemediationPlan.Target>> ordinary = new LinkedHashMap<>();
     private final Map<String, ProductionRemediationPlan.Target> pressure = new HashMap<>();
     private final Map<String, Map<String, TopologyValidationAccess.Stamp>> prepared = new HashMap<>();
     private final Set<ResourceKey<Level>> preparedDimensions = new HashSet<>();
@@ -44,6 +45,8 @@ final class ProductionRemediationTerrain {
     private boolean coldCleared;
     private long startedGcCount, startedGcMillis;
     private Map<String, Long> observationCost = Map.of();
+    private List<String> preparationWait = List.of();
+    private long preparationCalls, preparationNanos;
 
     ProductionRemediationTerrain(TopologyService topology, TopologyObservationAccess observation) {
         this.topology = topology; this.observation = observation;
@@ -53,7 +56,8 @@ final class ProductionRemediationTerrain {
         catch (IOException failure) { throw new UncheckedIOException(failure); }
         metrics = options.scenario().equals("M") ? new ProductionRemediationMetrics(topology, journal, options) : null;
         List<ProductionRemediationPlan.Target> targets = ProductionRemediationPlan.targets(options);
-        for (String route : ProductionRemediationPlan.routes()) {
+        for (String route : targets.stream().filter(target -> target.kind().equals("query"))
+                .map(target -> target.parameters().get("route")).distinct().toList()) {
             ordinary.put(route, targets.stream().filter(target -> target.kind().equals("query") && target.parameters().get("route").equals(route)).toList());
         }
         for (var target : targets) if (target.kind().equals("pressure")) {
@@ -61,6 +65,7 @@ final class ProductionRemediationTerrain {
         }
     }
 
+    List<String> routeNames() { return List.copyOf(ordinary.keySet()); }
     int count(String route) { return ordinary.getOrDefault(route, List.of()).size(); }
     String phase(String route, int index) { return target(route, index).parameters().get("phase"); }
     boolean pressureEnabled() { return !pressure.isEmpty(); }
@@ -84,10 +89,15 @@ final class ProductionRemediationTerrain {
         long now = System.nanoTime();
         if (!target.id().equals(preparationId)) {
             preparationId = target.id(); preparationStarted = now; preparationQueries = 0; coldCleared = false;
+            preparationWait = List.of(); preparationCalls = 0; preparationNanos = 0;
         }
         boolean initial = !preparedDimensions.contains(level.dimension());
         long timeout = initial ? 600_000_000_000L : 30_000_000_000L;
         if (now - preparationStarted >= timeout) {
+            journal.controlEvent(Map.of("event", "preparation-timeout", "id", target.id(),
+                    "waitingFor", preparationWait, "preparationCalls", preparationCalls,
+                    "preparationNanos", preparationNanos, "elapsedNanos", now - preparationStarted,
+                    "state", TopologyValidationAccess.snapshot(topology, level.dimension())));
             cleanupPreparation();
             journal.sample(target, Map.of("outcome", "NOT_ENTERED", "reason", "PREPARATION_FAILED", "qualified", false));
             return Preparation.SKIP;
@@ -96,12 +106,16 @@ final class ProductionRemediationTerrain {
         boolean cold = phase.equals("cold");
         if (initial || cold) {
             if (factsLease == null) factsLease = TopologyValidationAccess.factsLease(topology);
-            var sections = TopologyValidationAccess.loadedSections(topology, level.dimension(), chunks);
-            if (sections.isEmpty()) throw new IllegalStateException("Frozen chunk plan has no loaded sections");
-            if (!TopologyValidationAccess.prepareFacts(topology, level.dimension(), factsLease, sections).isEmpty()) return Preparation.WAIT;
+            long preparing = System.nanoTime();
+            try {
+                var sections = TopologyValidationAccess.loadedSections(topology, level.dimension(), chunks);
+                if (sections.isEmpty()) throw new IllegalStateException("Frozen chunk plan has no loaded sections");
+                preparationWait = TopologyValidationAccess.prepareFacts(topology, level.dimension(), factsLease, sections);
+            } finally { preparationCalls++; preparationNanos += System.nanoTime() - preparing; }
+            if (!preparationWait.isEmpty()) return Preparation.WAIT;
         }
         var snapshot = TopologyValidationAccess.snapshot(topology, level.dimension());
-        if (!snapshot.idle()) return Preparation.WAIT;
+        if (!snapshot.idle()) return waiting("RUNTIME_BUSY");
         if (initial) {
             preparedDimensions.add(level.dimension());
             journal.controlEvent(Map.of("event", "facts-ready", "dimension", level.dimension().location().toString(),
@@ -109,9 +123,9 @@ final class ProductionRemediationTerrain {
             if (!cold) releaseFacts();
         }
         if (preparationQuery != null) {
-            if (!preparationQuery.future().isDone()) return Preparation.WAIT;
+            if (!preparationQuery.future().isDone()) return waiting("PREPARATION_QUERY_PENDING");
             var used = finishCapture();
-            prepared.computeIfAbsent(route, ignored -> new LinkedHashMap<>()).putAll(used);
+            prepared.put(route, new LinkedHashMap<>(used));
             journal.controlEvent(Map.of("event", "preparation-query-terminal", "for", target.id(), "ordinal", preparationQueries,
                     "progress", preparationQuery.progress(), "request", TopologyValidationAccess.requestIdentity(preparationQuery), "used", used));
             TopologyValidationAccess.forgetRequest(preparationQuery);
@@ -120,13 +134,13 @@ final class ProductionRemediationTerrain {
         }
         ((TopologyFormalControlAccess) (Object) topology).acceleratedNavigation$clearCompletedCorridors();
         if (cold && !coldCleared) {
-            if (!TopologyValidationAccess.clearDerived(topology, level.dimension())) return Preparation.WAIT;
+            if (!TopologyValidationAccess.clearDerived(topology, level.dimension())) return waiting("DERIVED_REFERENCES_HELD");
             coldCleared = true;
             snapshot = TopologyValidationAccess.snapshot(topology, level.dimension());
         }
         if (phase.equals("hot")) {
             Map<String, TopologyValidationAccess.Stamp> expected = prepared.getOrDefault(route, Map.of());
-            if (expected.isEmpty() || !snapshot.objects().keySet().containsAll(expected.keySet())) {
+            if (expected.isEmpty() || !TopologyValidationAccess.validateExpected(snapshot, expected).isEmpty()) {
                 if (preparationQueries == 0) {
                     capture = TopologyValidationAccess.beginCapture();
                     preparationQueries++;
@@ -137,16 +151,19 @@ final class ProductionRemediationTerrain {
                     } catch (RuntimeException failure) { finishCapture(); throw failure; }
                     journal.controlEvent(Map.of("event", "preparation-query-submitted", "for", target.id(), "ordinal", preparationQueries));
                 }
-                return Preparation.WAIT;
+                return waiting("HOT_DEPENDENCIES_NOT_READY");
             }
         }
-        if (metrics != null && !metrics.prepare(level, start, goal)) return Preparation.WAIT;
-        before = TopologyValidationAccess.snapshot(topology, level.dimension());
+        if (metrics != null && !metrics.prepare(level, start, goal)) return waiting("METRICS_PREPARATION");
+        before = metrics == null ? snapshot : TopologyValidationAccess.snapshot(topology, level.dimension());
         beforeMetrics = observation.acceleratedNavigation$snapshotMetrics();
-        capture = TopologyValidationAccess.beginCapture();
+        observationCost = Map.of("directWallNanos", 0L, "calls", 0L);
+        if (!"B".equals(target.parameters().get("mode"))) capture = TopologyValidationAccess.beginCapture();
         startedGcCount = gc(false); startedGcMillis = gc(true);
         return Preparation.READY;
     }
+
+    private Preparation waiting(String reason) { preparationWait = List.of(reason); return Preparation.WAIT; }
 
     void sample(String route, int index, ServerLevel level, BlockPos start, BlockPos goal, UUID owner,
                 TopologyService.MacroRequest request, String outcome, Throwable failure,
@@ -156,7 +173,9 @@ final class ProductionRemediationTerrain {
         Map<String, Long> after = observation.acceleratedNavigation$snapshotMetrics();
         String phase = target.parameters().get("phase");
         List<String> issues = new java.util.ArrayList<>();
-        if (phase.equals("hot")) {
+        boolean reduced = "B".equals(target.parameters().get("mode"));
+        if (reduced) issues.add("DIAGNOSTIC_ONLY_CAPTURE_DISABLED");
+        if (phase.equals("hot") && !reduced) {
             for (var entry : used.entrySet()) if (!entry.getValue().equals(before.objects().get(entry.getKey()))) issues.add("NOT_READY_BEFORE:" + entry.getKey());
             if (used.isEmpty()) issues.add("NO_GRAPH_ACQUISITION");
             for (String counter : List.of("worker.tasks.completed.builds", "worker.tasks.completed.prewarms")) {
@@ -170,12 +189,12 @@ final class ProductionRemediationTerrain {
             if (request != null && request.completedFromCache()) issues.add("COMPLETED_CACHE_HIT");
             var current = TopologyValidationAccess.snapshot(topology, level.dimension());
             for (var entry : used.entrySet()) if (entry.getKey().startsWith("facts/") && !entry.getValue().equals(current.objects().get(entry.getKey()))) issues.add("FACTS_CHANGED:" + entry.getKey());
-        } else prepared.computeIfAbsent(route, ignored -> new LinkedHashMap<>()).putAll(used);
+        } else prepared.put(route, new LinkedHashMap<>(used));
         Map<String, Object> row = requestRow(level, start, goal, owner, request, outcome, failure, started, ended, cpu, startTick, endTick);
         row.put("qualified", issues.isEmpty()); row.put("qualificationIssues", issues);
         row.put("gcCollections", Math.max(0, gc(false) - startedGcCount));
         row.put("gcMillis", Math.max(0, gc(true) - startedGcMillis));
-        if (request != null && (options.scenario().equals("M") || options.scenario().equals("probe"))) {
+        if (request != null && (options.plan() != null || options.scenario().equals("M") || options.scenario().equals("probe"))) {
             var progress = request.progress();
             Map<String, Object> work = new LinkedHashMap<>();
             work.put("metrics", progress.metrics()); work.put("hierarchical", progress.hierarchical());
@@ -187,18 +206,22 @@ final class ProductionRemediationTerrain {
             row.put("pairedWork", work);
         }
         row.put("controlReference", target.id());
+        row.put("preparation", Map.of("elapsedNanos", started - preparationStarted, "dynamicQueries", preparationQueries, "calls", preparationCalls, "directNanos", preparationNanos));
+        row.put("qualificationMode", reduced ? "DIAGNOSTIC_ONLY" : "FULL");
         row.put("observerCost", observationCost);
-        Map<String, TopologyValidationAccess.Stamp> relevantBefore = new LinkedHashMap<>();
-        for (String key : used.keySet()) if (before.objects().containsKey(key)) relevantBefore.put(key, before.objects().get(key));
         Map<String, Object> control = new LinkedHashMap<>();
-        control.put("event", "sample-state"); control.put("id", target.id()); control.put("before", relevantBefore); control.put("used", used);
+        control.put("event", "sample-state"); control.put("id", target.id()); control.put("before", before.objects()); control.put("used", used);
         control.put("counterBefore", beforeMetrics); control.put("counterAfter", after); control.put("coldDerivedEmpty", coldCleared);
+        control.put("fullBefore", true); control.put("prepared", prepared.getOrDefault(route, Map.of()));
         control.put("testHeldFactsBytes", factsLease == null ? 0L : factsLease.bytes());
-        if ("mutated".equals(options.control())) row.putAll(ProductionRemediationReport.rejectSampleMutation(target, row, control));
-        journal.controlEvent(control);
-        journal.sample(target, row);
-        if (request != null) TopologyValidationAccess.forgetRequest(request);
-        releaseFacts(); preparationId = null;
+        try { journal.checkedSample(target, row, control, "mutated".equals(options.control())); }
+        finally {
+            if (request != null) TopologyValidationAccess.forgetRequest(request);
+            releaseFacts(); preparationId = null;
+            if (request != null && com.scarasol.acceleratednavigation.topology.TopologySegmentTrace.ENABLED)
+                journal.controlEvent(Map.of("event", "segment-cleanup", "id", target.id(),
+                        "proof", com.scarasol.acceleratednavigation.topology.TopologySegmentTrace.cleanupEvidence(request)));
+        }
     }
 
     void pressure(String stage, boolean nether, int index, ServerLevel level, BlockPos start, BlockPos goal, UUID owner,
@@ -206,10 +229,10 @@ final class ProductionRemediationTerrain {
                   long started, long ended, int startTick, int endTick) {
         var target = pressure.get(stage + "/" + (nether ? "nether" : "overworld") + "/" + index);
         if (target == null) throw new IllegalStateException("Unknown pressure position");
+        com.scarasol.acceleratednavigation.topology.TopologyCausalityObservation.logical(target.parameters().get("route"), stage, index, level, start, goal, request, "SUCCESS".equals(outcome), failure);
         var row = requestRow(level, start, goal, owner, request, outcome, failure, started, ended, -1, startTick, endTick);
-        if ("mutated".equals(options.control())) row.putAll(ProductionRemediationReport.rejectSampleMutation(target, row, null));
-        journal.sample(target, row);
-        if (request != null) TopologyValidationAccess.forgetRequest(request);
+        try { journal.checkedSample(target, row, null, "mutated".equals(options.control())); }
+        finally { if (request != null) TopologyValidationAccess.forgetRequest(request); }
     }
 
     private static Map<String, Object> requestRow(ServerLevel level, BlockPos start, BlockPos goal, UUID owner,
@@ -222,6 +245,19 @@ final class ProductionRemediationTerrain {
         row.put("outcome", outcome); row.put("exception", failure == null ? null : TerrainTestSupport.failureSummary(failure));
         row.put("startNanos", started); row.put("endNanos", ended); row.put("wallNanos", ended - started);
         row.put("processCpuNanos", cpu < 0 ? null : cpu); row.put("startTick", startTick); row.put("endTick", endTick); row.put("completionTicks", endTick - startTick);
+        var completion = request == null ? null : TopologyValidationAccess.completion(request);
+        Map<String, Object> boundary = Map.of("status", "UNPROVEN", "reason", "NO_WRAPPED_REQUEST");
+        if (completion != null) synchronized (completion) {
+            boundary = completion.ready() ? completion.evidence(started, startTick)
+                    : Map.of("status", "UNPROVEN", "reason", "COMPLETION_CALL_STILL_ACTIVE");
+        }
+        row.put("completionBoundary", boundary);
+        if (com.scarasol.acceleratednavigation.topology.TopologySegmentTrace.ENABLED) {
+            row.put("measurementSegments", com.scarasol.acceleratednavigation.topology.TopologySegmentTrace.snapshot(request, started, boundary));
+            row.put("clockAnchor", com.scarasol.acceleratednavigation.topology.TopologySegmentTrace.clockAnchor());
+            row.put("tickCadence", RealTerrainTopologyBenchmark.tickTimeline.window(started, ended));
+        }
+        row.put("cpuCoverage", "Whole JVM background only; not exclusive request or module CPU; no subtraction");
         row.put("failure", request == null ? null : request.progress().failure().name());
         row.put("blockedSection", request == null ? null : request.progress().blockedSection());
         row.put("progress", request == null ? null : request.progress());

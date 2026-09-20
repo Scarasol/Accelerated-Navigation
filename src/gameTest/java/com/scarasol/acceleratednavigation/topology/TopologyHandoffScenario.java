@@ -19,6 +19,7 @@ import static com.scarasol.acceleratednavigation.topology.TopologyTestBridge.*;
 public final class TopologyHandoffScenario implements AutoCloseable {
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final ProductionRemediationPlan.Target target;
     private final Map<String, Object> evidence = new LinkedHashMap<>();
     private final SectionPos section = SectionPos.of(96, 12, 96);
@@ -32,11 +33,11 @@ public final class TopologyHandoffScenario implements AutoCloseable {
     private TopologyValidationAccess.Capture capture;
     private int stage, changedTick;
     private long load, baselineVersion;
-    private boolean secondVersion, inapplicable, reversedFirstDeliveryUnavailable, reloaded, closed;
+    private boolean reloaded, closed;
     private int reloadStage;
 
     public TopologyHandoffScenario(TopologyService service, ServerLevel level, ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; this.target = target;
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); this.target = target;
         key = new TopologyWorkerRuntime.ClusterKey(level.dimension(), section);
         runtime = readField(service, "runtime"); mutated = "mutated".equals(control);
         competing = target.kind().equals("H01") || "v2".equals(parameter("competition"));
@@ -66,7 +67,7 @@ public final class TopologyHandoffScenario implements AutoCloseable {
             require(((Number) TopologyValidationAccess.chunkSettlement(service, level.dimension(), Set.of(chunk.getPos().toLong()))
                     .get("holds")).longValue() > 0, "the accepted old load still owns its pending terminal");
             evidence.put("beforeReload", canonical());
-            TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk);
+            tickets.unload(chunk); tickets.loaded(chunk);
             long nextLoad = (long) readField(readField(loaded(), "chunk"), "identity");
             require(nextLoad != load && !(boolean) readField(loaded(), "recoveryAttempted"),
                     "the new load has its own unused validation and recovery opportunity");
@@ -104,8 +105,9 @@ public final class TopologyHandoffScenario implements AutoCloseable {
     public Map<String, Object> tick() {
         if (closed) throw new IllegalStateException("closed handoff scenario");
         if (stage == 0) {
+            tickets.hold(Set.of(chunkPosition().toLong()));
             chunk = level.getChunk(section.x(), section.z());
-            TopologyService.onChunkLoaded(level, chunk);
+            tickets.loaded(chunk);
             for (int y = 0; y < 4; y++) for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++) {
                 chunk.setBlockState(at(x, y, z), y == 0 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(), false);
             }
@@ -115,6 +117,8 @@ public final class TopologyHandoffScenario implements AutoCloseable {
         if (stage == 1) {
             if (!nextTick() || !settled()) return null;
             Object loaded = loaded();
+            require(loaded != null && readField(readField(loaded, "chunk"), "chunk") == chunk,
+                    "handoff preparation retains the actual loaded target chunk");
             load = (long) readField(readField(loaded, "chunk"), "identity");
             baselineVersion = (long) readField(loaded, "version");
             BaseClusterTopology.PackedFacts facts = currentFacts();
@@ -125,8 +129,7 @@ public final class TopologyHandoffScenario implements AutoCloseable {
                 TopologyValidationAccess.evictIdle(service);
                 require(currentFacts() == null, "real eviction removes the target's idle canonical facts");
             }
-            inapplicable = "memory".equals(parameter("path")) && "B4".equals(parameter("barrier"));
-            String barrier = target.kind().equals("H05") ? "B1" : target.kind().equals("H01") ? "B5" : inapplicable ? "B1" : parameter("barrier");
+            String barrier = target.kind().equals("H05") ? "B1" : target.kind().equals("H01") ? "B5" : parameter("barrier");
             probe = TopologyHandoffProbe.install(level.dimension(), section, load, baselineVersion + 1, barrier);
             probe.observeRuntime(service);
             if (target.kind().equals("H05") || parameter("reloadTerminal") != null) sectionEvents = TopologySectionEventProbe.watch(level.dimension(), section);
@@ -140,19 +143,14 @@ public final class TopologyHandoffScenario implements AutoCloseable {
         if (stage == 2) {
             if (!probe.reached() || !nextTick()) return null;
             evidence.put("paused", TopologyValidationAccess.chunkSettlement(service, level.dimension(), Set.of(chunk.getPos().toLong())));
-            if (inapplicable) {
-                require(probe.events().stream().anyMatch(event -> "B1".equals(event.get("barrier"))
-                        && ((Number) event.get("factsToken")).longValue() != 0), "memory decision has a complete facts input");
-                evidence.put("staticEvidence", Map.of("path", "src/main/java/com/scarasol/acceleratednavigation/topology/TopologyStore.java",
-                        "relationship", "accept queues formDelta only when decision.facts() == null; this actual decision has nonnull facts"));
-            } else if (competing) writeSecondVersion();
+            if (competing) writeSecondVersion();
             changedTick = level.getServer().getTickCount(); stage = 3;
             return null;
         }
         if (stage == 3) {
             if (!nextTick()) return null;
             if ("old-load".equals(parameter("delivery"))) {
-                TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk);
+                tickets.unload(chunk); tickets.loaded(chunk);
                 long newLoad = (long) readField(readField(loaded(), "chunk"), "identity");
                 require(newLoad != load, "reload establishes an independent load identity");
                 evidence.put("newLoadIdentity", newLoad); reloaded = true;
@@ -162,42 +160,21 @@ public final class TopologyHandoffScenario implements AutoCloseable {
         }
         if (stage == 4) {
             if (!settled()) return null;
-            if (!inapplicable && !secondVersion && "v2-before-v1".equals(parameter("delivery"))) {
-                writeSecondVersion(); changedTick = level.getServer().getTickCount(); stage = 5;
-                return null;
-            }
-            stage = 6;
-        }
-        if (stage == 5) {
-            if (!nextTick() || !settled()) return null;
             stage = 6;
         }
         if (stage == 6) {
             String delivery = parameter("delivery");
-            if (!inapplicable && ("duplicate-v1".equals(delivery) || "v2-before-v1".equals(delivery))) {
+            if ("duplicate-v1".equals(delivery)) {
                 require(probe.completionCount() > 0, "a real immutable completion exists for replay");
                 Map<String, Object> before = canonical();
-                if ("v2-before-v1".equals(delivery)) {
-                    require(probe.completionCount() >= 2, "both actual versions completed before reversed duplicate notifications");
-                    var first = probe.events().stream().filter(event -> "write-terminal".equals(event.get("event"))).findFirst().orElseThrow();
-                    var second = probe.events().stream().filter(event -> "B1".equals(event.get("barrier"))
-                            && ((Number) event.get("version")).longValue() > ((Number) first.get("version")).longValue()).findFirst().orElseThrow();
-                    require(((Number) second.get("nanoTime")).longValue() > ((Number) first.get("nanoTime")).longValue(),
-                            "the successor decision can only be emitted after its predecessor's first terminal delivery");
-                    evidence.put("staticEvidence", Map.of("path", "src/main/java/com/scarasol/acceleratednavigation/topology/TopologyWorkerRuntime.java",
-                            "relationship", "decideFacts requires entry.decision == null; only completeFacts clears the predecessor and starts the successor",
-                            "predecessorTerminal", first, "successorDecision", second));
-                    reversedFirstDeliveryUnavailable = true;
-                    probe.replayCompletion(1);
-                }
                 probe.replayCompletion(0);
                 require(before.equals(canonical()), "duplicate or older acknowledgements cannot change current canonical facts");
-                evidence.put("duplicateReplaySequence", "v2-before-v1".equals(delivery) ? List.of("v2", "v1") : List.of("v1"));
+                evidence.put("duplicateReplaySequence", List.of("v1"));
             }
             verifyCells();
             evidence.put("canonical", canonical()); evidence.put("handoffs", probe.events());
-            if (!inapplicable && !reloaded) verifyReferences(probe.events());
-            if (mutated && !inapplicable && !reloaded) {
+            if (!reloaded) verifyReferences(probe.events());
+            if (mutated && !reloaded) {
                 List<Map<String, Object>> altered = new java.util.ArrayList<>(probe.events());
                 boolean changed = false;
                 for (int index = 0; index < altered.size(); index++) {
@@ -230,15 +207,13 @@ public final class TopologyHandoffScenario implements AutoCloseable {
         evidence.put("consumerObjects", capture.used()); capture = null;
         evidence.put("request", TopologyValidationAccess.requestIdentity(query));
         TopologyValidationAccess.forgetRequest(query); query = null;
-        boolean unavailable = inapplicable || reversedFirstDeliveryUnavailable;
-        evidence.put("outcome", unavailable ? "NOT_APPLICABLE" : "PASS"); evidence.put("reached", !unavailable);
+        evidence.put("outcome", "PASS"); evidence.put("reached", true);
         return Map.copyOf(evidence);
     }
 
     private void writeSecondVersion() {
         chunk.setBlockState(at(1, 1, 1), Blocks.STONE.defaultBlockState(), false);
         chunk.setBlockState(at(1, 2, 1), Blocks.STONE.defaultBlockState(), false);
-        secondVersion = true;
     }
 
     private Map<String, Object> invalidSequence() {
@@ -255,7 +230,7 @@ public final class TopologyHandoffScenario implements AutoCloseable {
                 chunk.setBlockState(at(3, 1, 1), Blocks.STONE.defaultBlockState(), false);
                 changedTick = level.getServer().getTickCount(); stage = 4; return null;
             }
-            TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk);
+            tickets.unload(chunk); tickets.loaded(chunk);
             long newLoad = (long) readField(readField(loaded(), "chunk"), "identity");
             require(newLoad != load, "the second load has an independent identity");
             evidence.put("newLoadIdentity", newLoad);
@@ -347,6 +322,69 @@ public final class TopologyHandoffScenario implements AutoCloseable {
             return entry == null ? null : (BaseClusterTopology.PackedFacts) readField(entry, "facts");
         }
     }
+    public Map<String, Object> observation() {
+        Map<String, Object> result = sectionObservation(service, level, section, chunk, load);
+        result.put("stage", stage); result.put("reloadStage", reloadStage); result.put("changedTick", changedTick);
+        result.put("phase", switch (stage) {
+            case 0 -> "prepare-blocks"; case 1 -> "preparation-settlement-and-baseline";
+            case 2 -> "target-barrier"; case 3 -> "next-tick-before-release";
+            case 4, 5 -> "released-work-settlement"; case 6 -> "canonical-verification";
+            default -> "public-consumer";
+        });
+        result.put("evidence", new LinkedHashMap<>(evidence));
+        if (probe != null) { result.put("handoffs", probe.events()); result.put("probeTimedOut", probe.timedOut()); }
+        if (query != null) result.put("query", queryObservation(query));
+        return result;
+    }
+
+    static Map<String, Object> sectionObservation(TopologyService service, ServerLevel level, SectionPos section,
+                                                   LevelChunk written, long expectedLoad) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        var key = new TopologyWorkerRuntime.ClusterKey(level.dimension(), section);
+        LevelChunk live = level.getChunkSource().getChunkNow(section.x(), section.z());
+        result.put("section", section.toString()); result.put("serverTick", level.getServer().getTickCount());
+        result.put("expectedLoad", expectedLoad); result.put("writtenChunk", TopologyValidationAccess.token(written));
+        result.put("worldChunk", TopologyValidationAccess.token(live)); result.put("sameWorldChunk", written != null && written == live);
+        Object loaded = ((Map<?, ?>) readField(service, "loadedSections")).get(key);
+        result.put("loaded", loaded != null);
+        if (loaded != null) {
+            Object owner = readField(loaded, "chunk");
+            result.put("currentLoad", readField(owner, "identity"));
+            result.put("serviceChunk", TopologyValidationAccess.token(readField(owner, "chunk")));
+            for (String field : List.of("version", "changedTick", "changeOriginalVersion", "persistencePending", "persistenceUnavailable",
+                    "foregroundWaiters", "readRequest", "readInFlight", "recoveryFailed", "recoveryAttempted", "implicitAllAirBase")) {
+                result.put(field, readField(loaded, field));
+            }
+            result.put("pendingChanges", new LinkedHashMap<>((Map<?, ?>) readField(loaded, "pendingChanges")));
+            result.put("recoveryQueued", invoke(service, "recoveryQueued", loaded));
+        }
+        Object runtime = readField(service, "runtime");
+        synchronized (readField(runtime, "runtimeLock")) {
+            Object entry = ((Map<?, ?>) readField(runtime, "clusters")).get(key);
+            Map<String, Object> facts = new LinkedHashMap<>(); facts.put("present", entry != null);
+            if (entry != null) {
+                for (String field : List.of("loadIdentity", "revision", "factState", "writeRequired", "baselineFailed", "persistenceUnavailableVersion")) {
+                    facts.put(field, readField(entry, field));
+                }
+                for (String field : List.of("facts", "pendingFactsReference", "decision", "tail")) facts.put(field + "Token", TopologyValidationAccess.token(readField(entry, field)));
+                facts.put("factWaiters", ((Set<?>) readField(entry, "factWaiters")).size());
+                facts.put("pinnedFacts", ((Map<?, ?>) readField(entry, "pinnedFacts")).size());
+            }
+            result.put("runtime", facts);
+        }
+        result.put("settlement", TopologyValidationAccess.chunkSettlement(service, level.dimension(), Set.of(section.chunk().toLong())));
+        return result;
+    }
+
+    static Map<String, Object> queryObservation(TopologyService.MacroRequest query) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("identity", TopologyValidationAccess.requestIdentity(query)); result.put("progress", query.progress());
+        result.put("done", query.future().isDone()); result.put("cancelled", query.future().isCancelled());
+        result.put("exceptional", query.future().isCompletedExceptionally());
+        if (query.future().isDone() && !query.future().isCompletedExceptionally()) result.put("hasCorridor", query.future().getNow(null) != null);
+        return result;
+    }
+
     private boolean settled() { return Boolean.TRUE.equals(TopologyValidationAccess.chunkSettlement(service, level.dimension(), Set.of(section.chunk().toLong())).get("settled")); }
     private Object loaded() { return ((Map<?, ?>) readField(service, "loadedSections")).get(key); }
     private boolean nextTick() { return level.getServer().getTickCount() > changedTick; }
@@ -355,14 +393,16 @@ public final class TopologyHandoffScenario implements AutoCloseable {
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
 
     @Override public void close() {
-        if (closed) return;
-        closed = true;
-        try { if (probe != null) probe.close(); }
-        finally {
-            if (sectionEvents != null) { sectionEvents.close(); sectionEvents = null; }
-            if (capture != null) { TopologyValidationAccess.endCapture(capture); capture = null; }
-            if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); query = null; }
-            if (chunk != null) TopologyService.onChunkUnloaded(level, chunk);
-        }
+        try {
+            if (closed) return;
+            closed = true;
+            try { if (probe != null) probe.close(); }
+            finally {
+                if (sectionEvents != null) { sectionEvents.close(); sectionEvents = null; }
+                if (capture != null) { TopologyValidationAccess.endCapture(capture); capture = null; }
+                if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); query = null; }
+                if (chunk != null) tickets.unload(chunk);
+            }
+        } finally { tickets.close(); }
     }
 }

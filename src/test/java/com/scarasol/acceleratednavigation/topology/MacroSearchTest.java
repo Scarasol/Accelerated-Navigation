@@ -20,6 +20,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class MacroSearchTest {
 
     @Test
+    void improvesOpenNodePriorityBeforeVisitLimit() {
+        TestGraph graph = new TestGraph(0, 1);
+        graph.edge(2, 0, 2, 1);
+        graph.edge(1, 0, 1, 10);
+        graph.edge(3, 0, 3, 3);
+        graph.edge(4, 0, 4, 4);
+        graph.edge(21, 2, 1, 1);
+        MacroSearch search = new MacroSearch(graph, 1.25F, 3);
+
+        runToCompletion(search);
+
+        assertEquals(Status.SUCCEEDED, search.status());
+        assertEquals(2.0F, search.result().cost());
+        assertEquals(3, search.metrics().expandedNodes());
+        assertEquals(List.of(2L, 21L), search.result().connections().stream()
+                .map(MacroSearch.Connection::id).toList());
+    }
+
+    @Test
     void laterFailureDoesNotCloseAReopenedNodeBeforeItsNextExpansion() {
         var a = new MacroSearch.DependencyKey(MacroSearch.DependencyKind.BASE_CLUSTER, SectionPos.of(1, 0, 0));
         var b = new MacroSearch.DependencyKey(MacroSearch.DependencyKind.BASE_CLUSTER, SectionPos.of(2, 0, 0));

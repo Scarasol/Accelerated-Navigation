@@ -3,6 +3,7 @@ package com.scarasol.acceleratednavigation.topology;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.SectionPos;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.Level;
 import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -26,6 +28,95 @@ class TopologyWorkerRuntimeTest {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         KEY = new TopologyWorkerRuntime.ClusterKey(Level.OVERWORLD, SectionPos.of(-2, 3, 4));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void nextSegmentDiscardsOldHandoffsAndRejectsLateSameKeyCompletion() throws Exception {
+        try (RuntimeCase test = new RuntimeCase()) {
+            var profile = BaseClusterTopology.TraversalProfile.DEFAULT_GROUND;
+            var priority = NavigationScheduler.Priority.ACTIVE;
+            Class<?> keyType = Class.forName(TopologyWorkerRuntime.class.getName() + "$MacroQueryKey");
+            var keyConstructor = keyType.getDeclaredConstructor(net.minecraft.resources.ResourceKey.class,
+                    BaseClusterTopology.Channel.class, BaseClusterTopology.TraversalProfile.class,
+                    boolean.class, int.class, int.class, List.class, List.class);
+            keyConstructor.setAccessible(true);
+            Object key = keyConstructor.newInstance(Level.OVERWORLD, BaseClusterTopology.Channel.GROUND,
+                    profile, true, Float.floatToIntBits(1.25F), 2048, List.of(), List.of());
+            Class<?> queryType = Class.forName(TopologyWorkerRuntime.class.getName() + "$MacroQuery");
+            var queryConstructor = queryType.getDeclaredConstructors()[0];
+            queryConstructor.setAccessible(true);
+            Object query = queryConstructor.newInstance(test.runtime, Level.OVERWORLD, BlockPos.ZERO,
+                    new BlockPos(32, 0, 0), BaseClusterTopology.Channel.GROUND, profile,
+                    priority, 1.25F, key, (Runnable) () -> {});
+            var waitingKey = MacroSearch.DependencyKey.superCluster(SectionPos.of(0, 0, 0));
+            var readyKey = MacroSearch.DependencyKey.baseBoundary(
+                    SectionPos.of(1, 0, 0), SectionPos.of(2, 0, 0), Direction.EAST);
+            Class<?> componentType = Class.forName(TopologyWorkerRuntime.class.getName() + "$MacroComponentKey");
+            Class<?> resolvedType = Class.forName(TopologyWorkerRuntime.class.getName() + "$ResolvedDependency");
+            Class<?> linkType = Class.forName(TopologyWorkerRuntime.class.getName() + "$LinkEntry");
+            var linkConstructor = linkType.getDeclaredConstructors()[0];
+            linkConstructor.setAccessible(true);
+            var resolvedConstructor = resolvedType.getDeclaredConstructors()[0];
+            resolvedConstructor.setAccessible(true);
+            synchronized (test.lock()) {
+                var dependencyWaiter = method(queryType, "dependencyWaiter", MacroSearch.DependencyKey.class);
+                Object oldWaiter = dependencyWaiter.invoke(query, waitingKey);
+                field(queryType, "workerRunning").setBoolean(query, true);
+                List<?> snapshot = (List<?>) method(queryType, "peekResolvedDependencies").invoke(query);
+                assertTrue(snapshot.isEmpty());
+                // A completed boundary arrives after the worker's input snapshot.
+                // Its payload is not consumed in this ownership-only regression.
+                Object link = linkConstructor.newInstance(test.runtime, priority, 0L);
+                method(TopologyWorkerRuntime.class, "finishBuildDemand").invoke(test.runtime);
+                field(linkType, "pins").setInt(link, 1);
+                method(TopologyWorkerRuntime.class, "addActiveReference").invoke(test.runtime);
+                Object resolved = resolvedConstructor.newInstance(readyKey, null, null, link, List.of(), 0L, null);
+                method(queryType, "retainResolvedDependency", MacroSearch.DependencyKey.class, resolvedType)
+                        .invoke(query, readyKey, resolved);
+                field(queryType, "pendingDependencies").set(query, List.of(waitingKey));
+                field(queryType, "buildFailure").set(query, new IllegalStateException("old dependency"));
+                field(queryType, "parentFallbackPending").setBoolean(query, true);
+                var start = new MacroSearch.ExactEndpoint(0, BlockPos.ZERO, 1);
+                var corridor = (List<MacroSearch.Endpoint>) field(queryType, "recoveredEndpoints").get(query);
+                corridor.add(start);
+                field(queryType, "witnessSegments").setInt(query, 2);
+                assertEquals(false, method(queryType, "beginLocalRecovery", MacroSearch.Endpoint.class,
+                        SectionPos.class, int.class, componentType, boolean.class)
+                        .invoke(query, start, SectionPos.of(0, 0, 0), 0, null, true));
+                assertEquals(2, field(TopologyWorkerRuntime.class, "liveSearchDependencies").getInt(test.runtime));
+                field(queryType, "workerRunning").setBoolean(query, false);
+                method(queryType, "preparePendingRecovery").invoke(query);
+                var requests = (Map<?, ?>) field(queryType, "requests").get(query);
+                assertTrue(requests.isEmpty());
+                assertTrue(((Map<?, ?>) field(queryType, "resolvedDependencies").get(query)).isEmpty());
+                assertTrue(((List<?>) field(queryType, "pendingDependencies").get(query)).isEmpty());
+                assertFalse(field(oldWaiter.getClass(), "active").getBoolean(oldWaiter));
+                assertEquals(0, field(linkType, "pins").getInt(link));
+                assertEquals(0, test.runtime.metrics().activeReferences());
+                assertEquals(0, field(TopologyWorkerRuntime.class, "liveSearchDependencies").getInt(test.runtime));
+                assertNull(field(queryType, "buildFailure").get(query));
+                assertFalse(field(queryType, "parentFallbackPending").getBoolean(query));
+                assertNotNull(field(queryType, "baseGraph").get(query));
+                assertEquals(List.of(start), corridor);
+                assertEquals(2, field(queryType, "witnessSegments").getInt(query));
+
+                Object successor = dependencyWaiter.invoke(query, waitingKey);
+                method(queryType, "completeDependencyRequest", MacroSearch.DependencyKey.class, oldWaiter.getClass())
+                        .invoke(query, waitingKey, oldWaiter);
+                method(oldWaiter.getClass(), "complete", Object.class, Throwable.class)
+                        .invoke(oldWaiter, null, new IllegalStateException("late old completion"));
+                assertSame(successor, requests.get(waitingKey));
+                assertEquals(1, field(TopologyWorkerRuntime.class, "liveSearchDependencies").getInt(test.runtime));
+                field(queryType, "cancelRequested").setBoolean(query, true);
+                method(queryType, "finishOnOwner").invoke(query);
+                assertEquals(MacroSearch.Failure.CANCELLED, field(queryType, "failure").get(query));
+                assertTrue(requests.isEmpty());
+                assertEquals(0, field(TopologyWorkerRuntime.class, "liveSearchDependencies").getInt(test.runtime));
+                assertEquals(0, field(TopologyWorkerRuntime.class, "dependencyConsumers").getInt(test.runtime));
+                assertEquals(0, field(TopologyWorkerRuntime.class, "buildDemands").getInt(test.runtime));
+            }
+        }
     }
 
     @Test
@@ -211,6 +302,65 @@ class TopologyWorkerRuntimeTest {
     }
 
     @Test
+    void recoveryFailureAdvancesVersionWithoutRevivingFactsOrRetainingTail() throws Exception {
+        try (RuntimeCase test = new RuntimeCase()) {
+            test.pending();
+            test.delta(0, 1, Map.of(20, (byte) 0));
+            var first = test.decision();
+            test.delta(1, 2, Map.of(21, (byte) 0));
+            test.awaitVersion(2);
+            test.runtime.completeFacts(first, false, false).get(5, TimeUnit.SECONDS);
+            assertNotNull(test.tail());
+            BlockPos start = new BlockPos(KEY.section().minBlockX() + 2,
+                    KEY.section().minBlockY() + 2, KEY.section().minBlockZ() + 2);
+            var waiting = test.runtime.requestMacroQuery(Level.OVERWORLD, start, start.offset(1, 0, 0),
+                    BaseClusterTopology.Channel.VOLUME, BaseClusterTopology.TraversalProfile.DEFAULT_GROUND,
+                    NavigationScheduler.Priority.ACTIVE);
+            assertNotNull(test.demands.poll(5, TimeUnit.SECONDS));
+            assertFalse(waiting.future().isDone());
+            test.runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(KEY, 1, 2, 2,
+                    TopologyWorkerRuntime.FactState.RECOVERY_FAILED, null, Map.of()));
+            var failed = waiting.future().get(5, TimeUnit.SECONDS);
+            assertEquals(MacroSearch.Failure.FACTS_RECOVERY_FAILED, failed.progress().failure());
+            assertNull(failed.corridor());
+            assertFalse(failed.stamps().isEmpty());
+            assertNull(test.tail());
+            assertEquals(false, test.entryField("writeRequired"));
+            synchronized (test.lock()) {
+                test.delta(2, 3, Map.of(22, (byte) 0));
+                test.delta(3, 4, Map.of(23, (byte) 0));
+                test.delta(1, 2, Map.of(24, (byte) 0));
+                test.full(1, 4, BaseClusterTopology.PackedFacts.allAir(), true);
+            }
+            test.awaitVersion(4);
+            assertTrue(failed.stamps().stream().noneMatch(TopologyWorkerRuntime.SectionStamp::current));
+            var repeated = test.runtime.requestMacroQuery(Level.OVERWORLD, start, start.offset(1, 0, 0),
+                    BaseClusterTopology.Channel.VOLUME, BaseClusterTopology.TraversalProfile.DEFAULT_GROUND,
+                    NavigationScheduler.Priority.ACTIVE).future().get(5, TimeUnit.SECONDS);
+            assertEquals(MacroSearch.Failure.FACTS_RECOVERY_FAILED, repeated.progress().failure());
+            assertEquals(KEY.section(), repeated.progress().blockedSection());
+            assertNull(repeated.corridor());
+            assertFalse(repeated.stamps().isEmpty());
+            assertTrue(repeated.stamps().stream().allMatch(stamp -> stamp.current() && stamp.version() == 4));
+            assertNull(test.facts());
+            assertNull(test.tail());
+            assertEquals(false, test.entryField("writeRequired"));
+            assertNull(test.entryField("pendingFactsReference"));
+            assertTrue(test.decisions.isEmpty());
+            assertEquals(0, test.runtime.metrics().activeReferences());
+            test.full(2, 0, BaseClusterTopology.PackedFacts.allAir(), false);
+            test.full(1, 99, BaseClusterTopology.PackedFacts.allAir(), true);
+            test.awaitLoad(2);
+            var reloaded = test.runtime.requestMacroQuery(Level.OVERWORLD, start, start.offset(1, 0, 0),
+                    BaseClusterTopology.Channel.VOLUME, BaseClusterTopology.TraversalProfile.DEFAULT_GROUND,
+                    NavigationScheduler.Priority.ACTIVE).future().get(5, TimeUnit.SECONDS);
+            assertNotNull(reloaded.corridor());
+            assertEquals(0L, test.entryField("revision"));
+            assertTrue(test.decisions.isEmpty());
+        }
+    }
+
+    @Test
     void exhaustedRecoveryTerminatesWaitingQueryAndDropsUnformableTailUntilReload() throws Exception {
         try (RuntimeCase test = new RuntimeCase()) {
             test.pending();
@@ -286,6 +436,57 @@ class TopologyWorkerRuntimeTest {
     }
 
     @Test
+    void demandedParentGraphIsRetainedForTheNextIdenticalQuery() throws Exception {
+        try (RuntimeCase test = new RuntimeCase()) {
+            var profile = BaseClusterTopology.TraversalProfile.DEFAULT_GROUND;
+            var priority = NavigationScheduler.Priority.ACTIVE;
+            var start = new BlockPos(8, 64, 8);
+            var goal = new BlockPos(88, 64, 8);
+
+            for (int x = 0; x <= 7; x++) {
+                for (int z = -1; z <= 1; z++) {
+                    test.publishFullFacts(new TopologyWorkerRuntime.ClusterKey(
+                            Level.OVERWORLD, SectionPos.of(x, 4, z)));
+                }
+            }
+            test.settleFacts(10_000L);
+
+            long buildsBeforeFirst = test.runtime.metrics().tasks().completed().builds();
+            var first = test.runtime.requestMacroQuery(Level.OVERWORLD, start, goal,
+                    BaseClusterTopology.Channel.GROUND, profile, priority);
+            for (int tick = 0; tick < 200 && !first.future().isDone(); tick++) {
+                test.runtime.endServerTick();
+                Thread.sleep(5);
+            }
+            assertTrue(first.future().isDone(), "first macro query did not finish");
+            test.runtime.endServerTick();
+            long buildsAfterFirst = test.runtime.metrics().tasks().completed().builds();
+            int idleParentsAfterFirst = test.runtime.metrics().parentCache().entries();
+            int highestIdleParents = test.runtime.metrics().parentCache().highestEntries();
+
+            long buildsBeforeSecond = buildsAfterFirst;
+            var second = test.runtime.requestMacroQuery(Level.OVERWORLD, start, goal,
+                    BaseClusterTopology.Channel.GROUND, profile, priority);
+            for (int tick = 0; tick < 200 && !second.future().isDone(); tick++) {
+                test.runtime.endServerTick();
+                Thread.sleep(5);
+            }
+            assertTrue(second.future().isDone(), "second macro query did not finish");
+            test.runtime.endServerTick();
+            long buildsAfterSecond = test.runtime.metrics().tasks().completed().builds();
+            int idleParentsAfterSecond = test.runtime.metrics().parentCache().entries();
+
+            String detail = "buildsFirst=" + (buildsAfterFirst - buildsBeforeFirst)
+                    + " buildsSecond=" + (buildsAfterSecond - buildsBeforeSecond)
+                    + " idleParents=" + idleParentsAfterFirst + "/" + idleParentsAfterSecond
+                    + " highestIdleParents=" + highestIdleParents;
+            assertEquals(0L, buildsAfterSecond - buildsBeforeSecond,
+                    "an identical second query rebuilt parent graphs it should have reused: " + detail);
+        }
+    }
+
+
+    @Test
     void lateOldLoadFormationCannotReplaceReloadedFacts() throws Exception {
         try (RuntimeCase test = new RuntimeCase()) {
             test.pending();
@@ -358,6 +559,12 @@ class TopologyWorkerRuntimeTest {
         return result;
     }
 
+    private static Method method(Class<?> type, String name, Class<?>... parameters) throws Exception {
+        Method result = type.getDeclaredMethod(name, parameters);
+        result.setAccessible(true);
+        return result;
+    }
+
     private static final class RuntimeCase implements AutoCloseable {
         final BlockingQueue<TopologyWorkerRuntime.FactDecision> decisions = new LinkedBlockingQueue<>();
         final BlockingQueue<Integer> demands = new LinkedBlockingQueue<>();
@@ -372,6 +579,32 @@ class TopologyWorkerRuntimeTest {
         void full(long load, long version, BaseClusterTopology.PackedFacts facts, boolean persist) {
             runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(KEY, load, version, version,
                     TopologyWorkerRuntime.FactState.AVAILABLE, facts, Map.of(), persist));
+        }
+
+        /** Publishes complete facts for one section; the formation handshake settles on later ticks. */
+        void publishFullFacts(TopologyWorkerRuntime.ClusterKey key) {
+            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(key, 1, 0, 1,
+                    TopologyWorkerRuntime.FactState.AVAILABLE, BaseClusterTopology.PackedFacts.allAir(),
+                    Map.of(), false));
+        }
+
+        /** Settles every pending facts decision; decisions appear only after an event batch runs. */
+        void settleFacts(long timeoutMillis) throws Exception {
+            long deadline = System.currentTimeMillis() + timeoutMillis;
+            while (System.currentTimeMillis() < deadline) {
+                runtime.endServerTick();
+                TopologyWorkerRuntime.FactDecision decision = decisions.poll(20, TimeUnit.MILLISECONDS);
+                if (decision == null) {
+                    if (decisions.isEmpty()) return;
+                    continue;
+                }
+                assertTrue(runtime.acceptFacts(decision));
+                var facts = decision.facts() == null ? BaseClusterTopology.PackedFacts.allAir()
+                        .withChanges(decision.changes()) : decision.facts();
+                assertTrue(runtime.factsFormed(decision, facts).get(5, TimeUnit.SECONDS));
+                assertTrue(runtime.completeFacts(decision, true, false).get(5, TimeUnit.SECONDS));
+            }
+            fail("facts decisions did not settle");
         }
 
         void delta(long from, long to, Map<Integer, Byte> cells) {

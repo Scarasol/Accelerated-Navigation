@@ -29,7 +29,7 @@ abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarr
     private TopologyService.ChunkFactsState acceleratedNavigation$facts =
             new TopologyService.ChunkFactsState();
 
-    @Inject(method = "<init>", at = @At("RETURN"))
+    @Inject(method = "<init>*", at = @At("RETURN"))
     private void acceleratedNavigation$bindSections(CallbackInfo callback) {
         if (level instanceof ServerLevel) {
             TopologyService.bindGeneration((LevelChunk) (Object) this);

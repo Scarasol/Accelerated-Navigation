@@ -1,42 +1,45 @@
-package com.scarasol.acceleratednavigation.topology;
+package com.scarasol.acceleratednavigation.gametest.mixin;
+
+import com.scarasol.acceleratednavigation.topology.*;
 
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Redirect;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import org.spongepowered.asm.mixin.injection.Coerce;
 
-@Mixin(value = TopologyWorkerRuntime.class, remap = false)
+@Mixin(targets = "com.scarasol.acceleratednavigation.topology.TopologyWorkerRuntime", remap = false)
 abstract class TopologyBuildWindowMixin {
-    @Redirect(method = "build", at = @At(value = "INVOKE", target = "Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;build(Lnet/minecraft/core/SectionPos;JLcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$BuildInput;Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$GeometryKey;Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$BuildScratch;)Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;"))
-    private BaseClusterTopology base(SectionPos section, long revision, BaseClusterTopology.BuildInput input,
-                                     BaseClusterTopology.GeometryKey geometry, BaseClusterTopology.BuildScratch scratch) {
+    @WrapOperation(method = "build", at = @At(value = "INVOKE", target = "Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;build(Lnet/minecraft/core/SectionPos;JLcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$BuildInput;Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$GeometryKey;Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$BuildScratch;)Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;"))
+    private BaseClusterTopology base(SectionPos section, long revision, @Coerce Object input,
+                                     BaseClusterTopology.GeometryKey geometry, @Coerce Object scratch, Operation<BaseClusterTopology> original) {
         TopologyBuildWindowProbe.point(this, "base", "captured", section, input, null);
-        BaseClusterTopology result = BaseClusterTopology.build(section, revision, input, geometry, scratch);
+        BaseClusterTopology result = original.call(section, revision, input, geometry, scratch);
         TopologyBuildWindowProbe.point(this, "base", "publishing", section, input, result);
         return result;
     }
-    @Redirect(method = "buildSuperCluster", at = @At(value = "INVOKE", target = "Lcom/scarasol/acceleratednavigation/topology/SuperClusterTopology;build(Lnet/minecraft/core/SectionPos;[Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$GeometryKey;Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$MovementKey;Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology$BuildScratch;)Lcom/scarasol/acceleratednavigation/topology/SuperClusterTopology;"))
-    private SuperClusterTopology parent(SectionPos origin, BaseClusterTopology[] children, BaseClusterTopology.GeometryKey geometry,
-                                        BaseClusterTopology.MovementKey movement, BaseClusterTopology.BuildScratch scratch) {
-        TopologyBuildWindowProbe.point(this, "parent", "captured", origin, children, null);
-        SuperClusterTopology result = SuperClusterTopology.build(origin, children, geometry, movement, scratch);
-        TopologyBuildWindowProbe.point(this, "parent", "publishing", origin, children, result);
-        return result;
+@WrapOperation(method = {"buildSuperCluster", "buildBaseBoundaryLinks", "buildSuperBoundaryLinks"},
+            at = @At(value = "INVOKE", target = "Lcom/scarasol/acceleratednavigation/topology/TopologyWorkerRuntime;runtimeTransition(Ljava/util/function/Supplier;)Ljava/lang/Object;"))
+    private Object captured(@Coerce Object runtime, java.util.function.Supplier<?> action, Operation<Object> original,
+                            @com.llamalad7.mixinextras.sugar.Share("buildWindowInput") com.llamalad7.mixinextras.sugar.ref.LocalRef<TopologyBuildTransitionProbe.Input> shared) {
+        Object value = original.call(runtime, action);
+        var input = TopologyBuildTransitionProbe.captured(action, value);
+        shared.set(input);
+        if (input != null) TopologyBuildWindowProbe.point(this, input.kind(), "captured", input.section(), input.input(), null);
+        return value;
     }
-    @Redirect(method = "buildBaseBoundaryLinks", at = @At(value = "INVOKE", target = "Lcom/scarasol/acceleratednavigation/topology/SuperClusterTopology;boundaryLinks(Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;Lnet/minecraft/core/Direction;)Lcom/scarasol/acceleratednavigation/topology/SuperClusterTopology$BoundaryLinks;"))
-    private SuperClusterTopology.BoundaryLinks baseBoundary(BaseClusterTopology source, BaseClusterTopology target, Direction face) {
-        TopologyBuildWindowProbe.point(this, "base-boundary", "captured", source.section(), source, null);
-        var result = SuperClusterTopology.boundaryLinks(source, target, face);
-        TopologyBuildWindowProbe.point(this, "base-boundary", "publishing", source.section(), source, result);
-        return result;
-    }
-    @Redirect(method = "buildSuperBoundaryLinks", at = @At(value = "INVOKE", target = "Lcom/scarasol/acceleratednavigation/topology/SuperClusterTopology;crossingIndex(Lnet/minecraft/core/Direction;Lcom/scarasol/acceleratednavigation/topology/SuperClusterTopology;[Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;[Lcom/scarasol/acceleratednavigation/topology/BaseClusterTopology;)Lcom/scarasol/acceleratednavigation/topology/SuperClusterTopology$CrossingIndex;"))
-    private SuperClusterTopology.CrossingIndex parentBoundary(SuperClusterTopology source, Direction face, SuperClusterTopology target,
-                                                              BaseClusterTopology[] sourceChildren, BaseClusterTopology[] targetChildren) {
-        TopologyBuildWindowProbe.point(this, "parent-boundary", "captured", source.origin(), source, null);
-        var result = source.crossingIndex(face, target, sourceChildren, targetChildren);
-        TopologyBuildWindowProbe.point(this, "parent-boundary", "publishing", source.origin(), source, result);
-        return result;
+
+    @WrapOperation(method = {"buildSuperCluster", "buildBaseBoundaryLinks", "buildSuperBoundaryLinks"},
+            at = @At(value = "INVOKE", target = "Lcom/scarasol/acceleratednavigation/topology/TopologyWorkerRuntime;runRuntimeTransition(Ljava/lang/Runnable;)V"))
+    private void publishing(@Coerce Object runtime, Runnable action, Operation<Void> original,
+                            @com.llamalad7.mixinextras.sugar.Share("buildWindowInput") com.llamalad7.mixinextras.sugar.ref.LocalRef<TopologyBuildTransitionProbe.Input> shared) {
+        var input = shared.get();
+        if (input != null) {
+            Object result = TopologyBuildTransitionProbe.result(action, input);
+            if (result != null) TopologyBuildWindowProbe.point(this, input.kind(), "publishing", input.section(), input.input(), result);
+        }
+        original.call(runtime, action);
     }
 }

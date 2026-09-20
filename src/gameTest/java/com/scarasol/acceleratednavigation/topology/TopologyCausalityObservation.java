@@ -31,11 +31,14 @@ import java.util.stream.Collectors;
 /** Diagnostic-only snapshots. No production state is written or returned differently. */
 public final class TopologyCausalityObservation {
     public static final boolean CAUSALITY = Boolean.getBoolean("acceleratedNavigation.terrainCausality");
+    public static final boolean UNRESOLVED = CAUSALITY && "qn-unresolved".equals(System.getProperty("acceleratedNavigation.validation.selection"));
     public static final boolean ENABLED = CAUSALITY || Boolean.getBoolean("acceleratedNavigation.terrainProbe");
+    private static final String PLAN = System.getProperty("acceleratedNavigation.validation.plan");
+    private static final List<String> PACKAGES = PLAN == null ? null : com.scarasol.acceleratednavigation.gametest.ProductionRemediationPlan.DiagnosticPlan.parse(PLAN).observers();
     private static final String FAMILY = System.getProperty("acceleratedNavigation.validation.family");
     private static final java.lang.management.ThreadMXBean THREADS = java.lang.management.ManagementFactory.getThreadMXBean();
     private static final Map<String, Long> STARTED = new LinkedHashMap<>(), COMPLETED = new LinkedHashMap<>();
-    private static final Gson GSON = new Gson();
+    private static final Gson GSON = new com.google.gson.GsonBuilder().serializeNulls().create();
     private static final Map<Object, Long> QUERY_IDS = new WeakHashMap<>();
     private static final Map<Object, Map<String, Object>> SEARCHES = new WeakHashMap<>();
     private static final java.util.concurrent.atomic.AtomicLong SEQUENCE = new java.util.concurrent.atomic.AtomicLong();
@@ -48,7 +51,7 @@ public final class TopologyCausalityObservation {
 
     public record Span(String family, String operation, long id, long owner, long startNanos, long cpuNanos, long thread) { }
 
-    public static boolean enabled(String family) { return ENABLED && (FAMILY == null || FAMILY.equals(family)); }
+    public static boolean enabled(String family) { return ENABLED && (PACKAGES == null ? FAMILY == null || FAMILY.equals(family) : PACKAGES.contains(family)); }
 
     public static Span begin(String family, String operation, Object owner) {
         if (!enabled(family)) return null;
@@ -72,6 +75,76 @@ public final class TopologyCausalityObservation {
 
     private static long cpu() { return THREADS.isCurrentThreadCpuTimeSupported() && THREADS.isThreadCpuTimeEnabled() ? THREADS.getCurrentThreadCpuTime() : -1; }
 
+    public static void buildAttempt(Object runtime, String phase) {
+        if (!enabled("build")) return;
+        observe(() -> {
+            Object executor = field(runtime, "taskExecutor");
+            Object task = ((ThreadLocal<?>) field(executor, "currentTask")).get();
+            if (task == null) throw new IllegalStateException("Build did not run in its executor task");
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("phase", phase); row.put("runtimeToken", TopologyValidationAccess.token(runtime));
+            row.put("taskToken", TopologyValidationAccess.token(task));
+            Object command;
+            synchronized (field(executor, "monitor")) {
+                for (String name : List.of("sequence", "kind", "priority", "enqueuedNanos")) row.put(name.equals("kind") ? "taskKind" : name, field(task, name));
+                command = field(task, "command");
+            }
+            List<Object> inputs = new ArrayList<>();
+            synchronized (field(runtime, "runtimeLock")) {
+                for (Field capture : command.getClass().getDeclaredFields()) {
+                    capture.setAccessible(true); Object input = capture.get(command);
+                    if (input == runtime) continue;
+                    Map<String, Object> value = new LinkedHashMap<>();
+                    value.put("type", capture.getType().getSimpleName()); value.put("token", TopologyValidationAccess.token(input));
+                    if (capture.getType().getSimpleName().equals("TopologyDemand")) {
+                        for (String name : List.of("key", "geometry", "generation", "fingerprint", "prewarmSlot", "priority")) value.put(name, field(input, name));
+                        value.put("waiters", ((Set<?>) field(input, "waiters")).stream().map(TopologyValidationAccess::token).toList());
+                        value.put("waitingFacts", ((Set<?>) field(input, "waitingFacts")).size());
+                    } else if (capture.getType().isRecord() || input instanceof Number) value.put("value", input);
+                    inputs.add(value);
+                }
+            }
+            row.put("inputs", inputs); emit("build_attempt", row);
+        });
+    }
+
+    public static void buildSubmission(Object runtime, Object handle) {
+        if (!enabled("build") || handle == null) return;
+        observe(() -> {
+            Object executor = field(runtime, "taskExecutor");
+            var row = new LinkedHashMap<String, Object>();
+            synchronized (field(executor, "monitor")) {
+                row.put("taskToken", TopologyValidationAccess.token(handle)); row.put("runtimeToken", TopologyValidationAccess.token(runtime));
+                for (String name : List.of("sequence", "kind", "priority", "enqueuedNanos", "state")) row.put(name, field(handle, name));
+            }
+            emit("build_submission", row);
+        });
+    }
+
+    public static void invalidated(Object source, Object state) {
+        if (!enabled("build")) return;
+        emit("derived_invalidation", Map.of("source", source, "nextState", state,
+                "caller", StackWalker.getInstance().walk(stream -> stream.filter(frame -> frame.getClassName().contains("TopologyWorkerRuntime"))
+                        .limit(6).map(Object::toString).toList())));
+    }
+
+    public static void queryDecision(Object query, String point) {
+        if (!enabled("search")) return;
+        observe(() -> {
+            var row = queryIdentity(query); row.put("point", point);
+            for (String name : List.of("status", "failure", "blockedEndpoint", "preparedResultCurrent")) row.put(name, field(query, name));
+            row.put("usedSections", stampSnapshots(((Map<?, ?>) field(query, "usedSections")).values()));
+            row.put("preparedResultStamps", stampSnapshots((Iterable<?>) field(query, "preparedResultStamps")));
+            for (String name : List.of("baseGraph", "superGraph")) {
+                Object graph = field(query, name);
+                if (graph != null) row.put(name, capturedStamps(graph));
+            }
+            Object search = field(query, "search");
+            if (search != null) { row.put("searchStatus", ((MacroSearch) search).status()); row.put("searchFailure", ((MacroSearch) search).failure()); }
+            emit("query_decision", row);
+        });
+    }
+
     public static void bindSearch(Object query) {
         if (!enabled("search")) return;
         observe(() -> {
@@ -86,6 +159,144 @@ public final class TopologyCausalityObservation {
             synchronized (SEARCHES) { SEARCHES.put(search, identity); }
             emit("search_start", identity);
         });
+    }
+
+    /** Observe handoff identity without retaining or changing any production ownership. */
+    public static void boundaryHandoff(Object query, String point, MacroSearch.DependencyKey dependency,
+                                       Object waiter, Object resolved) {
+        if (!enabled("search")) return;
+        observe(() -> {
+            MacroSearch.DependencyKey actual = dependency != null ? dependency : resolved == null ? null
+                    : (MacroSearch.DependencyKey) field(resolved, "dependency");
+            var row = queryIdentity(query);
+            row.put("point", point); row.put("dependency", actual);
+            Object graph = field(query, "baseGraph");
+            row.put("baseGraphToken", TopologyValidationAccess.token(graph));
+            row.put("searchToken", TopologyValidationAccess.token(field(query, "search")));
+            row.put("waiterToken", TopologyValidationAccess.token(waiter));
+            row.put("resolvedToken", TopologyValidationAccess.token(resolved));
+            if (resolved != null) {
+                Object key = field(resolved, "cacheKey");
+                row.put("unavailability", field(resolved, "unavailability"));
+                if (key != null && actual != null && actual.kind() == MacroSearch.DependencyKind.BASE_BOUNDARY) {
+                    for (String side : List.of("source", "target")) {
+                        BaseClusterTopology topology = (BaseClusterTopology) field(key, side);
+                        row.put(side, topologyIdentity(topology));
+                        // Only inspect the mutable graph on its worker immediately before attach.
+                        if (point.equals("attach") && graph != null) {
+                            Object capture = ((Map<?, ?>) field(graph, "topologySnapshot")).get(topology.section().asLong());
+                            row.put(side + "InGraph", capture == null ? null : topologyIdentity((BaseClusterTopology) field(capture, "topology")));
+                        }
+                    }
+                }
+            }
+            emit("boundary_handoff", row);
+        });
+    }
+
+    /** Live world access is restricted to the server thread before the query timer. */
+    public static void endpointWorld(Object service, ServerLevel level, String route, String phase, int sample,
+                                     BlockPos start, BlockPos goal) {
+        if (!enabled("endpoint")) return;
+        observe(() -> {
+            if (!level.getServer().isSameThread()) throw new IllegalStateException("endpoint world snapshot outside server thread");
+            Object runtime = field(service, "runtime");
+            var row = new LinkedHashMap<String, Object>();
+            row.put("route", route); row.put("phase", phase); row.put("sample", sample);
+            row.put("dimension", level.dimension()); row.put("startPosition", start); row.put("goalPosition", goal);
+            var positions = new java.util.LinkedHashSet<BlockPos>();
+            for (BlockPos endpoint : List.of(start, goal)) for (BlockPos anchor : observedAnchors(endpoint, true)) {
+                positions.add(anchor.below()); positions.add(anchor); positions.add(anchor.above());
+            }
+            List<Object> cells = new ArrayList<>();
+            for (BlockPos position : positions) {
+                var cell = new LinkedHashMap<String, Object>();
+                cell.put("position", position);
+                cell.put("block", level.getBlockState(position).toString());
+                cell.put("pathType", net.minecraft.world.level.pathfinder.WalkNodeEvaluator.getBlockPathTypeStatic(level,
+                        position.mutable()));
+                cell.put("independentFlags", TopologyGenerationProbe.independentFlags(level, position));
+                synchronized (field(runtime, "runtimeLock")) {
+                    Object entry = ((Map<?, ?>) field(runtime, "clusters")).get(new TopologyWorkerRuntime.ClusterKey(level.dimension(), SectionPos.of(position)));
+                    cell.put("entryPresent", entry != null);
+                    if (entry != null) {
+                        cell.put("revision", field(entry, "revision")); cell.put("factState", field(entry, "factState"));
+                        cell.put("latest", invoke(field(entry, "latest"), "get"));
+                        BaseClusterTopology.PackedFacts facts = (BaseClusterTopology.PackedFacts) field(entry, "facts");
+                        cell.put("factsAvailable", facts != null);
+                        if (facts != null) cell.put("publishedFlags", facts.flags(BaseClusterTopology.cellIndex(
+                                position.getX() & 15, position.getY() & 15, position.getZ() & 15)));
+                    }
+                }
+                cells.add(cell);
+            }
+            row.put("cells", cells); emit("endpoint_world", row);
+        });
+    }
+
+    /** Records the actual immutable ResolveFlight input, never reading a live world on the worker. */
+    public static void endpointInput(Object resolver, List<?> input, Map<?, ?> failures) {
+        if (!enabled("endpoint")) return;
+        observe(() -> {
+            var row = resolverIdentity(resolver);
+            var topologies = new HashMap<SectionPos, BaseClusterTopology>();
+            List<Object> captures = new ArrayList<>();
+            for (Object capture : input) {
+                BaseClusterTopology topology = (BaseClusterTopology) field(capture, "topology");
+                topologies.put(topology.section(), topology);
+                var entry = topologyIdentity(topology); entry.put("validity", field(capture, "validity"));
+                entry.put("ownerToken", TopologyValidationAccess.token(field(capture, "owner")));
+                captures.add(entry);
+            }
+            row.put("input", captures); row.put("factFailures", failures);
+            Object key = field(resolver, "key");
+            for (String side : List.of("start", "goal")) {
+                boolean fallback = (Boolean) field(resolver, side.equals("start") ? "fallbackStart" : "fallbackGoal");
+                List<Object> anchors = new ArrayList<>();
+                for (BlockPos position : observedAnchors((BlockPos) field(key, side), fallback)) {
+                    BaseClusterTopology topology = topologies.get(SectionPos.of(position));
+                    var anchor = new LinkedHashMap<String, Object>();
+                    anchor.put("position", position); anchor.put("topologyToken", TopologyValidationAccess.token(topology));
+                    if (topology != null) anchor.put("component", topology.geometry().channel() == field(key, "channel")
+                            ? component(topology, position) : -1);
+                    anchors.add(anchor);
+                }
+                row.put(side + "Anchors", anchors);
+            }
+            emit("endpoint_input", row);
+        });
+    }
+
+    public static void endpointResolved(Object resolver, Object starts, Object goals) {
+        if (!enabled("endpoint")) return;
+        observe(() -> {
+            var row = resolverIdentity(resolver); row.put("starts", starts); row.put("goals", goals);
+            emit("endpoint_resolved", row);
+        });
+    }
+
+    private static Map<String, Object> resolverIdentity(Object resolver) throws ReflectiveOperationException {
+        var row = new LinkedHashMap<String, Object>();
+        row.put("resolverToken", TopologyValidationAccess.token(resolver)); row.put("key", field(resolver, "key"));
+        row.put("fallbackStart", field(resolver, "fallbackStart")); row.put("fallbackGoal", field(resolver, "fallbackGoal"));
+        return row;
+    }
+
+    private static Map<String, Object> topologyIdentity(BaseClusterTopology topology) {
+        var row = new LinkedHashMap<String, Object>();
+        row.put("topologyToken", TopologyValidationAccess.token(topology)); row.put("section", topology.section());
+        row.put("revision", topology.revision()); row.put("fingerprint", topology.sourceFingerprint());
+        row.put("componentCount", topology.componentCount()); row.put("geometry", topology.geometry());
+        return row;
+    }
+
+    private static List<BlockPos> observedAnchors(BlockPos center, boolean fallback) {
+        if (!fallback) return List.of(center);
+        List<BlockPos> positions = new ArrayList<>();
+        for (int x = -2; x <= 2; x++) for (int y = -2; y <= 2; y++) for (int z = -2; z <= 2; z++) {
+            if (Math.abs(x) + Math.abs(y) + Math.abs(z) <= 2) positions.add(center.offset(x, y, z));
+        }
+        return positions;
     }
 
     public static void searchTerminal(MacroSearch search) {
@@ -125,8 +336,9 @@ public final class TopologyCausalityObservation {
                 Object topology = field(capture, "topology");
                 Map<String, Object> entry = new LinkedHashMap<>();
                 entry.put("key", field(capture, "key"));
-                entry.put("stamps", field(capture, "stamps"));
+                entry.put("stamps", stampSnapshots((Iterable<?>) field(capture, "stamps")));
                 entry.put("validity", field(capture, "validity"));
+                entry.put("ownerValidity", field(field(capture, "owner"), "validity"));
                 if (topology instanceof SuperClusterTopology parent) {
                     entry.put("signature", parent.signature());
                     for (String name : List.of("childComponentOffsets", "aggregateByChildComponent",
@@ -195,9 +407,9 @@ public final class TopologyCausalityObservation {
             data.put("goalPosition", goal);
             data.put("success", success);
             data.put("exception", failure == null ? null : failure.toString());
-            data.put("progress", request.progress());
+            data.put("progress", request == null ? null : request.progress());
             data.put("requestToken", TopologyValidationAccess.token(request));
-            data.putAll(TopologyValidationAccess.requestIdentity(request));
+            if (request != null) data.putAll(TopologyValidationAccess.requestIdentity(request));
             emit("logical_terminal", data);
         });
     }
@@ -205,7 +417,7 @@ public final class TopologyCausalityObservation {
     /** Rebuilds a detached view from captured immutable facts, never publishing it to the runtime. */
     public static void referencePath(Object service, ServerLevel level, String route,
                                      List<BlockPos> path, Map<String, Object> reference) {
-        if (!ENABLED) return;
+        if (!enabled("search")) return;
         observe(() -> {
             Object runtime = field(service, "runtime");
             Map<?, ?> clusters = (Map<?, ?>) field(runtime, "clusters");
@@ -317,11 +529,41 @@ public final class TopologyCausalityObservation {
     private static Map<String, Object> queryIdentity(Object query) throws ReflectiveOperationException {
         Map<String, Object> data = new LinkedHashMap<>();
         synchronized (QUERY_IDS) { data.put("queryId", QUERY_IDS.computeIfAbsent(query, ignored -> nextId())); }
+        data.put("queryToken", TopologyValidationAccess.token(query));
         for (String name : List.of("dimension", "startPosition", "goalPosition", "hierarchical",
                 "refining", "witnessConnectionIndex", "startCandidates", "goalCandidates")) {
             data.put(name, field(query, name));
         }
         return data;
+    }
+
+    // Resolve suppliers before emit acquires the writer monitor: absent stamps take runtimeLock.
+    // Each row compares the same single source read with the immutable expected identity.
+    private static List<Object> stampSnapshots(Iterable<?> stamps) throws ReflectiveOperationException {
+        List<Object> result = new ArrayList<>();
+        for (Object stamp : stamps) {
+            Object expected = field(stamp, "expected");
+            Object current = ((java.util.function.Supplier<?>) field(stamp, "source")).get();
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("key", field(stamp, "key"));
+            row.put("expected", expected); row.put("current", current);
+            row.put("expectedToken", TopologyValidationAccess.token(expected));
+            row.put("currentToken", TopologyValidationAccess.token(current));
+            row.put("sameIdentity", current == expected);
+            result.add(simple(row));
+        }
+        return result;
+    }
+
+    private static List<Object> capturedStamps(Object graph) throws ReflectiveOperationException {
+        List<Object> result = new ArrayList<>();
+        for (Object capture : ((Map<?, ?>) field(graph, "topologySnapshot")).values()) {
+            result.add(Map.of("key", field(capture, "key"),
+                    "stamps", stampSnapshots((Iterable<?>) field(capture, "stamps")),
+                    "validity", field(capture, "validity"),
+                    "ownerValidity", field(field(capture, "owner"), "validity")));
+        }
+        return result;
     }
 
     private static long nextId() { return SEQUENCE.incrementAndGet(); }
@@ -357,7 +599,7 @@ public final class TopologyCausalityObservation {
     public static synchronized void close() {
         if (!ENABLED || closed) return;
         emit("observation_end", Map.of("errors", errors, "bytesBeforeEnd", bytes, "truncated", truncated,
-                "family", FAMILY == null ? "all" : FAMILY, "started", Map.copyOf(STARTED), "completed", Map.copyOf(COMPLETED)));
+                "family", PACKAGES == null ? FAMILY == null ? "all" : FAMILY : String.join(",", PACKAGES), "started", Map.copyOf(STARTED), "completed", Map.copyOf(COMPLETED)));
         closed = true;
         try { if (writer != null) writer.close(); }
         catch (IOException failure) { throw new IllegalStateException(failure); }

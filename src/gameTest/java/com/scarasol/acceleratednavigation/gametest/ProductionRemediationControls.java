@@ -58,6 +58,8 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
     private Map<String, Object> evidence;
     private long targetStarted;
     private LevelChunk tracked;
+    private boolean chunkTicket;
+    private com.scarasol.acceleratednavigation.topology.TopologySeededChunkProbe seededChunk;
     private ServerLevel targetLevel;
     private ChunkPos targetChunk;
     private long cleanupStarted;
@@ -83,7 +85,7 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
     private TopologyValidationAccess.Capture generationCapture;
     private int generationQueries;
     private int stage, stageTick;
-    private boolean requestedStop, published;
+    private boolean requestedStop, published, stopAfterCleanup;
 
     ProductionRemediationControls(MinecraftServer server) {
         this.server = server; topology = TopologyService.forServer(server);
@@ -189,7 +191,8 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
         ServerLevel level = nether ? server.getLevel(Level.NETHER) : server.overworld();
         int x = integer("x"), z = integer("z");
         targetLevel = level; targetChunk = new ChunkPos(x, z);
-        level.getChunk(x, z, ChunkStatus.FULL, true);
+        holdChunk();
+        LevelChunk chunk = level.getChunk(x, z);
         Map<String, Object> observed = TopologyGenerationProbe.loaded(level.dimension().location().toString(), x, z);
         if (observed == null) return false;
         evidence.putAll(observed);
@@ -197,7 +200,18 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
             if (((Number) observed.get(field)).longValue() == 0) throw new NotEntered(field);
         }
         if (!TopologyGenerationProbe.COST) {
+            evidence.put("postloadWrites", TopologyGenerationProbe.postloadWrites(level, chunk));
             @SuppressWarnings("unchecked") Map<String, Object> comparison = (Map<String, Object>) observed.get("cellComparison");
+            if (comparison == null) {
+                comparison = TopologyGenerationProbe.comparePublished(topology, level, chunk);
+                if (comparison == null) return false;
+                evidence.put("cellComparison", comparison);
+                evidence.put("comparedChunkIdentity", chunkIdentity(chunk));
+            }
+            @SuppressWarnings("unchecked") List<Map<String, Object>> ancestry = (List<Map<String, Object>>) observed.get("generationAncestry");
+            for (var ancestor : ancestry) if (ancestor.get("cellComparison") instanceof Map<?, ?> previous) {
+                require(previous.get("checked").equals(previous.get("equal")), "serialized generated baseline agrees with independent oracle");
+            }
             long equal = ((Number) comparison.get("equal")).longValue();
             require(equal == ((Number) comparison.get("checked")).longValue(), "all final generated cells equal independent four-bit oracle");
             if ("mutated".equals(options.control())) detectMutation(equal - 1 == ((Number) comparison.get("checked")).longValue(), "cell comparison");
@@ -237,13 +251,18 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
         ServerLevel level = server.overworld();
         BlockPos position = new BlockPos(1537, 1, 1537);
         if (stage == 0) {
-            ProtoChunk proto = proto(level, false, new ChunkPos(96, 96));
-            tracked = new LevelChunk(level, proto, null);
-            targetLevel = level; targetChunk = tracked.getPos();
-            tracked.setBlockState(position, Blocks.STONE.defaultBlockState(), false);
-            require(!state(tracked).versions().isEmpty(), "promotion before load still collects generation changes");
+            if (tracked == null) {
+                targetLevel = level; targetChunk = new ChunkPos(96, 96);
+                TopologyGenerationProbe.armHandoff(level, targetChunk); holdChunk();
+                tracked = level.getChunk(targetChunk.x, targetChunk.z);
+                var handoff = TopologyGenerationProbe.handoff();
+                require(handoff != null && ((Number) handoff.get("chunkToken")).longValue() == TopologyValidationAccess.token(tracked),
+                        "pre-load generation write and formal changes use the same actual chunk");
+                evidence.put("preloadHandoff", handoff);
+            }
+            if (!Boolean.TRUE.equals(TopologyValidationAccess.chunkSettlement(topology, level.dimension(), Set.of(targetChunk.toLong())).get("settled"))) return false;
+            require(level.getChunkSource().getChunkNow(targetChunk.x, targetChunk.z) == tracked, "writes use the authoritative world chunk");
             sectionProbe = TopologySectionEventProbe.watch(level.dimension(), net.minecraft.core.SectionPos.of(position));
-            TopologyService.onChunkLoaded(level, tracked);
             require(boundOwner(tracked, 0) == null, "formal load releases generation owner");
             evidence.put("before", state(tracked).versions());
             Map<Integer, Byte> beforeCells = oracleCells(tracked, List.of(position, position.above(), position.offset(1, 0, 0), position.offset(1, 1, 0)));
@@ -252,6 +271,7 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
             tracked.setBlockState(position.offset(1, 0, 0), Blocks.STONE.defaultBlockState(), false);
             expectedFirstDelta = changedCells(beforeCells, oracleCells(tracked, List.of(position, position.above(), position.offset(1, 0, 0), position.offset(1, 1, 0))));
             evidence.put("sameTick", state(tracked).versions());
+            evidence.put("sameTickIdentity", generationIdentity());
             stageTick = server.getTickCount(); stage = 1;
             return false;
         }
@@ -261,6 +281,7 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
             tracked.setBlockState(position, Blocks.AIR.defaultBlockState(), false);
             expectedSecondDelta = changedCells(beforeCells, oracleCells(tracked, List.of(position, position.above())));
             evidence.put("nextTick", state(tracked).versions());
+            evidence.put("nextTickIdentity", generationIdentity());
             @SuppressWarnings("unchecked") Map<Integer, Long> before = (Map<Integer, Long>) evidence.get("before");
             @SuppressWarnings("unchecked") Map<Integer, Long> same = (Map<Integer, Long>) evidence.get("sameTick");
             long actual = state(tracked).versions().get(0);
@@ -290,31 +311,44 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
         ServerLevel level = server.overworld();
         if (stage == 0) {
             int slot = List.of("normal", "missing", "corrupt").indexOf(parameter("version")) * 2 + (parameter("section").equals("sparse") ? 1 : 0);
-            ChunkPos pos = new ChunkPos(112 + slot, 112);
+            ChunkPos pos = new ChunkPos(4096 + slot * 32, 4096);
             targetLevel = level; targetChunk = pos;
+            require(TopologyTestBridge.invoke(level.getChunkSource().chunkMap, "getVisibleChunkIfPresent", pos.toLong()) == null,
+                    "seed position has no in-memory chunk holder");
             ProtoChunk proto = proto(level, false, pos);
             if (parameter("section").equals("sparse")) proto.setBlockState(new BlockPos(pos.getMinBlockX() + 1, 7, pos.getMinBlockZ() + 1), Blocks.STONE.defaultBlockState(), false);
             CompoundTag tag = ChunkSerializer.write(level, proto);
             if (parameter("version").equals("missing")) tag.remove("accelerated_navigation_facts_versions");
             else if (parameter("version").equals("corrupt")) tag.putString("accelerated_navigation_facts_versions", "invalid");
             ProtoChunk resumed = ChunkSerializer.read(level, level.getPoiManager(), pos, tag);
+            evidence.put("resumedIdentity", chunkIdentity(resumed));
             require((boolean) TopologyTestBridge.readField(state(resumed), "loadedFromDisk"), "NBT reload cannot inherit new-air baseline");
             for (int y : List.of(0, 15)) resumed.getSection(resumed.getSectionIndex(y)).setBlockState(1, y, 1, Blocks.STONE.defaultBlockState(), false);
             require(!state(resumed).versions().containsKey(0), "resumed write invalidates touched persisted section version");
             require(((Map<?, ?>) TopologyTestBridge.readField(state(resumed), "generatedCells")).isEmpty(), "sparse resumed writes never claim complete facts");
             CompoundTag saved = ChunkSerializer.write(level, resumed);
             ProtoChunk roundTrip = ChunkSerializer.read(level, level.getPoiManager(), pos, saved);
+            evidence.put("roundTripIdentity", chunkIdentity(roundTrip));
             long actual = state(roundTrip).versions().getOrDefault(0, -1L);
             require(actual == -1L, "invalidated version remains absent after second NBT round trip");
             if ("mutated".equals(options.control())) detectMutation(0 == actual, "persisted invalid version");
-            level.getChunkSource().chunkMap.write(pos, saved);
+            // Freeze the resumed payload as a complete world chunk; G02 separately exercises real generation.
+            CompoundTag baseline = ChunkSerializer.write(level, new LevelChunk(level, roundTrip, null));
+            seededChunk = new com.scarasol.acceleratednavigation.topology.TopologySeededChunkProbe(level, pos, baseline);
+            level.getChunkSource().chunkMap.write(pos, baseline);
+            level.getChunkSource().chunkMap.flushWorker();
             sectionProbe = TopologySectionEventProbe.watch(level.dimension(), net.minecraft.core.SectionPos.of(pos.x, 0, pos.z));
-            level.getChunk(pos.x, pos.z, ChunkStatus.FULL, true);
+            holdChunk(); tracked = level.getChunk(pos.x, pos.z);
+            seededChunk.verify(tracked);
+            evidence.put("seededDiskStateToken", TopologyValidationAccess.token(state(tracked)));
             evidence.put("chunkX", pos.x); evidence.put("chunkZ", pos.z); generationQueries = 0; stage = 1;
             return false;
         }
+        if (stage == 2 && !generationConsumer.future().isDone()) return false;
         Object loaded = sectionProbe.loaded(topology);
-        if (loaded == null || !(boolean) TopologyTestBridge.readField(loaded, "recoveryAttempted") || !targetSettled()) return false;
+        if (stage == 1 && (loaded == null || !(boolean) TopologyTestBridge.readField(loaded, "recoveryAttempted") || !targetSettled())) return false;
+        require(loaded != null && level.getChunkSource().getChunkNow(targetChunk.x, targetChunk.z) == tracked,
+                "the retained recovery load remains authoritative through its consumer terminal");
         long load = (long) TopologyTestBridge.readField(TopologyTestBridge.readField(loaded, "chunk"), "identity");
         require(!(boolean) TopologyTestBridge.readField(loaded, "recoveryFailed"), "partial reload recovery reaches one successful terminal");
         require(sectionProbe.scans().equals(Map.of(load, 1)), "partial reload has exactly one observed scan in its load identity");
@@ -326,7 +360,6 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
                     BaseClusterTopology.Channel.VOLUME, BaseClusterTopology.TraversalProfile.DEFAULT_GROUND, NavigationScheduler.Priority.ACTIVE);
             stage = 2; return false;
         }
-        if (!generationConsumer.future().isDone()) return false;
         generationConsumer.future().join();
         MacroSearch.Failure failure = generationConsumer.progress().failure();
         require(failure != MacroSearch.Failure.FACTS_RECOVERY_FAILED && failure != MacroSearch.Failure.FACTS_PERSISTENCE_UNAVAILABLE
@@ -509,32 +542,128 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
     }
 
     private void complete(String outcome, String reason, boolean reached) {
+        if (options.scenario().equals("H") && options.selection() != null) {
+            evidence.put("chunkTicketHeld", chunkTicket);
+            try {
+                if (handoff != null) evidence.put("handoffObservation", handoff.observation());
+                if (handoffFailure != null) evidence.put("handoffObservation", handoffFailure.observation());
+            } catch (RuntimeException failure) {
+                evidence.put("handoffObservationFailure", TerrainTestSupport.failureSummary(failure));
+                if ("PASS".equals(outcome)) { outcome = "FAIL"; reason = "HANDOFF_OBSERVATION_FAILED"; }
+            }
+        }
+        if (current.kind().equals("G04") || current.kind().equals("G05")) {
+            evidence.put("terminalIdentity", generationIdentity());
+            if (sectionProbe != null) {
+                evidence.put("scanCounts", sectionProbe.scans());
+                evidence.put("sectionPublications", sectionProbe.publications());
+            }
+        }
+        evidence.put("outerStage", stage); evidence.put("elapsedNanos", System.nanoTime() - targetStarted);
+        try {
+            if (endpointFailure != null) evidence.put("scenario", endpointFailure.observation());
+            if (mixedFailure != null) evidence.put("scenario", mixedFailure.observation());
+            if (finalResult != null) evidence.put("scenario", finalResult.observation());
+            if (requestLifecycle != null) evidence.put("scenario", requestLifecycle.observation());
+            if (connection != null) evidence.put("scenario", connection.observation());
+            if (derivedLifecycle != null) {
+                evidence.put("scenario", derivedLifecycle.observation());
+                reached = derivedLifecycle.controlReached(reached);
+                if (reached && "CONTROL_TIMEOUT".equals(reason)) outcome = "FAIL";
+            }
+            if (prewarm != null) evidence.put("scenario", prewarm.observation());
+            if (dependencyLimit != null) evidence.put("scenario", dependencyLimit.observation());
+            if (handoff != null) evidence.put("scenario", handoff.observation());
+            if (handoffFailure != null) evidence.put("scenario", handoffFailure.observation());
+        } catch (RuntimeException observationFailure) { evidence.put("observationFailure", observationFailure.toString()); }
         completedOutcome = outcome; completedReason = reason; completedReached = reached;
+        var terminal = new LinkedHashMap<String, Object>(evidence);
+        terminal.put("event", "control-before-cleanup"); terminal.put("id", current.id()); terminal.put("outcome", outcome); terminal.put("reason", reason);
+        journal.controlEvent(terminal);
         cleanupStarted = System.nanoTime();
-        if (generationCapture != null) { TopologyValidationAccess.endCapture(generationCapture); generationCapture = null; }
-        if (generationConsumer != null) { generationConsumer.cancel(); TopologyValidationAccess.forgetRequest(generationConsumer); generationConsumer = null; }
-        if (sectionProbe != null) { sectionProbe.close(); sectionProbe = null; }
-        if (handoff != null) { handoff.close(); handoff = null; }
-        if (handoffFailure != null) {
+        cleanupStep(() -> { if (generationCapture != null) { TopologyValidationAccess.endCapture(generationCapture); generationCapture = null; } });
+        cleanupStep(() -> { if (generationConsumer != null) { generationConsumer.cancel(); TopologyValidationAccess.forgetRequest(generationConsumer); generationConsumer = null; } });
+        cleanupStep(() -> { if (sectionProbe != null) { sectionProbe.close(); sectionProbe = null; } });
+        cleanupStep(() -> { if (handoff != null) { handoff.close(); handoff = null; } });
+        cleanupStep(() -> { if (handoffFailure != null) {
             handoffFailure.close(); pendingFaultEdit = handoffFailure.pendingDiskEdit(); handoffFailure = null;
-        }
-        if (endpointFailure != null) {
+        } });
+        cleanupStep(() -> { if (endpointFailure != null) {
             endpointFailure.close(); pendingFaultEdit = endpointFailure.pendingDiskEdit(); endpointFailure = null;
-        }
-        if (mixedFailure != null) {
+        } });
+        cleanupStep(() -> { if (mixedFailure != null) {
             mixedFailure.close(); pendingFaultEdit = mixedFailure.pendingDiskEdit(); mixedFailure = null;
-        }
-        if (finalResult != null) {
+        } });
+        cleanupStep(() -> { if (finalResult != null) {
             finalResult.close(); pendingFaultEdit = finalResult.pendingDiskEdit(); finalResult = null;
+        } });
+        cleanupStep(() -> { if (requestLifecycle != null) { requestLifecycle.close(); requestLifecycle = null; } });
+        cleanupStep(() -> { if (connection != null) { connection.close(); connection = null; } });
+        cleanupStep(() -> { if (derivedLifecycle != null) { derivedLifecycle.close(); pendingFaultEdit = derivedLifecycle.pendingDiskEdit(); derivedLifecycle = null; } });
+        cleanupStep(() -> { if (prewarm != null) { prewarm.close(); prewarm = null; } });
+        cleanupStep(() -> { if (shutdown != null) { shutdown.close(); shutdown = null; } });
+        cleanupStep(() -> { if (dependencyLimit != null) { dependencyLimit.close(); dependencyLimit = null; } });
+        cleanupStep(() -> { if (threading != null) { threading.close(); threading = null; } });
+        cleanupStep(() -> { if (seededChunk != null) { seededChunk.close(); seededChunk = null; } });
+        cleanupStep(() -> { if (current.kind().equals("G04")) TopologyGenerationProbe.clearHandoff(); });
+        cleanupStep(() -> { if (chunkTicket) {
+            targetLevel.getChunkSource().removeRegionTicket(net.minecraft.server.level.TicketType.FORCED, targetChunk, 0, targetChunk);
+            chunkTicket = false;
+        } });
+        tracked = null;
+    }
+
+    private void cleanupStep(Runnable action) {
+        try { action.run(); }
+        catch (RuntimeException | AssertionError failure) {
+            @SuppressWarnings("unchecked") var errors = (List<String>) evidence.computeIfAbsent("cleanupErrors", key -> new java.util.ArrayList<String>());
+            errors.add(failure.toString());
         }
-        if (requestLifecycle != null) { requestLifecycle.close(); requestLifecycle = null; }
-        if (connection != null) { connection.close(); connection = null; }
-        if (derivedLifecycle != null) { derivedLifecycle.close(); pendingFaultEdit = derivedLifecycle.pendingDiskEdit(); derivedLifecycle = null; }
-        if (prewarm != null) { prewarm.close(); prewarm = null; }
-        if (shutdown != null) { shutdown.close(); shutdown = null; }
-        if (dependencyLimit != null) { dependencyLimit.close(); dependencyLimit = null; }
-        if (threading != null) { threading.close(); threading = null; }
-        if (tracked != null) { TopologyService.onChunkUnloaded(targetLevel, tracked); tracked = null; }
+    }
+
+    private void holdChunk() {
+        if (chunkTicket) return;
+        targetLevel.getChunkSource().addRegionTicket(net.minecraft.server.level.TicketType.FORCED, targetChunk, 0, targetChunk);
+        chunkTicket = true;
+    }
+
+    private Map<String, Object> generationIdentity() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("stage", stage); result.put("serverTick", server.getTickCount());
+        result.put("elapsedNanos", System.nanoTime() - targetStarted);
+        if (tracked != null) result.put("writtenChunk", chunkIdentity(tracked));
+        if (targetLevel != null && targetChunk != null) {
+            LevelChunk live = targetLevel.getChunkSource().getChunkNow(targetChunk.x, targetChunk.z);
+            result.put("worldChunk", live == null ? null : chunkIdentity(live));
+            result.put("settlementBeforeCleanup", TopologyValidationAccess.chunkSettlement(
+                    topology, targetLevel.dimension(), Set.of(targetChunk.toLong())));
+        }
+        Object loaded = sectionProbe == null ? null : sectionProbe.loaded(topology);
+        if (loaded != null) {
+            Object owner = TopologyTestBridge.readField(loaded, "chunk");
+            result.put("trackedLoad", TopologyTestBridge.readField(owner, "identity"));
+            result.put("serviceChunk", chunkIdentity((ChunkAccess) TopologyTestBridge.readField(owner, "chunk")));
+            for (String field : List.of("version", "changedTick", "readInFlight", "readRequest", "persistencePending",
+                    "recoveryAttempted", "recoveryFailed", "persistenceUnavailable", "foregroundWaiters", "pendingChanges")) {
+                Object value = TopologyTestBridge.readField(loaded, field);
+                result.put(field, value instanceof Map<?, ?> map ? new LinkedHashMap<>(map) : value);
+            }
+        }
+        if (generationConsumer != null) {
+            result.put("consumerDone", generationConsumer.future().isDone());
+            result.put("consumerProgress", generationConsumer.progress());
+            result.put("consumerIdentity", TopologyValidationAccess.requestIdentity(generationConsumer));
+        }
+        return result;
+    }
+
+    private static Map<String, Object> chunkIdentity(ChunkAccess chunk) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("chunkToken", TopologyValidationAccess.token(chunk)); result.put("stateToken", TopologyValidationAccess.token(state(chunk)));
+        result.put("status", chunk.getStatus().toString()); result.put("versions", state(chunk).versions());
+        result.put("generationOwnerToken", TopologyValidationAccess.token(boundOwner(chunk, 0)));
+        for (String field : List.of("loadedFromDisk", "generationInitialized", "versionTagValid")) result.put(field, TopologyTestBridge.readField(state(chunk), field));
+        return result;
     }
 
     private void settle() {
@@ -542,22 +671,32 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
         Map<String, Object> cleanup = chunks.isEmpty() ? Map.of("settled", true)
                 : TopologyValidationAccess.chunkSettlement(topology, targetLevel.dimension(), chunks);
         boolean faultEditSettled = pendingFaultEdit == null || pendingFaultEdit.isDone();
-        boolean settled = Boolean.TRUE.equals(cleanup.get("settled")) && faultEditSettled;
+        if (pendingFaultEdit != null && pendingFaultEdit.isCompletedExceptionally()) {
+            try { pendingFaultEdit.join(); }
+            catch (RuntimeException failure) { evidence.put("faultEditFailure", TerrainTestSupport.failureSummary(failure)); }
+        }
+        boolean settled = Boolean.TRUE.equals(cleanup.get("settled")) && faultEditSettled
+                && !evidence.containsKey("cleanupErrors") && !evidence.containsKey("faultEditFailure");
         if (!settled && System.nanoTime() - cleanupStarted < 30_000_000_000L) return;
         evidence.put("cleanup", cleanup); evidence.put("faultEditSettled", faultEditSettled); evidence.put("cleaned", settled);
         evidence.put("outcome", settled ? completedOutcome : "FAIL");
         evidence.put("reason", settled ? completedReason : "CLEANUP_TIMEOUT");
         evidence.put("originalOutcome", completedOutcome); evidence.put("reached", completedReached);
         journal.control(current, evidence); current = null; completedOutcome = null; pendingFaultEdit = null;
-        if (!settled) { requestedStop = true; server.halt(false); }
+        if (!settled || stopAfterCleanup) { requestedStop = true; server.halt(false); }
     }
     @Override public void failAndStop(RuntimeException failure) {
         summary.put("failure", TerrainTestSupport.failureSummary(failure));
-        if (current != null) complete("FAIL", "HARNESS_EXCEPTION", false);
-        requestedStop = true; server.halt(false);
+        stopAfterCleanup = true;
+        if (current != null) {
+            if (completedOutcome == null) complete("FAIL", "HARNESS_EXCEPTION", false);
+        } else { requestedStop = true; server.halt(false); }
     }
     @Override public void serverStopping() {
-        if (shutdown == null) return;
+        if (shutdown == null) {
+            if (current != null && completedOutcome == null) complete("NOT_ENTERED", "SERVER_STOPPING", false);
+            return;
+        }
         try { shutdown.serverStopping(); }
         catch (RuntimeException | AssertionError failure) { evidence.putAll(shutdown.failure(failure)); shutdown.close(); }
     }
@@ -585,5 +724,6 @@ final class ProductionRemediationControls implements RealTerrainTopologyBenchmar
         summary.put("state", pending.isEmpty() && current == null ? "DATA_COMPLETE" : "DATA_PARTIAL");
         try { journal.finish(summary, "CONTROL_NOT_EXECUTED"); }
         catch (IOException failure) { throw new UncheckedIOException(failure); }
+        finally { com.scarasol.acceleratednavigation.topology.TopologyCausalityObservation.close(); }
     }
 }

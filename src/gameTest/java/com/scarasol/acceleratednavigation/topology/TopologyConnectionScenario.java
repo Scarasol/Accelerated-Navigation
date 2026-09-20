@@ -23,6 +23,7 @@ import static com.scarasol.acceleratednavigation.topology.TopologyTestBridge.*;
 public final class TopologyConnectionScenario implements AutoCloseable {
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final ProductionRemediationPlan.Target target;
     private final boolean mutated, volume, bands, allowed, unconditional;
     private final Direction direction;
@@ -38,7 +39,7 @@ public final class TopologyConnectionScenario implements AutoCloseable {
     private int stage, changedTick;
 
     public TopologyConnectionScenario(TopologyService service, ServerLevel level, ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; this.target = target; mutated = "mutated".equals(control);
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); this.target = target; mutated = "mutated".equals(control);
         volume = target.kind().equals("L01/volume"); bands = target.kind().startsWith("L02");
         direction = Direction.byName(target.parameters().get("direction"));
         if (direction == null) throw new IllegalArgumentException("missing direction");
@@ -78,9 +79,10 @@ public final class TopologyConnectionScenario implements AutoCloseable {
                 "staticEvidence", Map.of("path", "src/main/java/com/scarasol/acceleratednavigation/topology/BaseClusterTopology.java",
                         "relationship", "Component flood fill retains unit flat movement even for MovementKey(0,0,0)"));
         if (stage == 0) {
+            tickets.hold(chunkPositions());
             for (SectionPos section : sections) {
                 LevelChunk chunk = chunks.computeIfAbsent(section.chunk().toLong(), ignored -> {
-                    LevelChunk loaded = level.getChunk(section.x(), section.z()); TopologyService.onChunkLoaded(level, loaded); return loaded;
+                    LevelChunk loaded = level.getChunk(section.x(), section.z()); tickets.loaded(loaded); return loaded;
                 });
                 for (int y = 0; y < 16; y++) for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++) {
                     chunk.setBlockState(new BlockPos(section.minBlockX() + x, section.minBlockY() + y, section.minBlockZ() + z),
@@ -297,9 +299,17 @@ public final class TopologyConnectionScenario implements AutoCloseable {
     private boolean settled() { return Boolean.TRUE.equals(TopologyValidationAccess.chunkSettlement(service, level.dimension(), chunkPositions()).get("settled")); }
     private static void verifyRelation(boolean actual, boolean expected, String message) { require(actual == expected, message); }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
+    public Map<String, Object> observation() {
+        var result = new LinkedHashMap<String, Object>(evidence);
+        result.put("stage", stage); result.put("tickets", tickets.held());
+        result.put("requests", TopologyValidationAccess.requestState(query));
+        return result;
+    }
     @Override public void close() {
-        if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); query = null; }
-        for (LevelChunk chunk : chunks.values()) TopologyService.onChunkUnloaded(level, chunk);
-        chunks.clear(); bases.clear();
+        try {
+            if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); query = null; }
+            for (LevelChunk chunk : chunks.values()) tickets.unload(chunk);
+            chunks.clear(); bases.clear();
+        } finally { tickets.close(); }
     }
 }

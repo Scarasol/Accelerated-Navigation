@@ -21,6 +21,7 @@ import static com.scarasol.acceleratednavigation.topology.TopologyTestBridge.*;
 public final class TopologyHandoffFailureScenario implements AutoCloseable {
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final ProductionRemediationPlan.Target target;
     private final boolean mutated, writeFailure, recoveryFailure;
     private final SectionPos section = SectionPos.of(100, 12, 100);
@@ -39,7 +40,7 @@ public final class TopologyHandoffFailureScenario implements AutoCloseable {
 
     public TopologyHandoffFailureScenario(TopologyService service, ServerLevel level,
                                           ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; this.target = target;
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); this.target = target;
         mutated = "mutated".equals(control); writeFailure = target.kind().equals("H03");
         recoveryFailure = target.kind().equals("H02/recovery") && !"collision".equals(parameter("fault"));
         key = new TopologyWorkerRuntime.ClusterKey(level.dimension(), section); runtime = readField(service, "runtime");
@@ -53,23 +54,15 @@ public final class TopologyHandoffFailureScenario implements AutoCloseable {
         Object section = loaded();
         return section != null && (boolean) invoke(service, "recoveryQueued", section);
     }
-    SectionPos shutdownSection() { return section; }
     boolean prepareRecoveryShutdown(String window) {
         if (stage < 5) { tick(); return false; }
-        if (!window.startsWith("queued")) {
-            if (!queriesDone() || !settled()) return false;
-            verifyQueries(MacroSearch.Failure.NONE);
-            require(count(fault.snapshot(), "scans") == 1 && count(fault.snapshot(), "publications") == 1,
-                    "one synchronous recovery reaches scan and publication before shutdown");
-            return true;
-        }
         if (!shutdownIntervened) {
             if (!recoveryQueuedForShutdown() || (int) readField(loaded(), "foregroundWaiters") == 0) return false;
             require(count(fault.snapshot(), "scans") == 0, "the actual recovery remains queued and has not scanned");
             evidence.put("queuedRecovery", Map.of("load", load, "version", version,
                     "foregroundWaiters", readField(loaded(), "foregroundWaiters"), "fault", fault.snapshot()));
             if (window.equals("queued-cancel")) queries.forEach(TopologyService.MacroRequest::cancel);
-            if (window.equals("queued-unload")) TopologyService.onChunkUnloaded(level, chunk);
+            if (window.equals("queued-unload")) tickets.unload(chunk);
             shutdownIntervened = true;
         }
         if (window.equals("queued-cancel")) {
@@ -94,8 +87,9 @@ public final class TopologyHandoffFailureScenario implements AutoCloseable {
     public Map<String, Object> tick() {
         if (closed) throw new IllegalStateException("closed fault scenario");
         if (stage == 0) {
+            tickets.hold(Set.of(chunkPosition().toLong()));
             chunk = level.getChunk(section.x(), section.z());
-            TopologyService.onChunkLoaded(level, chunk);
+            tickets.loaded(chunk);
             for (int y = 0; y < 4; y++) for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++) {
                 chunk.setBlockState(at(x, y, z), y == 0 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(), false);
             }
@@ -105,7 +99,15 @@ public final class TopologyHandoffFailureScenario implements AutoCloseable {
         }
         if (stage == 1) {
             if (!nextTick() || !settled()) return null;
-            TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk);
+            Object preparation = loaded();
+            require(preparation != null, "preparation retains its loaded section");
+            BaseClusterTopology.PackedFacts complete = facts();
+            if (complete == null || (boolean) readField(preparation, "persistencePending")) return null;
+            require(!(boolean) readField(preparation, "persistenceUnavailable"), "preparation baseline was persisted successfully");
+            evidence.put("preparationBaseline", Map.of("load", readField(readField(preparation, "chunk"), "identity"),
+                    "version", readField(preparation, "version"), "factsToken", TopologyValidationAccess.token(complete),
+                    "persistencePending", false, "recoveryAttempted", readField(preparation, "recoveryAttempted")));
+            tickets.unload(chunk); tickets.loaded(chunk);
             stage = 2; return null;
         }
         if (stage == 2) {
@@ -206,6 +208,16 @@ public final class TopologyHandoffFailureScenario implements AutoCloseable {
             if (!queriesDone() || !settled()) return null;
             verifyQueries(stage == 13 ? MacroSearch.Failure.FACTS_RECOVERY_FAILED : MacroSearch.Failure.FACTS_PERSISTENCE_UNAVAILABLE);
             require(count(fault.snapshot(), "scans") == (writeFailure ? 0 : 1), "ordinary changes and repeated queries cannot rescan");
+            if (stage == 13) {
+                Map<String, Object> failed = TopologyHandoffScenario.sectionObservation(service, level, section, chunk, load);
+                Map<?, ?> worker = (Map<?, ?>) failed.get("runtime");
+                require(Long.valueOf(load).equals(failed.get("currentLoad")) && Long.valueOf(load).equals(worker.get("loadIdentity"))
+                        && failed.get("version").equals(worker.get("revision")), "recovery failure tracks the current world load and version");
+                require("RECOVERY_FAILED".equals(worker.get("factState").toString()) && Boolean.FALSE.equals(failed.get("persistencePending"))
+                        && Boolean.FALSE.equals(worker.get("writeRequired")) && Long.valueOf(0).equals(worker.get("tailToken")),
+                        "terminal recovery failure retains no unformable tail or current-version write work");
+                evidence.put("failedVersionSettlement", failed);
+            }
             if (writeFailure) {
                 fault.fault(null);
                 chunk.setBlockState(at(2, 1, 1), Blocks.STONE.defaultBlockState(), false);
@@ -240,7 +252,7 @@ public final class TopologyHandoffFailureScenario implements AutoCloseable {
         require(facts() == null, "the original cache owner evicted complete target facts");
         ((TopologyStore) readField(service, "store")).unload(level.dimension(), section.chunk());
     }
-    private void reload() { fault.fault(null); TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk); }
+    private void reload() { fault.fault(null); tickets.unload(chunk); tickets.loaded(chunk); }
     private void requestPair() {
         queries.clear();
         for (int i = 0; i < 2; i++) queries.add(service.requestMacroQuery(level, UUID.randomUUID(), at(6, 1, 6), at(8, 1, 6),
@@ -269,6 +281,27 @@ public final class TopologyHandoffFailureScenario implements AutoCloseable {
         }
         evidence.put("outcome", "PASS"); return Map.copyOf(evidence);
     }
+    public Map<String, Object> observation() {
+        Map<String, Object> result = TopologyHandoffScenario.sectionObservation(service, level, section, chunk, load);
+        result.put("stage", stage); result.put("changedTick", changedTick); result.put("baselineVersion", version);
+        result.put("phase", switch (stage) {
+            case 0 -> "prepare-blocks"; case 1 -> "preparation-settlement"; case 2 -> "reloaded-baseline";
+            case 3, 7 -> "disk-fault-edit"; case 4 -> "next-tick-before-query";
+            case 5 -> "first-query-and-fault-verification"; case 6 -> "new-version-settlement";
+            case 8 -> "exhausted-read-query"; case 9, 11 -> "next-change-settlement";
+            case 10, 13 -> "terminal-remains-failed"; case 12 -> "fresh-load-settlement";
+            case 14 -> "evicted-write-verification"; default -> "reloaded-query";
+        });
+        result.put("evidence", new LinkedHashMap<>(evidence));
+        result.put("diskEditPresent", diskEdit != null);
+        if (diskEdit != null) {
+            result.put("diskEditDone", diskEdit.isDone()); result.put("diskEditExceptional", diskEdit.isCompletedExceptionally());
+        }
+        if (fault != null) result.put("fault", fault.snapshot());
+        if (handoffs != null) result.put("handoffs", handoffs.events());
+        result.put("queries", queries.stream().map(TopologyHandoffScenario::queryObservation).toList());
+        return result;
+    }
     private Object loaded() { return ((Map<?, ?>) readField(service, "loadedSections")).get(key); }
     private BaseClusterTopology.PackedFacts facts() {
         synchronized (readField(runtime, "runtimeLock")) {
@@ -290,11 +323,13 @@ public final class TopologyHandoffFailureScenario implements AutoCloseable {
     private static int count(Map<String, Object> values, String key) { return ((Number) values.get(key)).intValue(); }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
     @Override public void close() {
-        if (closed) return;
-        closed = true;
-        for (var query : queries) { if (!query.future().isDone()) query.cancel(); TopologyValidationAccess.forgetRequest(query); }
-        if (fault != null) fault.close();
-        if (handoffs != null) handoffs.close();
-        if (chunk != null) TopologyService.onChunkUnloaded(level, chunk);
+        try {
+            if (closed) return;
+            closed = true;
+            for (var query : queries) { if (!query.future().isDone()) query.cancel(); TopologyValidationAccess.forgetRequest(query); }
+            if (fault != null) fault.close();
+            if (handoffs != null) handoffs.close();
+            if (chunk != null) tickets.unload(chunk);
+        } finally { tickets.close(); }
     }
 }

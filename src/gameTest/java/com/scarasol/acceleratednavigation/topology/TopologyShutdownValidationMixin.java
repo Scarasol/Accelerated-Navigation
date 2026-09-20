@@ -1,4 +1,6 @@
-package com.scarasol.acceleratednavigation.topology;
+package com.scarasol.acceleratednavigation.gametest.mixin;
+
+import com.scarasol.acceleratednavigation.topology.*;
 
 import java.io.IOException;
 import org.spongepowered.asm.mixin.Mixin;
@@ -9,7 +11,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-@Mixin(value = TopologyStore.class, remap = false)
+@Mixin(targets = "com.scarasol.acceleratednavigation.topology.TopologyStore", remap = false)
 abstract class TopologyShutdownValidationMixin {
     @Inject(method = "requestSave", at = @At("RETURN"))
     private void requested(net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimension, CallbackInfo callback) {
@@ -36,7 +38,7 @@ abstract class TopologyShutdownValidationMixin {
         TopologyFlushWindowProbe.point(this, dimension, "complete");
     }
     @Inject(method = "accept", at = @At("HEAD"))
-    private void accepting(TopologyWorkerRuntime.FactDecision decision, CallbackInfoReturnable<TopologyStore.WriteReceipt> callback) {
+    private void accepting(@Coerce Object decision, CallbackInfoReturnable<?> callback) {
         TopologyShutdownScenario.accepting(this, decision);
     }
     @Inject(method = "writeChunkRecord", at = @At(value = "INVOKE", target = "Ljava/io/DataOutputStream;writeInt(I)V", ordinal = 0))

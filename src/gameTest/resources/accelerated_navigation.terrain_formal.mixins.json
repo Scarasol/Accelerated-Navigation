@@ -6,6 +6,10 @@
   "refmap": "accelerated_navigation.terrain_benchmark.refmap.json",
   "mixins": [
     "TopologyServiceFormalControlMixin",
+    "TopologyRequestCompletionMixin",
+    "TopologyRequestSegmentMixin$ServiceRequest",
+    "TopologyRequestSegmentMixin$WorkerFlight",
+    "TopologyRequestSegmentMixin$WorkerRequest",
     "TopologyWorkerRuntimeFormalControlMixin"
   ],
   "injectors": {

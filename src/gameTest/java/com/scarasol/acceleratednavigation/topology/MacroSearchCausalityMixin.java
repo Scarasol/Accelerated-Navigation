@@ -18,6 +18,7 @@ abstract class MacroSearchCausalityMixin {
     }
     @Inject(method = "step", at = @At("RETURN"))
     private void observeTerminal(int budget, CallbackInfoReturnable<ResumableSearch.Status> callback) {
+        if (acceleratedNavigation$step == null) return;
         TopologyCausalityObservation.end(acceleratedNavigation$step, java.util.Map.of("budget", budget, "status", callback.getReturnValue()));
         acceleratedNavigation$step = null;
         TopologyCausalityObservation.searchTerminal((MacroSearch) (Object) this);

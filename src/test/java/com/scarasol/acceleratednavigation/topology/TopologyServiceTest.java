@@ -28,6 +28,8 @@ class TopologyServiceTest {
     @Test
     void minecraftCollisionShapesProduceConservativeTopologyFlags() {
         assertEquals(0, classify(Blocks.STONE.defaultBlockState()));
+        assertEquals(11, classify(Blocks.SOUL_SAND.defaultBlockState()));
+        assertEquals(7, classify(Blocks.LAVA.defaultBlockState()));
         int air = classify(Blocks.AIR.defaultBlockState());
         assertTrue((air & BaseClusterTopology.VOLUME_OPEN) != 0);
         assertEquals(0, air & BaseClusterTopology.EXACT_REQUIRED);
@@ -93,11 +95,11 @@ class TopologyServiceTest {
         assertEquals(3, facts.flags(BaseClusterTopology.cellIndex(0, 1, 0)));
         BlockState waterlogged = Blocks.OAK_SLAB.defaultBlockState()
                 .setValue(BlockStateProperties.WATERLOGGED, true);
-        waterlogged.initCache();
         assertEquals(expected | BaseClusterTopology.FLUID, classify(waterlogged));
     }
 
     private static int classify(BlockState state) {
+        state.initCache();
         return (int) TopologyService.sampleColumnFacts(new SingleStateGetter(state),
                 BlockPos.ZERO) & 0xFF;
     }

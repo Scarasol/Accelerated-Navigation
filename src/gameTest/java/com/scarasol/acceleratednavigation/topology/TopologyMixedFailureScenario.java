@@ -25,6 +25,7 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
     private static final List<SectionPos> SECTIONS = List.of(SectionPos.of(0, 0, 0), SectionPos.of(1, 0, 0), SectionPos.of(0, 0, 1));
     private final TopologyService service;
     private final ServerLevel level;
+    private final TopologyValidationAccess.ScenarioTickets tickets;
     private final Object runtime;
     private final ProductionRemediationPlan.Target target;
     private final boolean alternative, rejected, nodeControl, mutated;
@@ -37,14 +38,15 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
     private final List<Candidate> candidates = new ArrayList<>();
     private final Map<String, Object> evidence = new LinkedHashMap<>();
     private TopologyService.MacroRequest query;
+    private TopologyValidationAccess.FactsLease preparationFacts;
     private MacroSearch search;
     private boolean armed, closed, released;
     private int stage, changedTick, next;
 
     public TopologyMixedFailureScenario(TopologyService service, ServerLevel level, ProductionRemediationPlan.Target target, String control) {
-        this.service = service; this.level = level; this.target = target; runtime = readField(service, "runtime");
+        this.service = service; this.level = level; tickets = new TopologyValidationAccess.ScenarioTickets(level); this.target = target; runtime = readField(service, "runtime");
         alternative = target.kind().equals("F03/alternative"); rejected = target.kind().equals("F03/rejected");
-        nodeControl = target.kind().equals("F02/node-tie"); mutated = control.equals("mutated");
+        nodeControl = target.kind().equals("F02/node-tie"); mutated = "mutated".equals(control);
         if (target.parameters().containsKey("placement")) {
             String[] placement = target.parameters().get("placement").split(",");
             for (int index = 0; index < placement.length; index++) reasons.put(SECTIONS.get(index), placement[index]);
@@ -74,11 +76,12 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
 
     public Map<String, Object> tick() {
         if (stage == 0) {
+            tickets.hold(chunkPositions());
             List<Long> positions = new ArrayList<>(chunkPositions()); positions.sort(Long::compare);
             if ("reverse".equals(target.parameters().get("order"))) java.util.Collections.reverse(positions);
             for (long packed : positions) {
                 ChunkPos pos = new ChunkPos(packed); LevelChunk chunk = level.getChunk(pos.x, pos.z); chunks.put(packed, chunk);
-                TopologyService.onChunkLoaded(level, chunk);
+                tickets.loaded(chunk);
                 for (int y = 0; y < 16; y++) for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++) {
                     chunk.setBlockState(new BlockPos(pos.getMinBlockX() + x, y, pos.getMinBlockZ() + z), Blocks.STONE.defaultBlockState(), false);
                 }
@@ -98,9 +101,18 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
             changedTick = level.getServer().getTickCount(); stage = 1; return null;
         }
         if (stage == 1) {
-            if (level.getServer().getTickCount() <= changedTick || !settled()) return null;
+            if (preparationFacts == null) {
+                if (level.getServer().getTickCount() <= changedTick || !settled()) return null;
+                preparationFacts = TopologyValidationAccess.factsLease(service);
+            }
+            Set<SectionPos> sections = chunks.values().stream().map(chunk -> SectionPos.of(chunk.getPos().x, 0, chunk.getPos().z))
+                    .collect(java.util.stream.Collectors.toSet());
+            var missing = TopologyValidationAccess.prepareFacts(service, level.dimension(), preparationFacts, sections);
+            evidence.put("preparationMissing", missing);
+            if (!missing.isEmpty()) return null;
             verifyCells();
-            for (LevelChunk chunk : chunks.values()) { TopologyService.onChunkUnloaded(level, chunk); TopologyService.onChunkLoaded(level, chunk); }
+            preparationFacts.close(); preparationFacts = null;
+            for (LevelChunk chunk : chunks.values()) { tickets.unload(chunk); tickets.loaded(chunk); }
             stage = 2; return null;
         }
         if (stage == 2) {
@@ -115,6 +127,9 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
             query = service.requestMacroQuery(level, UUID.randomUUID(), START, GOAL, BaseClusterTopology.Channel.GROUND,
                     BaseClusterTopology.TraversalProfile.DEFAULT_GROUND, NavigationScheduler.Priority.ACTIVE);
             stage = 3; return null;
+        }
+        if ("harness-exception".equals(target.parameters().get("qualification"))) {
+            throw new IllegalStateException("QF05 deliberate harness exception with an owned request and scene");
         }
         if (!query.future().isDone()) return null;
         boolean success = query.future().join() != null;
@@ -193,7 +208,7 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
     private boolean matches(Object query) {
         return armed && !closed && readField(query, "this$0") == runtime && START.equals(readField(query, "startPosition")) && GOAL.equals(readField(query, "goalPosition"));
     }
-    static void created(Object query) {
+    public static void created(Object query) {
         var probe = active; if (probe == null) return;
         synchronized (probe) {
             if (!probe.matches(query)) return;
@@ -201,7 +216,7 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
             probe.search = (MacroSearch) readField(query, "search");
         }
     }
-    static List<?> resolutions(Object query, List<?> original) {
+    public static List<?> resolutions(Object query, List<?> original) {
         var probe = active; if (probe == null) return original;
         synchronized (probe) {
             if (!probe.matches(query) || probe.search == null || probe.rejected || probe.released) return original;
@@ -223,7 +238,8 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
             return List.copyOf(available);
         }
     }
-    static void unavailable(MacroSearch search, MacroSearch.DependencyKey key, MacroSearch.Unavailability reason) {
+    public static void unavailable(MacroSearch search, MacroSearch.DependencyKey key, Object value) {
+        var reason = (MacroSearch.Unavailability) value;
         var probe = active;
         int repeat = 1;
         if (probe != null) synchronized (probe) {
@@ -231,7 +247,8 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
                 @SuppressWarnings("unchecked") Map<MacroSearch.DependencyKey, Set<?>> waiting = (Map<MacroSearch.DependencyKey, Set<?>>) readField(search, "waitingByDependency");
                 Set<?> nodes = waiting.get(key); require(nodes != null && !nodes.isEmpty(), "the real notification reaches an actual blocked dependency");
                 for (Object node : nodes) {
-                    float f = (float) readField(node, "f"), g = (float) readField(node, "g"), h = (float) readField(node, "h");
+                    var mappedNode = (net.minecraft.world.level.pathfinder.Node) node;
+                    float f = mappedNode.f, g = mappedNode.g, h = mappedNode.h;
                     require(Float.isFinite(f) && Float.compare(f, g + (float) readField(search, "weight") * h) == 0, "observed f preserves the production node's g/weight/h relationship");
                     require(probe.candidates.size() < 64, "blocked candidate observation is bounded");
                     probe.candidates.add(new Candidate(f, g, h, reason.reason(), reason.section(), source((MacroSearch.Endpoint) readField(node, "endpoint"))));
@@ -243,14 +260,14 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
         }
         for (int index = 0; index < repeat; index++) search.dependencyUnavailable(key, reason);
     }
-    static void requested(Object query, MacroSearch.DependencyKey key) {
+    public static void requested(Object query, MacroSearch.DependencyKey key) {
         var probe = active; if (probe == null) return;
         synchronized (probe) {
             if (!probe.matches(query)) return;
             require(probe.requested.size() < 256, "dependency observation is bounded"); probe.requested.add(key);
         }
     }
-    static void sourceExit(Object graph, SectionPos neighbor, boolean allowed) {
+    public static void sourceExit(Object graph, SectionPos neighbor, boolean allowed) {
         var probe = active; if (probe == null || allowed) return;
         synchronized (probe) {
             if (!probe.armed || probe.closed || readField(graph, "this$0") != probe.runtime || !probe.reasons.containsKey(neighbor)) return;
@@ -280,12 +297,21 @@ public final class TopologyMixedFailureScenario implements AutoCloseable {
             .thenComparingInt(value -> value.section().x()).thenComparingInt(value -> value.section().y()).thenComparingInt(value -> value.section().z())
             .thenComparing(Candidate::source, SOURCE_ORDER);
 
+    public Map<String, Object> observation() {
+        var result = new LinkedHashMap<String, Object>(evidence);
+        result.put("stage", stage); result.put("tickets", tickets.held());
+        result.put("requests", TopologyValidationAccess.requestState(query));
+        return result;
+    }
     @Override public void close() {
-        synchronized (this) { closed = true; armed = false; }
-        inputs.forEach(TopologySectionFailureInput::close);
-        if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); }
-        chunks.values().forEach(chunk -> TopologyService.onChunkUnloaded(level, chunk));
-        synchronized (TopologyMixedFailureScenario.class) { if (active == this) active = null; }
+        try {
+            synchronized (this) { closed = true; armed = false; }
+            if (preparationFacts != null) { preparationFacts.close(); preparationFacts = null; }
+            inputs.forEach(TopologySectionFailureInput::close);
+            if (query != null) { query.cancel(); TopologyValidationAccess.forgetRequest(query); }
+            chunks.values().forEach(chunk -> tickets.unload(chunk));
+            synchronized (TopologyMixedFailureScenario.class) { if (active == this) active = null; }
+        } finally { tickets.close(); }
     }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
 }

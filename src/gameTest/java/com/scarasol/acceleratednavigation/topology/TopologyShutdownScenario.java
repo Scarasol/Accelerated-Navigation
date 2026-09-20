@@ -33,7 +33,6 @@ public final class TopologyShutdownScenario implements AutoCloseable {
     private int writeFailures, acceptanceRejections, controlRejections, cleanupFailures;
     private boolean releaseWrite;
     private boolean recoveryReleased;
-    private final List<Map<String, Object>> recoveryStages = new ArrayList<>();
     private TopologyFlushWindowProbe flushProbe;
     private int flushStage;
 
@@ -80,12 +79,6 @@ public final class TopologyShutdownScenario implements AutoCloseable {
         if (recovery != null) {
             if (!recovery.prepareRecoveryShutdown(target.parameters().get("window"))) return false;
             evidence.put("controlledWindow", recovery.recoveryShutdownEvidence());
-            if (!target.parameters().get("window").startsWith("queued")) {
-                require(recoveryStages.size() == 2, "both synchronous recovery stages were observed on the server thread");
-                evidence.put("staticEvidence", Map.of("source", "TopologyService.runOneRecovery -> scanSection -> writeFull; beginStopping requires the same server thread",
-                        "reason", "scan and publication have no queue or yield between them and cannot overlap ServerStopping",
-                        "observedStages", List.copyOf(recoveryStages)));
-            }
         } else if (target.kind().equals("W08")) {
             if (!prepareFlush()) return false;
         } else if (target.kind().equals("W06")) {
@@ -136,12 +129,7 @@ public final class TopologyShutdownScenario implements AutoCloseable {
         }
         if (!flushProbe.reached()) return false;
         Map<String, Object> before = flushProbe.evidence(); evidence.put("flushBeforeStop", before);
-        if (window.equals("completion-before-callback")) {
-            require(((Number) before.get("completed")).intValue() == 1, "the real flush completed");
-            evidence.put("staticEvidence", Map.of("source", "TopologyService.onLevelSave -> TopologyStore.requestSave -> runRequestedFlush",
-                    "reason", "requestSave and runRequestedFlush return void and register no completion or server callback; the callback window does not exist",
-                    "observedFlush", before));
-        } else require(((Number) before.get("completed")).intValue() == 0, "unrelated saving cannot complete the paused target");
+        require(((Number) before.get("completed")).intValue() == 0, "unrelated saving cannot complete the paused target");
         evidence.put("controlledWindow", handoff.shutdownEvidence()); return true;
     }
     public void serverStopping() {
@@ -181,7 +169,7 @@ public final class TopologyShutdownScenario implements AutoCloseable {
         }
         if (recovery != null) {
             Map<?, ?> fault = (Map<?, ?>) recovery.recoveryShutdownEvidence().get("faultObservations");
-            require(((Number) fault.get("scans")).intValue() == (target.parameters().get("window").startsWith("queued") ? 0 : 1),
+            require(((Number) fault.get("scans")).intValue() == 0,
                     "stopping never starts a queued recovery or repeats a completed recovery");
         }
         if ("reject".equals(target.parameters().get("submission"))) require(acceptanceRejections == 1, "the actual acceptance rejection was reached once");
@@ -205,14 +193,21 @@ public final class TopologyShutdownScenario implements AutoCloseable {
             try { verifyClosed(altered); } catch (AssertionError expected) { detected = true; }
             require(detected, "the shutdown validator rejects a surviving worker"); evidence.put("mutationDetected", true);
         }
-        evidence.put("outcome", evidence.containsKey("staticEvidence") ? "NOT_APPLICABLE" : "PASS");
-        evidence.put("reached", !evidence.containsKey("staticEvidence")); evidence.put("cleaned", true);
+        evidence.put("outcome", "PASS"); evidence.put("reached", true); evidence.put("cleaned", true);
         return Map.copyOf(evidence);
     }
     public Map<String, Object> failure(Throwable failure) {
         evidence.put("outcome", "FAIL"); evidence.put("reason", "SHUTDOWN_ASSERTION_OR_EXCEPTION");
         evidence.put("failure", failure.toString()); evidence.put("reached", armed); evidence.put("cleaned", false);
-        evidence.put("lifecycle", List.copyOf(lifecycle)); return Map.copyOf(evidence);
+        evidence.put("lifecycle", List.copyOf(lifecycle));
+        try {
+            if (finalResult != null) evidence.put("scenarioAtFailure", finalResult.observation());
+            if (derived != null) evidence.put("scenarioAtFailure", derived.observation());
+            if (handoff != null) evidence.put("scenarioAtFailure", handoff.observation());
+            if (recovery != null) evidence.put("scenarioAtFailure", recovery.observation());
+            if (flushProbe != null) evidence.put("flushAtFailure", flushProbe.evidence());
+        } catch (RuntimeException snapshotFailure) { evidence.put("failureSnapshotError", snapshotFailure.toString()); }
+        return Map.copyOf(evidence);
     }
     private Map<String, Object> finalState() {
         Map<String, Object> result = new LinkedHashMap<>();
@@ -242,17 +237,17 @@ public final class TopologyShutdownScenario implements AutoCloseable {
     }
     private void record(String event) { lifecycle.add(Map.of("event", event, "nanoTime", System.nanoTime(), "thread", Thread.currentThread().getName())); }
     private boolean directStopped() { return "direct-stopped".equals(target.parameters().get("fault")); }
-    static boolean bypassStopping(net.minecraft.server.MinecraftServer server) {
+    public static boolean bypassStopping(net.minecraft.server.MinecraftServer server) {
         var scenario = active;
         return scenario != null && scenario.armed && scenario.directStopped() && scenario.level.getServer() == server;
     }
-    static void finalStopping(Object service) {
+    public static void finalStopping(Object service) {
         var scenario = active;
         if (scenario != null && scenario.armed && scenario.service == service && scenario.directStopped()) {
             scenario.record("final-stop-supplements-beginStopping"); scenario.release();
         }
     }
-    static void submittingControl(Object executor) {
+    public static void submittingControl(Object executor) {
         var scenario = active;
         if (scenario == null || !scenario.armed || scenario.stopped || readField(scenario.runtime, "taskExecutor") != executor
                 || !"queue-rejection".equals(scenario.target.parameters().get("fault"))) return;
@@ -262,30 +257,21 @@ public final class TopologyShutdownScenario implements AutoCloseable {
         }
         throw new java.util.concurrent.RejectedExecutionException("W09 actual closing control submission rejected");
     }
-    static boolean holdRecovery(Object owner) {
+    public static boolean holdRecovery(Object owner) {
         var scenario = active;
         return scenario != null && scenario.service == owner && scenario.recovery != null && !scenario.recoveryReleased
                 && scenario.target.parameters().get("window").startsWith("queued")
                 && scenario.recovery.holdRecoveryForShutdown() && scenario.recovery.recoveryQueuedForShutdown();
     }
-    static void recoveryStage(Object owner, Object section, String point) {
-        var scenario = active;
-        if (scenario == null || scenario.service != owner || scenario.recovery == null
-                || !scenario.recovery.holdRecoveryForShutdown()
-                || !scenario.recovery.shutdownSection().equals(((TopologyWorkerRuntime.ClusterKey) readField(section, "key")).section())) return;
-        require(scenario.level.getServer().isSameThread(), "recovery and stopping use the same server thread");
-        require(!(boolean) readField(owner, "stopping"), "the synchronous recovery stage precedes stopping");
-        scenario.recoveryStages.add(Map.of("point", point, "thread", Thread.currentThread().getName(),
-                "nanoTime", System.nanoTime(), "loadIdentity", readField(readField(section, "chunk"), "identity")));
-    }
-    static void cleaning(Object store) throws IOException {
+    public static void cleaning(Object store) throws IOException {
         var scenario = active;
         if (scenario == null || !scenario.armed || scenario.store != store
                 || !"cleanup-exception".equals(scenario.target.parameters().get("fault")) || scenario.cleanupFailures != 0) return;
         scenario.cleanupFailures++;
         throw new IOException("W09 actual final region flush failure");
     }
-    static void accepting(Object owner, TopologyWorkerRuntime.FactDecision decision) {
+    public static void accepting(Object owner, Object operation) {
+        var decision = (TopologyWorkerRuntime.FactDecision) operation;
         var scenario = active;
         if (scenario == null || !scenario.armed || scenario.stopped || owner != scenario.store || scenario.handoff == null
                 || !scenario.handoff.section().equals(decision.key().section()) || scenario.handoff.loadIdentity() != decision.loadIdentity()) return;
@@ -294,7 +280,7 @@ public final class TopologyShutdownScenario implements AutoCloseable {
             throw new java.util.concurrent.RejectedExecutionException("W02 actual store submission rejected");
         }
     }
-    static void writing(Object owner, Object chunkKey) throws IOException {
+    public static void writing(Object owner, Object chunkKey) throws IOException {
         var scenario = active;
         if (scenario == null || !scenario.armed || scenario.stopped || owner != scenario.store || scenario.handoff == null
                 || !scenario.level.dimension().equals(readField(chunkKey, "dimension"))

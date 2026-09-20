@@ -23,6 +23,7 @@ public final class TopologyDerivedLifecycleScenario implements AutoCloseable {
     private final boolean mutated, replaced;
     private final BlockPos start, goal;
     private final Map<Long, LevelChunk> chunks = new LinkedHashMap<>();
+    private final Set<Long> tickets = new java.util.HashSet<>();
     private final Map<String, Object> evidence = new LinkedHashMap<>();
     private final TopologyFinalResultScenario finalResult;
     private TopologyBuildWindowProbe probe;
@@ -65,7 +66,10 @@ public final class TopologyDerivedLifecycleScenario implements AutoCloseable {
         if (finalResult != null) return finalResult.tick();
         if (stage == 0) {
             for (long position : chunkPositions()) {
-                ChunkPos pos = new ChunkPos(position); LevelChunk chunk = level.getChunk(pos.x, pos.z);
+                ChunkPos pos = new ChunkPos(position);
+                level.getChunkSource().addRegionTicket(net.minecraft.server.level.TicketType.FORCED, pos, 0, pos);
+                tickets.add(position);
+                LevelChunk chunk = level.getChunk(pos.x, pos.z);
                 chunks.put(position, chunk); TopologyService.onChunkLoaded(level, chunk);
                 for (int x = 0; x < 16; x++) for (int z = 0; z < 16; z++) for (int y = 288; y <= 292; y++) {
                     chunk.setBlockState(new BlockPos(pos.getMinBlockX() + x, y, pos.getMinBlockZ() + z),
@@ -111,7 +115,10 @@ public final class TopologyDerivedLifecycleScenario implements AutoCloseable {
         if (stage == 4) {
             if (level.getServer().getTickCount() <= changedTick) return null;
             if (replaced) {
-                replacement = request(); stage = 5; return null;
+                BlockPos replacementGoal = window.equals("parent-boundary/replaced") ? goal.offset(16, 0, 0) : goal;
+                evidence.put("originalEndpoints", Map.of("start", start, "goal", goal));
+                evidence.put("replacementEndpoints", Map.of("start", start, "goal", replacementGoal));
+                replacement = request(replacementGoal); stage = 5; return null;
             }
             probe.release(); stage = 6; return null;
         }
@@ -149,10 +156,42 @@ public final class TopologyDerivedLifecycleScenario implements AutoCloseable {
         else if (change.equals("unload")) TopologyService.onChunkUnloaded(level, chunks.get(probe.section().chunk().toLong()));
     }
     private TopologyService.MacroRequest request() {
-        return service.requestMacroQuery(level, UUID.randomUUID(), start, goal, BaseClusterTopology.Channel.GROUND,
+        return request(goal);
+    }
+    private TopologyService.MacroRequest request(BlockPos destination) {
+        return service.requestMacroQuery(level, UUID.randomUUID(), start, destination, BaseClusterTopology.Channel.GROUND,
                 BaseClusterTopology.TraversalProfile.DEFAULT_GROUND, NavigationScheduler.Priority.ACTIVE);
     }
     private boolean settled() { return Boolean.TRUE.equals(TopologyValidationAccess.chunkSettlement(service, level.dimension(), chunkPositions()).get("settled")); }
+    public boolean controlReached(boolean fallback) { return finalResult != null ? fallback : probe != null && probe.reached(); }
+    public Map<String, Object> observation() {
+        if (finalResult != null) return finalResult.observation();
+        Map<String, Object> result = new LinkedHashMap<>(evidence); result.put("stage", stage); result.put("window", window);
+        if (query != null) { result.put("request", TopologyValidationAccess.requestIdentity(query)); result.put("progress", query.progress()); result.put("done", query.future().isDone()); }
+        if (replacement != null) {
+            result.put("replacement", TopologyValidationAccess.requestIdentity(replacement));
+            result.put("replacementProgress", replacement.progress());
+            result.put("replacementDone", replacement.future().isDone());
+            result.put("replacementCancelled", replacement.future().isCancelled());
+        }
+        if (probe != null) {
+            result.put("controlReached", probe.reached()); result.put("probeTimedOut", probe.timedOut());
+            result.put("probeEvents", probe.events()); result.put("oldReference", probe.oldReferenceState());
+        }
+        result.put("workers", workerMetrics(service));
+        result.put("workerStacks", Thread.getAllStackTraces().entrySet().stream()
+                .filter(entry -> entry.getKey().getName().matches("accelerated-navigation-topology-[12]"))
+                .map(entry -> Map.of("thread", entry.getKey().getName(), "state", entry.getKey().getState().toString(),
+                        "stack", java.util.Arrays.stream(entry.getValue()).map(StackTraceElement::toString).toList())).toList());
+        result.put("chunks", chunks.entrySet().stream().map(entry -> {
+            ChunkPos position = entry.getValue().getPos(); LevelChunk live = level.getChunkSource().getChunkNow(position.x, position.z);
+            return Map.of("position", position.toString(), "writtenToken", TopologyValidationAccess.token(entry.getValue()),
+                    "worldToken", TopologyValidationAccess.token(live), "sameWorldChunk", live == entry.getValue());
+        }).toList());
+        result.put("settlement", TopologyValidationAccess.chunkSettlement(service, level.dimension(), chunkPositions()));
+        result.put("runtime", TopologyValidationAccess.snapshot(service, level.dimension()));
+        return result;
+    }
     private static void verifyNoLatePublication(boolean published) { require(!published, "the rejected original object is not installed as a current cache value"); }
     private static void require(boolean condition, String message) { if (!condition) throw new AssertionError(message); }
     @Override public void close() {
@@ -160,5 +199,10 @@ public final class TopologyDerivedLifecycleScenario implements AutoCloseable {
         if (probe != null) { probe.close(); probe = null; }
         for (var request : new TopologyService.MacroRequest[]{query, replacement}) if (request != null) { request.cancel(); TopologyValidationAccess.forgetRequest(request); }
         for (LevelChunk chunk : chunks.values()) TopologyService.onChunkUnloaded(level, chunk);
+        for (long position : tickets) {
+            ChunkPos pos = new ChunkPos(position);
+            level.getChunkSource().removeRegionTicket(net.minecraft.server.level.TicketType.FORCED, pos, 0, pos);
+        }
+        tickets.clear();
     }
 }

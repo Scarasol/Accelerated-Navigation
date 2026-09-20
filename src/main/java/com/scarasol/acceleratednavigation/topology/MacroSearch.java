@@ -282,7 +282,7 @@ public final class MacroSearch {
             boolean wasClosed = next.closed;
             next.g = nextCost;
             next.h = checkedHeuristic(next.endpoint);
-            next.f = nextCost + weight * next.h;
+            float nextPriority = nextCost + weight * next.h;
             next.previous = current;
             next.viaId = connectionId;
             next.viaLowerBound = lowerBound;
@@ -298,9 +298,10 @@ public final class MacroSearch {
                 next.expansionStarted = false;
             }
             if (next.inOpenSet()) {
-                openSet.changeCost(next, next.f);
+                openSet.changeCost(next, nextPriority);
             } else {
                 next.closed = false;
+                next.f = nextPriority;
                 openSet.insert(next);
                 if (wasClosed || wasBlocked) {
                     reopenedNodes++;
