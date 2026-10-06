@@ -23,6 +23,7 @@ public final class AcceleratedNavigation {
 
     public static final String MOD_ID = "accelerated_navigation";
     public static final Logger LOGGER = LogUtils.getLogger();
+    private final NavigationCommand navigationCommand = new NavigationCommand();
 
     public AcceleratedNavigation() {
         ModLoadingContext.get().registerConfig(
@@ -36,6 +37,9 @@ public final class AcceleratedNavigation {
         modBus.addListener(this::onConfigReloaded);
 
         MinecraftForge.EVENT_BUS.addListener(this::onServerTick);
+        MinecraftForge.EVENT_BUS.addListener(navigationCommand::register);
+        MinecraftForge.EVENT_BUS.addListener(navigationCommand::tick);
+        MinecraftForge.EVENT_BUS.addListener(navigationCommand::stopping);
         MinecraftForge.EVENT_BUS.addListener(this::onChunkLoad);
         MinecraftForge.EVENT_BUS.addListener(this::onChunkUnload);
         MinecraftForge.EVENT_BUS.addListener(this::onLevelSave);

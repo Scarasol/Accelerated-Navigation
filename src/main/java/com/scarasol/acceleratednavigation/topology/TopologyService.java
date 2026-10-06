@@ -20,10 +20,13 @@ import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.storage.LevelResource;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -35,9 +38,14 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
@@ -51,6 +59,7 @@ public final class TopologyService {
     private static final int COLLIDES = 1 << 4;
     private static final int HAS_ABOVE = 1 << 16;
     private static final int MAX_MACRO_REQUESTS = 1_024;
+    public static final int MAX_GRAPH_CAPTURE_DISTANCE = BaseGraphCapture.MAX_DISTANCE;
     private static final long WORKER_CLOSE_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(30L);
 
     private final MinecraftServer server;
@@ -66,6 +75,8 @@ public final class TopologyService {
             new LinkedHashSet<>();
     private final LinkedHashSet<LoadedSection> changedSections = new LinkedHashSet<>();
     private final Map<RequestKey, MacroRequest> macroRequests = new HashMap<>();
+    private ExecutorService graphCaptureExecutor;
+    private CompletableFuture<GraphCaptureResult> graphCapture;
     private final Object factDemandLock = new Object();
     private Map<FactDemandKey, Integer> factDemandChanges = new HashMap<>();
     private boolean factDemandNoticeQueued;
@@ -258,6 +269,110 @@ public final class TopologyService {
         if (replaced != null) replaced.cancelOnServer();
         request.submit();
         return request;
+    }
+
+    /** Diagnostic export of the current default-ground base graphs. */
+    public CompletableFuture<GraphCaptureResult> captureBaseGraphs(ServerLevel level,
+                                                                    Vec3 center, int distance) {
+        requireServerThread();
+        if (!isAvailable() || level.getServer() != server) {
+            throw new IllegalStateException("topology service is unavailable");
+        }
+        if (graphCapture != null && !graphCapture.isDone()) {
+            throw new RejectedExecutionException("a graph export is already running");
+        }
+        List<GraphSelection> selection = new ArrayList<>();
+        for (SectionPos section : BaseGraphCapture.sections(center, distance,
+                level.getMinBuildHeight(), level.getMaxBuildHeight())) {
+            selection.add(new GraphSelection(section, loadedSections.containsKey(
+                    new TopologyWorkerRuntime.ClusterKey(level.dimension(), section))));
+        }
+        Path output = server.getWorldPath(LevelResource.ROOT).resolve("data")
+                .resolve("accelerated_navigation").resolve("graph_exports")
+                .resolve("graph-" + Instant.now().toEpochMilli() + "-"
+                        + UUID.randomUUID() + ".json.gz");
+        if (graphCaptureExecutor == null) {
+            graphCaptureExecutor = Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "accelerated-navigation-graph-export");
+                thread.setDaemon(true);
+                return thread;
+            });
+        }
+        CompletableFuture<GraphCaptureResult> result = new CompletableFuture<>();
+        graphCapture = result;
+        graphCaptureExecutor.execute(() -> collectBaseGraphs(level.dimension(), center,
+                distance, output, selection, result));
+        return result;
+    }
+
+    private void collectBaseGraphs(ResourceKey<Level> dimension, Vec3 center, int distance,
+                                   Path output, List<GraphSelection> selection,
+                                   CompletableFuture<GraphCaptureResult> result) {
+        try {
+            BaseClusterTopology.GeometryKey geometry =
+                    BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.geometry(
+                            BaseClusterTopology.Channel.GROUND);
+            // Keep only fact identities for the final stability check, never the captured graphs.
+            Map<TopologyWorkerRuntime.ClusterKey, TopologyWorkerRuntime.SectionStamp> stamps =
+                    new HashMap<>();
+            boolean stable = true;
+            BaseGraphCapture.Result saved;
+            try (BaseGraphCapture.Writer writer = BaseGraphCapture.open(output,
+                    dimension.location().toString(), center, distance)) {
+                for (GraphSelection item : selection) {
+                    if (Thread.currentThread().isInterrupted() || !isAvailable()) {
+                        throw new InterruptedException("graph export stopped");
+                    }
+                    if (!item.loaded()) {
+                        writer.add(new BaseGraphCapture.Entry(item.section(), "UNLOADED", null, null));
+                        continue;
+                    }
+                    CompletableFuture<TopologyWorkerRuntime.BaseGraphView> pending =
+                            runtime.requestBaseGraph(dimension, item.section(), geometry);
+                    try {
+                        TopologyWorkerRuntime.BaseGraphView view = pending.get(60L, TimeUnit.SECONDS);
+                        boolean current = view.current();
+                        if (!current) stable = false;
+                        // READY means current when written; the final flag also checks later changes.
+                        writer.add(new BaseGraphCapture.Entry(item.section(),
+                                current ? "READY" : "STALE", view.topology(),
+                                current ? null : "source facts changed during export"));
+                        for (TopologyWorkerRuntime.SectionStamp stamp : view.stamps()) {
+                            stamps.putIfAbsent(stamp.key(), stamp);
+                        }
+                    } catch (TimeoutException failure) {
+                        pending.cancel(false);
+                        writer.add(new BaseGraphCapture.Entry(item.section(), "BUILD_FAILED", null, "build exceeded 60 s"));
+                    } catch (InterruptedException failure) {
+                        pending.cancel(false);
+                        throw failure;
+                    } catch (ExecutionException failure) {
+                        Throwable root = failure.getCause() == null ? failure : failure.getCause();
+                        writer.add(new BaseGraphCapture.Entry(item.section(), "BUILD_FAILED",
+                                null, root.toString()));
+                    }
+                }
+                if (!isAvailable()) throw new InterruptedException("graph export stopped");
+                for (TopologyWorkerRuntime.SectionStamp stamp : stamps.values()) {
+                    if (!stamp.current()) stable = false;
+                }
+                saved = writer.finish(stable);
+            }
+            result.complete(new GraphCaptureResult(saved.path(), saved.ready(),
+                    saved.unloaded(), saved.failed(), saved.stable(), saved.complete()));
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            result.completeExceptionally(new CancellationException("graph export interrupted"));
+        } catch (IOException | RuntimeException failure) {
+            result.completeExceptionally(failure);
+        }
+    }
+
+    public record GraphCaptureResult(Path path, int ready, int unloaded, int failed,
+                                     boolean stable, boolean complete) {
+    }
+
+    private record GraphSelection(SectionPos section, boolean loaded) {
     }
 
     private void loadChunk(ServerLevel level, ChunkAccess access) {
@@ -776,6 +891,10 @@ public final class TopologyService {
         if (stopping) return;
         if (!unsupportedThreading.get()) finishTick();
         stopping = true;
+        if (graphCapture != null && !graphCapture.isDone()) {
+            graphCapture.completeExceptionally(new CancellationException("server stopping"));
+        }
+        if (graphCaptureExecutor != null) graphCaptureExecutor.shutdownNow();
         foregroundRecovery.clear();
         ordinaryRecovery.clear();
         changedSections.clear();

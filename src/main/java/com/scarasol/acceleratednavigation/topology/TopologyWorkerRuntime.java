@@ -47,13 +47,10 @@ final class TopologyWorkerRuntime {
     private static final int MAX_SUPER_CACHE_ENTRIES = 512;
     private static final long MAX_BASE_RETAINED_BYTES = 128L * 1024L * 1024L;
     private static final long MAX_SUPER_RETAINED_BYTES = 16L * 1024L * 1024L;
-    private static final int MIN_QUERY_VISITED_NODES = 1_024;
-    private static final int MIN_HIERARCHICAL_QUERY_VISITED_NODES = 2_048;
-    private static final int MAX_QUERY_VISITED_NODES = 8_192;
+    private static final int MAX_QUERY_VISITED_NODES = 16_384;
     private static final int MAX_LOCAL_WITNESS_NODES = 512;
     private static final int MAX_FAST_SEARCH_NODES = 512;
     private static final int MAX_LONG_SEARCH_NODES = 256;
-    private static final float QUERY_VISITED_NODES_PER_BLOCK = 8.0F;
     private static final int MAX_PREWARM_ADMITTED = 8;
     // Approximate event-table metadata only; shared facts and requests are not counted twice.
     private static final long SECTION_EVENT_METADATA_BYTES = 96L;
@@ -595,10 +592,21 @@ final class TopologyWorkerRuntime {
         } catch (RejectedExecutionException ignored) {
             boolean closing;
             synchronized (runtimeLock) {
-                closing = stopRequested && !closed;
+                closing = stopRequested && !factClosingFinished;
                 eventTaskOutstanding = closing;
             }
-            if (closing) taskExecutor.shutdown(this::processSectionEvents);
+            if (closing) {
+                try {
+                    taskExecutor.notifyClosing(this::processSectionEvents);
+                } catch (RejectedExecutionException unavailable) {
+                    synchronized (runtimeLock) {
+                        eventTaskOutstanding = false;
+                        if (factClosingFinished) return;
+                    }
+                    AcceleratedNavigation.LOGGER.error(
+                            "Topology workers unavailable before facts closing completed", unavailable);
+                }
+            }
         }
     }
 
@@ -2606,6 +2614,58 @@ final class TopologyWorkerRuntime {
                 .toList();
     }
 
+    /** Captures a built base view and the exact live facts identities that produced it. */
+    record BaseGraphView(BaseClusterTopology topology, List<SectionStamp> stamps) {
+        BaseGraphView {
+            stamps = List.copyOf(stamps);
+        }
+
+        boolean current() {
+            return stamps.stream().allMatch(SectionStamp::current);
+        }
+    }
+
+    CompletableFuture<BaseGraphView> requestBaseGraph(ResourceKey<Level> dimension,
+                                                       SectionPos section,
+                                                       BaseClusterTopology.GeometryKey geometry) {
+        CompletableFuture<BaseGraphView> result = new CompletableFuture<>();
+        try {
+            runRuntimeTransition(() -> {
+                ClusterKey key = new ClusterKey(dimension, section);
+                TopologyWaiter<BaseClusterTopology> waiter = new TopologyWaiter<>(
+                        NavigationScheduler.Priority.BACKGROUND, completed -> {
+                    if (completed.failure != null) {
+                        finishFuture(result, null, completed.failure);
+                        return;
+                    }
+                    ClusterEntry entry = clusters.get(key);
+                    ViewEntry view = entry == null ? null : entry.views.get(geometry);
+                    if (view == null || view.topology != completed.value
+                            || view.topologyStamps.isEmpty() || !isCurrent(view.topologyStamps)) {
+                        finishFuture(result, null,
+                                new StaleTopologyException("base graph changed during capture"));
+                    } else {
+                        finishFuture(result,
+                                new BaseGraphView(completed.value, view.topologyStamps), null);
+                    }
+                });
+                result.whenComplete((value, failure) -> {
+                    if (result.isCancelled()) runRuntimeTransition(waiter::cancel);
+                });
+                try {
+                    requestClusterDependency(dimension, section, geometry,
+                            NavigationScheduler.Priority.BACKGROUND, false, waiter);
+                } catch (RuntimeException failure) {
+                    waiter.cancel();
+                    throw failure;
+                }
+            });
+        } catch (RuntimeException failure) {
+            result.completeExceptionally(failure);
+        }
+        return result;
+    }
+
     MacroRequest requestMacroQuery(ResourceKey<Level> dimension,
                                    BlockPos start,
                                    BlockPos goal,
@@ -2716,22 +2776,6 @@ final class TopologyWorkerRuntime {
             request.finishExceptionally(failure);
         }
     }
-
-    private static int queryNodeBudget(BlockPos start,
-                                       BlockPos goal,
-                                       boolean hierarchical) {
-        double directDistance = Math.sqrt(start.distSqr(goal));
-        return Math.max(
-                hierarchical
-                        ? MIN_HIERARCHICAL_QUERY_VISITED_NODES
-                        : MIN_QUERY_VISITED_NODES,
-                Math.min(
-                        MAX_QUERY_VISITED_NODES,
-                        (int) Math.ceil(directDistance * QUERY_VISITED_NODES_PER_BLOCK)
-                )
-        );
-    }
-
 
     void beginStopping() {
         boolean schedule;
@@ -4061,7 +4105,6 @@ final class TopologyWorkerRuntime {
                                boolean hierarchical) {
         MacroQueryKey key = new MacroQueryKey(request.dimension, request.channel,
                 request.profile, hierarchical, Float.floatToRawIntBits(request.weight),
-                queryNodeBudget(request.startPosition, request.goalPosition, hierarchical),
                 starts, goals);
         joinCanonical(request, key);
     }
@@ -5221,7 +5264,6 @@ final class TopologyWorkerRuntime {
                                  BaseClusterTopology.MovementKey movement,
                                  boolean hierarchical,
                                  int weightBits,
-                                 int nodeBudget,
                                  List<MacroComponentKey> starts,
                                  List<MacroComponentKey> goals) {
         private MacroQueryKey {
@@ -5234,11 +5276,10 @@ final class TopologyWorkerRuntime {
                               BaseClusterTopology.TraversalProfile profile,
                               boolean hierarchical,
                               int weightBits,
-                              int nodeBudget,
                               List<MacroComponentKey> starts,
                               List<MacroComponentKey> goals) {
             this(dimension, profile.geometry(channel), profile.movement(channel), hierarchical,
-                    weightBits, nodeBudget, List.copyOf(starts), List.copyOf(goals));
+                    weightBits, List.copyOf(starts), List.copyOf(goals));
         }
     }
 
@@ -5428,7 +5469,6 @@ final class TopologyWorkerRuntime {
         }
 
         private void createSearchOnWorker() {
-            int maxVisitedNodes = queryNodeBudget(startPosition, goalPosition, hierarchical);
             if (refining) {
                 baseGraph.initializeBindings();
                 search = new MacroSearch(new AggregateTopologyGraph(baseGraph, superGraph,
@@ -5436,10 +5476,11 @@ final class TopologyWorkerRuntime {
                         MAX_LOCAL_WITNESS_NODES);
             } else if (hierarchical) {
                 superGraph.initializeBindings();
-                search = new MacroSearch(superGraph, weight, maxVisitedNodes);
+                search = new MacroSearch(superGraph, weight, MAX_QUERY_VISITED_NODES);
             } else {
                 baseGraph.initializeBindings();
-                search = new MacroSearch(baseGraph, weight, maxVisitedNodes);
+                search = new MacroSearch(baseGraph.reverseGraph(), weight,
+                        MAX_QUERY_VISITED_NODES);
             }
         }
 
@@ -5523,7 +5564,7 @@ final class TopologyWorkerRuntime {
                             return stepWitnessRecovery(expansionBudget, expandedBefore);
                         }
                     } else if (candidate != null) {
-                        result = candidate;
+                        result = restoreForwardCorridor(candidate);
                         status = Status.SUCCEEDED;
                         clearRequests();
                         releaseGraphs();
@@ -7044,6 +7085,114 @@ final class TopologyWorkerRuntime {
             expandInto(from, output, null);
         }
 
+        private MacroSearch.Graph reverseGraph() {
+            return new MacroSearch.Graph() {
+                @Override public MacroSearch.Endpoint start() { return goal; }
+                @Override public MacroSearch.Endpoint goal() { return start; }
+                @Override public void expandInto(MacroSearch.Endpoint from,
+                                                 MacroSearch.ExpansionBuffer output) {
+                    expandReverse(from, output);
+                }
+                @Override public boolean revisionsValid() {
+                    return TopologyGraph.this.revisionsValid();
+                }
+                @Override public float heuristic(MacroSearch.Endpoint endpoint) {
+                    return sectionHeuristic(endpoint, start, startBindings);
+                }
+                @Override public float prefetchSlack() { return TopologyGraph.this.prefetchSlack(); }
+            };
+        }
+
+        private void expandReverse(MacroSearch.Endpoint from, MacroSearch.ExpansionBuffer output) {
+            if (from.id() == start.id()) return;
+            if (from.id() == goal.id()) {
+                for (ComponentBinding target : goalBindings) {
+                    output.addMembership(edgeId(goal, target.endpoint()), target.endpoint(), 0.0F);
+                }
+                return;
+            }
+            ComponentBinding target = bindingsByEndpoint.get(from.id());
+            if (target == null) throw new IllegalArgumentException("endpoint does not belong to this graph");
+            CapturedBase targetTopology = requireTopology(target.cluster());
+            BaseClusterTopology topology = targetTopology.topology;
+            BaseClusterTopology.MovementKey movement = profile.movement(channel);
+            if (output.needsPart(0)) {
+                if (startBindings.stream().anyMatch(source -> sameComponent(source, target))) {
+                    output.addMembership(edgeId(from, start), start, 0.0F);
+                }
+                IncomingEdges incoming = topology.incomingEdges();
+                for (int i = incoming.start(target.componentId()); i < incoming.end(target.componentId()); i++) {
+                    int edge = incoming.edge(i);
+                    if (!topology.localEdgeSupports(edge, movement)) continue;
+                    ComponentBinding source = binding(targetTopology, incoming.source(i));
+                    output.addLocal(edgeId(from, source.endpoint()), source.endpoint(),
+                            topology.localEdgeLowerBound(edge));
+                }
+                output.completePart(0);
+            }
+            for (Direction face : DIRECTIONS) {
+                if (face.getAxis().isVertical()) {
+                    expandReverseBoundary(target, targetTopology, face, 0, movement, output);
+                } else {
+                    for (int shift = -1; shift <= 1; shift++) {
+                        expandReverseBoundary(target, targetTopology, face, shift, movement, output);
+                    }
+                }
+            }
+        }
+
+        private void expandReverseBoundary(ComponentBinding target,
+                                           CapturedBase targetTopology,
+                                           Direction neighborFace,
+                                           int yShift,
+                                           BaseClusterTopology.MovementKey movement,
+                                           MacroSearch.ExpansionBuffer output) {
+            SectionPos sourceSection = targetTopology.neighbor(neighborFace, yShift);
+            int part = baseLinkSlot(target.cluster().section(), sourceSection, neighborFace) + 1;
+            if (!output.needsPart(part)) return;
+            if (!targetTopology.topology.mayEnter(target.componentId(), sourceSection, movement)) {
+                output.completePart(part);
+                return;
+            }
+            CapturedBase sourceTopology = captureTopology(sourceSection);
+            if (sourceTopology == null) {
+                output.addDependency(part, new MacroSearch.DependencyKey(
+                        MacroSearch.DependencyKind.BASE_CLUSTER, sourceSection));
+                return;
+            }
+            BaseClusterTopology source = sourceTopology.topology;
+            boolean mayEnter = false;
+            for (int component = 0; component < source.componentCount(); component++) {
+                if (source.mayExit(component, target.cluster().section(), movement)) {
+                    mayEnter = true;
+                    break;
+                }
+            }
+            if (!mayEnter) {
+                output.completePart(part);
+                return;
+            }
+            Direction face = neighborFace.getOpposite();
+            SuperClusterTopology.BoundaryLinks links =
+                    sourceTopology.boundaryLinks(face, -yShift, targetTopology);
+            if (links == null) {
+                output.addDependency(part, MacroSearch.DependencyKey.baseBoundary(
+                        sourceSection, target.cluster().section(), face));
+                return;
+            }
+            IncomingEdges incoming = links.incomingEdges();
+            for (int i = incoming.start(target.componentId()); i < incoming.end(target.componentId()); i++) {
+                int edge = incoming.edge(i);
+                int component = incoming.source(i);
+                if (!links.supports(edge, movement)
+                        || !source.mayExit(component, target.cluster().section(), movement)) continue;
+                ComponentBinding previous = binding(sourceTopology, component);
+                output.addBoundary(edgeId(target.endpoint(), previous.endpoint()), previous.endpoint(),
+                        links.lowerBound(edge), links, edge, movement.capabilityMask());
+            }
+            output.completePart(part);
+        }
+
         private void expandInto(MacroSearch.Endpoint from,
                                 MacroSearch.ExpansionBuffer output,
                                 @Nullable ComponentAdmission admission) {
@@ -7160,14 +7309,20 @@ final class TopologyWorkerRuntime {
 
         @Override
         public float heuristic(MacroSearch.Endpoint endpoint) {
-            if (endpoint.id() == goal.id()) {
+            return sectionHeuristic(endpoint, goal, goalBindings);
+        }
+
+        private float sectionHeuristic(MacroSearch.Endpoint endpoint,
+                                       MacroSearch.Endpoint destination,
+                                       List<ComponentBinding> candidates) {
+            if (endpoint.id() == destination.id()) {
                 return 0.0F;
             }
             SectionPos sourceSection = endpoint instanceof MacroSearch.ComponentEndpoint component
                     ? component.section()
                     : SectionPos.of(endpoint.anchor());
             int best = Integer.MAX_VALUE;
-            for (ComponentBinding binding : goalBindings) {
+            for (ComponentBinding binding : candidates) {
                 SectionPos target = binding.cluster().section();
                 int dx = Math.abs(target.x() - sourceSection.x());
                 int dy = Math.abs(target.y() - sourceSection.y());
@@ -7408,6 +7563,25 @@ final class TopologyWorkerRuntime {
             throw new IllegalStateException("macro endpoint ID exceeds the collision-free edge range");
         }
         return fromId << 32 | toId;
+    }
+
+    /** Incoming search payloads describe the original forward transitions. */
+    static MacroSearch.Corridor restoreForwardCorridor(MacroSearch.Corridor backward) {
+        List<MacroSearch.Endpoint> endpoints = new ArrayList<>(backward.endpoints());
+        Collections.reverse(endpoints);
+        List<MacroSearch.Connection> connections = new ArrayList<>(backward.connections().size());
+        float cost = 0.0F;
+        for (int i = backward.connections().size() - 1; i >= 0; i--) {
+            MacroSearch.Connection old = backward.connections().get(i);
+            if (old.from().id() != backward.endpoints().get(i).id()
+                    || old.to().id() != backward.endpoints().get(i + 1).id()) {
+                throw new IllegalArgumentException("reverse corridor is not connected");
+            }
+            connections.add(new MacroSearch.Connection(edgeId(old.to(), old.from()),
+                    old.to(), old.from(), old.lowerBound(), old.transition()));
+            cost += old.lowerBound();
+        }
+        return new MacroSearch.Corridor(endpoints, connections, cost);
     }
 
     private static boolean sameComponent(@Nullable ComponentBinding first,

@@ -319,7 +319,7 @@ final class SuperClusterTopology {
                 }
             }
         }
-        return BoundaryLinks.from(face, source.componentCount(), masks);
+        return BoundaryLinks.from(face, source.componentCount(), target.componentCount(), masks);
     }
 
     private static void addBoundaryMask(Long2ObjectOpenHashMap<long[]> masks,
@@ -835,6 +835,7 @@ final class SuperClusterTopology {
 
     static final class BoundaryLinks {
         private final Direction face;
+        private final int targetCount;
         private final int[] offsets;
         private final int[] targets;
         private final int[] bandOffsets;
@@ -842,8 +843,10 @@ final class SuperClusterTopology {
         private final long[] capabilities;
         private final long[] masks;
         private final float[] lowerBounds;
+        private volatile IncomingEdges incomingEdges;
 
         private BoundaryLinks(Direction face,
+                              int targetCount,
                               int[] offsets,
                               int[] targets,
                               int[] bandOffsets,
@@ -852,6 +855,7 @@ final class SuperClusterTopology {
                               long[] masks,
                               float[] lowerBounds) {
             this.face = face;
+            this.targetCount = targetCount;
             this.offsets = offsets;
             this.targets = targets;
             this.bandOffsets = bandOffsets;
@@ -863,6 +867,7 @@ final class SuperClusterTopology {
 
         private static BoundaryLinks from(Direction face,
                                           int sourceCount,
+                                          int targetCount,
                                           Long2ObjectOpenHashMap<long[]> sourceMasks) {
             long[] bands = sourceMasks.keySet().toLongArray();
             Arrays.sort(bands);
@@ -908,7 +913,7 @@ final class SuperClusterTopology {
             }
             for (int index = 1; index < offsets.length; index++) offsets[index] += offsets[index - 1];
             bandOffsets[edgeCount] = bands.length;
-            return new BoundaryLinks(face, offsets, targets, bandOffsets, descriptors, capabilities, masks,
+            return new BoundaryLinks(face, targetCount, offsets, targets, bandOffsets, descriptors, capabilities, masks,
                     lowerBounds);
         }
 
@@ -930,11 +935,25 @@ final class SuperClusterTopology {
         }
         long maskWord(int band, int word) { return masks[band * 4 + word]; }
         float lowerBound(int edge) { return lowerBounds[edge]; }
+        IncomingEdges incomingEdges() {
+            IncomingEdges ready = incomingEdges;
+            if (ready == null) {
+                synchronized (this) {
+                    ready = incomingEdges;
+                    if (ready == null) {
+                        ready = IncomingEdges.build(offsets, targets, targetCount);
+                        incomingEdges = ready;
+                    }
+                }
+            }
+            return ready;
+        }
         int retainedBytes() {
-            return 72 + (offsets.length + targets.length + bandOffsets.length) * Integer.BYTES
+            return 88 + (offsets.length + targets.length + bandOffsets.length) * Integer.BYTES
                     + descriptors.length * Short.BYTES
                     + capabilities.length * Long.BYTES + masks.length * Long.BYTES
-                    + lowerBounds.length * Float.BYTES;
+                    + lowerBounds.length * Float.BYTES
+                    + IncomingEdges.reservedBytes(targetCount, targets.length);
         }
     }
 

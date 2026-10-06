@@ -126,12 +126,12 @@ final class TopologyTaskExecutor {
         }
     }
 
-    /** Preserve the final state-consumption notice when ordinary submission was rejected. */
-    void shutdown(Runnable finalControl) {
-        Objects.requireNonNull(finalControl, "finalControl");
+    /** Preserve a closing notice without ending the workers that consume later facts feedback. */
+    void notifyClosing(Runnable command) {
+        Objects.requireNonNull(command, "command");
         synchronized (monitor) {
-            queueControlLocked(finalControl);
-            shutdown();
+            ensureAccepting();
+            queueControlLocked(command);
         }
     }
 

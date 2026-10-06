@@ -1,38 +1,28 @@
-# IDE
-/.idea/
-/.settings/
-/.metadata/
-/bin/
-/out/
-*.iml
-*.ipr
-*.iws
+# eclipse
+bin
 *.launch
+.settings
+.metadata
 .classpath
 .project
 
-# Gradle and generated output
-/.gradle/
-/.gradle-user/
-/build/
-/eclipse/
-/mcmodsrepo/
-/src/generated/
+# idea
+out
+*.ipr
+*.iws
+*.iml
+.idea
 
-# Minecraft development runs and local evidence
-/run/
-/run-data/
-/run-terrain-benchmark/
-/run-terrain-probe/*
-/terrain-qualification-input/
-/logs/
-*.log
-*.log.gz
-*.jfr
-*.csv
+# gradle
+build
+.gradle
 
-# Local design and planning documents
-/docs/
+# other
+eclipse
+run
 
-# Local Codex migration context. Never commit or publish this directory.
-/.codex-handoff/
+# Files from Forge MDK
+forge*changelog.txt
+logs/
+run-performance/
+run-performance-flat/

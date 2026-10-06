@@ -1,5 +1,6 @@
 package com.scarasol.acceleratednavigation.topology;
 
+import com.google.gson.stream.JsonWriter;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
@@ -7,6 +8,7 @@ import net.minecraft.util.BitStorage;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.ZeroBitStorage;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
@@ -49,6 +51,7 @@ public final class BaseClusterTopology {
     private final long[] haloFingerprints;
     private final long signature;
     private final int retainedBytes;
+    private volatile IncomingEdges incomingEdges;
 
     private BaseClusterTopology(SectionPos section,
                                 long revision,
@@ -85,7 +88,8 @@ public final class BaseClusterTopology {
                 + (outgoingOffsets.length + outgoingTargets.length) * Integer.BYTES
                 + outgoingCapabilityMasks.length * Long.BYTES
                 + outgoingLowerBounds.length * Float.BYTES
-                + haloOffsets.length + (haloRevisions.length + haloFingerprints.length) * Long.BYTES;
+                + haloOffsets.length + (haloRevisions.length + haloFingerprints.length) * Long.BYTES
+                + IncomingEdges.reservedBytes(componentCount(), outgoingTargets.length);
         validate();
     }
 
@@ -158,10 +162,18 @@ public final class BaseClusterTopology {
     }
 
     boolean mayExit(int componentId, SectionPos target, MovementKey movement) {
+        return mayConnect(componentId, target, movement, false);
+    }
+
+    boolean mayEnter(int componentId, SectionPos source, MovementKey movement) {
+        return mayConnect(componentId, source, movement, true);
+    }
+
+    private boolean mayConnect(int componentId, SectionPos neighbor, MovementKey movement, boolean incoming) {
         long bounds = metadata(componentId);
-        int dx = target.x() - section.x();
-        int dy = target.y() - section.y();
-        int dz = target.z() - section.z();
+        int dx = neighbor.x() - section.x();
+        int dy = neighbor.y() - section.y();
+        int dz = neighbor.z() - section.z();
         int horizontal = Math.abs(dx) + Math.abs(dz);
         if (horizontal > 1 || Math.abs(dy) > 1 || (horizontal == 0 && dy == 0)) return false;
         boolean volume = geometry.channel() == Channel.VOLUME;
@@ -172,7 +184,7 @@ public final class BaseClusterTopology {
         return overlapsSection((int) (bounds >>> 12) & 15, (int) (bounds >>> 24) & 15,
                 reach, reach, dx)
                 && overlapsSection((int) (bounds >>> 16) & 15, (int) (bounds >>> 28) & 15,
-                down, up, dy)
+                incoming ? up : down, incoming ? down : up, dy)
                 && overlapsSection((int) (bounds >>> 20) & 15, (int) (bounds >>> 32) & 15,
                 reach, reach, dz);
     }
@@ -208,6 +220,20 @@ public final class BaseClusterTopology {
         return (outgoingCapabilityMasks[edge] & movement.capabilityMask()) != 0L;
     }
 
+    IncomingEdges incomingEdges() {
+        IncomingEdges ready = incomingEdges;
+        if (ready == null) {
+            synchronized (this) {
+                ready = incomingEdges;
+                if (ready == null) {
+                    ready = IncomingEdges.build(outgoingOffsets, outgoingTargets, componentCount());
+                    incomingEdges = ready;
+                }
+            }
+        }
+        return ready;
+    }
+
     public int haloStampCount() {
         return haloOffsets.length;
     }
@@ -224,6 +250,52 @@ public final class BaseClusterTopology {
         return haloFingerprints[index];
     }
 
+    /** Writes every primitive needed to reconstruct this derived graph without world access. */
+    void writeSnapshot(JsonWriter json) throws IOException {
+        json.beginObject();
+        json.name("section").beginArray().value(section.x()).value(section.y()).value(section.z()).endArray();
+        json.name("revision").value(revision);
+        json.name("sourceFingerprintHex").value(Long.toUnsignedString(sourceFingerprint, 16));
+        json.name("signatureHex").value(Long.toUnsignedString(signature, 16));
+        json.name("geometry").beginObject();
+        json.name("channel").value(geometry.channel().name());
+        json.name("widthCells").value(geometry.widthCells());
+        json.name("heightCells").value(geometry.heightCells());
+        json.name("acceptsFluid").value(geometry.acceptsFluid());
+        json.endObject();
+        json.name("baseLabel").value(baseLabel);
+        json.name("labelCellOrder").value("(y << 8) | (z << 4) | x");
+        json.name("componentLabelValues").beginArray();
+        for (int cell = 0; cell < CELL_COUNT; cell++) json.value(componentLabels.get(cell));
+        json.endArray();
+        json.name("componentMetadataHex").beginArray();
+        for (long value : componentMetadata) json.value(Long.toUnsignedString(value, 16));
+        json.endArray();
+        json.name("outgoingOffsets").beginArray();
+        for (int value : outgoingOffsets) json.value(value);
+        json.endArray();
+        json.name("outgoingTargets").beginArray();
+        for (int value : outgoingTargets) json.value(value);
+        json.endArray();
+        json.name("outgoingCapabilityMasksHex").beginArray();
+        for (long value : outgoingCapabilityMasks) json.value(Long.toUnsignedString(value, 16));
+        json.endArray();
+        json.name("outgoingLowerBoundBitsHex").beginArray();
+        for (float value : outgoingLowerBounds) {
+            json.value(Integer.toUnsignedString(Float.floatToRawIntBits(value), 16));
+        }
+        json.endArray();
+        json.name("halo").beginArray();
+        for (int index = 0; index < haloOffsets.length; index++) {
+            json.beginObject();
+            json.name("offset").value(Byte.toUnsignedInt(haloOffsets[index]));
+            json.name("revision").value(haloRevisions[index]);
+            json.name("fingerprintHex").value(Long.toUnsignedString(haloFingerprints[index], 16));
+            json.endObject();
+        }
+        json.endArray();
+        json.endObject();
+    }
     public int retainedBytes() {
         return retainedBytes;
     }
