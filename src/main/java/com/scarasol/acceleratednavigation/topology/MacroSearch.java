@@ -1,0 +1,1030 @@
+package com.scarasol.acceleratednavigation.topology;
+
+import com.scarasol.acceleratednavigation.api.ResumableSearch.Status;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.SectionPos;
+import net.minecraft.world.level.pathfinder.BinaryHeap;
+import net.minecraft.world.level.pathfinder.Node;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+/** Resumable Weighted A* over an already-built structural component graph. */
+public final class MacroSearch {
+
+    public static final float DEFAULT_WEIGHT = 1.25F;
+
+    private final Graph graph;
+    private final float weight;
+    private final int maxVisitedNodes;
+    private final BinaryHeap openSet = new BinaryHeap();
+    private final Long2ObjectOpenHashMap<SearchNode> nodes = new Long2ObjectOpenHashMap<>();
+    private final Set<SearchNode> blockedNodes = new HashSet<>();
+    private final Map<DependencyKey, Set<SearchNode>> waitingByDependency = new HashMap<>();
+    private final ExpansionBuffer expansionBuffer = new ExpansionBuffer();
+
+    private Status status = Status.RUNNING;
+    private Failure failure = Failure.NONE;
+    private SectionPos blockedSection;
+    private Corridor result;
+    private boolean initialized;
+    private boolean waitingForTopology;
+    private long expansionWorkUnits;
+    private long expandedNodes;
+    private long generatedConnections;
+    private long reopenedNodes;
+    private long reexpandedBlockedNodes;
+    private int maximumDegree;
+    private int maximumBlockedNodes;
+
+    public MacroSearch(Graph graph,
+                       float weight,
+                       int maxVisitedNodes) {
+        this.graph = Objects.requireNonNull(graph, "graph");
+        if (!Float.isFinite(weight) || weight < 1.0F) {
+            throw new IllegalArgumentException("weight must be finite and at least 1.0");
+        }
+        if (maxVisitedNodes <= 0) {
+            throw new IllegalArgumentException("maxVisitedNodes must be positive");
+        }
+        this.weight = weight;
+        this.maxVisitedNodes = maxVisitedNodes;
+    }
+
+    public Status step(int expansionBudget) {
+        if (status != Status.RUNNING) {
+            return status;
+        }
+        if (expansionBudget <= 0) {
+            throw new IllegalArgumentException("expansionBudget must be positive");
+        }
+        if (!graph.revisionsValid()) {
+            return fail(Failure.STALE_WORLD);
+        }
+        if (!initialized) {
+            initialize();
+        }
+
+        waitingForTopology = false;
+        int expandedThisStep = 0;
+        while (expandedThisStep < expansionBudget) {
+            if (shouldWaitForTopology()) {
+                waitingForTopology = true;
+                blockedSection = bestPendingSection();
+                return status;
+            }
+            if (openSet.isEmpty()) {
+                if (hasPendingDependencies()) {
+                    waitingForTopology = true;
+                    blockedSection = bestPendingSection();
+                    return status;
+                }
+                BlockedFailure blocked = bestBlockedFailure();
+                if (blocked == null) return fail(Failure.NO_STRUCTURAL_ROUTE);
+                blockedSection = blocked.unavailability.section();
+                return fail(blocked.unavailability.reason());
+            }
+            SearchNode current = popOpenNode();
+            if (current.closed) {
+                continue;
+            }
+            if (!current.expansionStarted && expandedNodes >= maxVisitedNodes) {
+                return fail(Failure.SEARCH_LIMIT_REACHED);
+            }
+            expandedThisStep++;
+            expansionWorkUnits++;
+            if (!current.expansionStarted) {
+                current.expansionStarted = true;
+                expandedNodes++;
+            }
+
+            if (current.endpoint.id() == graph.goal().id()) {
+                result = trace(current);
+                status = Status.SUCCEEDED;
+                return status;
+            }
+            expand(current);
+        }
+        return status;
+    }
+
+    @SuppressWarnings("unchecked")
+    private SearchNode popOpenNode() {
+        return (SearchNode) openSet.pop();
+    }
+
+    public Status status() {
+        return status;
+    }
+
+    @Nullable
+    public Corridor result() {
+        return result;
+    }
+
+    public Failure failure() {
+        return failure;
+    }
+
+    @Nullable
+    public SectionPos blockedSection() {
+        return blockedSection;
+    }
+
+    public Metrics metrics() {
+        return new Metrics(
+                expansionWorkUnits,
+                expandedNodes,
+                generatedConnections,
+                reopenedNodes,
+                reexpandedBlockedNodes,
+                maximumDegree,
+                maximumBlockedNodes
+        );
+    }
+
+    public boolean waitingForTopology() {
+        return status == Status.RUNNING && waitingForTopology;
+    }
+
+    public List<DependencyKey> pendingDependencies(int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
+        return waitingByDependency.entrySet().stream()
+                .map(entry -> Map.entry(
+                        entry.getKey(),
+                        entry.getValue().stream()
+                                .map(node -> node.f)
+                                .min(Float::compare)
+                                .orElse(Float.POSITIVE_INFINITY)
+                ))
+                .sorted(Comparator
+                        .comparingDouble((Map.Entry<DependencyKey, Float> entry) -> entry.getValue())
+                        .thenComparingInt(entry -> entry.getKey().kind().ordinal())
+                        .thenComparingInt(entry -> entry.getKey().position().x())
+                        .thenComparingInt(entry -> entry.getKey().position().y())
+                        .thenComparingInt(entry -> entry.getKey().position().z()))
+                .limit(limit)
+                .map(Map.Entry::getKey)
+                .toList();
+    }
+
+    /**
+     * Marks a pending dependency as unavailable without reopening the blocked node.
+     * The node may still have another pending dependency; once those are resolved,
+     * the unavailable edge remains excluded and the ready frontier can continue.
+     */
+    void dependencyUnavailable(DependencyKey dependency, Unavailability reason) {
+        Objects.requireNonNull(dependency, "dependency");
+        Set<SearchNode> affected = waitingByDependency.remove(dependency);
+        if (affected == null || affected.isEmpty()) {
+            return;
+        }
+        for (SearchNode node : affected) {
+            if (!blockedNodes.contains(node) || node.pendingParts == null) {
+                continue;
+            }
+            Long parts = node.pendingParts.remove(dependency);
+            if (parts == null) continue;
+            if (node.pendingParts.isEmpty()) node.pendingParts = null;
+            node.completedExpansionParts |= parts;
+            if (node.unavailableDependencies == null) node.unavailableDependencies = new HashMap<>();
+            node.unavailableDependencies.put(dependency, reason);
+            if (node.pendingParts == null && !node.inOpenSet()) node.closed = true;
+        }
+        waitingForTopology = false;
+        blockedSection = null;
+    }
+
+    void dependenciesAvailable(Iterable<DependencyKey> dependencies) {
+        Objects.requireNonNull(dependencies, "dependencies");
+        Set<SearchNode> affectedNodes = new HashSet<>();
+        for (DependencyKey dependency : dependencies) {
+            Set<SearchNode> affected = waitingByDependency.remove(
+                    Objects.requireNonNull(dependency, "dependency")
+            );
+            if (affected != null) {
+                for (SearchNode node : affected) {
+                    if (node.pendingParts != null) {
+                        node.pendingParts.remove(dependency);
+                        if (node.pendingParts.isEmpty()) node.pendingParts = null;
+                    }
+                    affectedNodes.add(node);
+                }
+            }
+        }
+        boolean reopened = false;
+        for (SearchNode node : affectedNodes) {
+            if (!blockedNodes.contains(node)) {
+                continue;
+            }
+            node.closed = false;
+            if (!node.inOpenSet()) {
+                openSet.insert(node);
+            }
+            reexpandedBlockedNodes++;
+            reopened = true;
+        }
+        if (reopened) {
+            waitingForTopology = false;
+            blockedSection = null;
+        }
+    }
+
+    private void initialize() {
+        SearchNode start = node(graph.start());
+        start.g = 0.0F;
+        start.h = checkedHeuristic(start.endpoint);
+        start.f = weight * start.h;
+        openSet.insert(start);
+        initialized = true;
+    }
+
+    private boolean shouldWaitForTopology() {
+        float blockedKey = bestPendingKey();
+        if (!Float.isFinite(blockedKey)) {
+            return false;
+        }
+        if (openSet.isEmpty()) {
+            return true;
+        }
+        float readyKey = ((SearchNode) openSet.peek()).f;
+        return readyKey > blockedKey + graph.prefetchSlack();
+    }
+
+    private void expand(SearchNode current) {
+        expansionBuffer.reset(current.endpoint, current.completedExpansionParts,
+                current.pendingPartMask());
+        graph.expandInto(current.endpoint, expansionBuffer);
+        current.completedExpansionParts = expansionBuffer.completedParts();
+        int generatedThisExpansion = 0;
+        for (int index = 0; index < expansionBuffer.connectionCount(); index++) {
+            long connectionId = expansionBuffer.connectionId(index);
+            generatedConnections++;
+            generatedThisExpansion++;
+            float lowerBound = expansionBuffer.lowerBound(index);
+            float nextCost = current.g + lowerBound;
+            SearchNode next = node(expansionBuffer.target(index));
+            if (nextCost >= next.g) {
+                continue;
+            }
+            boolean wasClosed = next.closed;
+            next.g = nextCost;
+            next.h = checkedHeuristic(next.endpoint);
+            float nextPriority = nextCost + weight * next.h;
+            next.previous = current;
+            next.viaId = connectionId;
+            next.viaLowerBound = lowerBound;
+            next.viaKind = expansionBuffer.transitionKind(index);
+            next.viaPayload = expansionBuffer.transitionPayload(index);
+            next.viaPayloadIndex = expansionBuffer.transitionPayloadIndex(index);
+            next.viaPrimitivePayload = expansionBuffer.transitionPrimitivePayload(index);
+            boolean wasBlocked = blockedNodes.contains(next);
+            if (wasBlocked) {
+                unregisterBlocked(next, true);
+            } else if (wasClosed) {
+                next.completedExpansionParts = 0L;
+                next.expansionStarted = false;
+            }
+            if (next.inOpenSet()) {
+                openSet.changeCost(next, nextPriority);
+            } else {
+                next.closed = false;
+                next.f = nextPriority;
+                openSet.insert(next);
+                if (wasClosed || wasBlocked) {
+                    reopenedNodes++;
+                }
+            }
+        }
+        maximumDegree = Math.max(maximumDegree, generatedThisExpansion);
+        if (expansionBuffer.dependencyCount() != 0
+                || current.pendingParts != null) {
+            registerBlocked(current, expansionBuffer);
+        } else {
+            current.closed = true;
+            if (current.unavailableDependencies == null) blockedNodes.remove(current);
+        }
+    }
+
+    private void registerBlocked(SearchNode node, ExpansionBuffer expansion) {
+        for (int index = 0; index < expansion.dependencyCount(); index++) {
+            DependencyKey dependency = expansion.dependency(index);
+            if (node.pendingParts == null) node.pendingParts = new HashMap<>();
+            node.pendingParts.merge(dependency, expansion.dependencyParts(index),
+                    (left, right) -> left | right);
+            waitingByDependency.computeIfAbsent(dependency, ignored -> new HashSet<>())
+                    .add(node);
+        }
+        node.closed = node.pendingParts == null;
+        blockedNodes.add(node);
+        maximumBlockedNodes = Math.max(maximumBlockedNodes, blockedNodes.size());
+    }
+
+    private void unregisterBlocked(SearchNode node, boolean resetExpansion) {
+        if (!blockedNodes.remove(node)) {
+            return;
+        }
+        if (node.pendingParts != null) {
+            for (DependencyKey dependency : node.pendingParts.keySet()) {
+                Set<SearchNode> waiting = waitingByDependency.get(dependency);
+                if (waiting == null) continue;
+                waiting.remove(node);
+                if (waiting.isEmpty()) waitingByDependency.remove(dependency);
+            }
+        }
+        node.pendingParts = null;
+        node.unavailableDependencies = null;
+        if (resetExpansion) {
+            node.completedExpansionParts = 0L;
+            node.expansionStarted = false;
+        }
+    }
+
+    private boolean hasPendingDependencies() {
+        return Float.isFinite(bestPendingKey());
+    }
+
+    private float bestPendingKey() {
+        float best = Float.POSITIVE_INFINITY;
+        for (SearchNode node : blockedNodes) {
+            if (node.pendingParts != null) best = Math.min(best, node.f);
+        }
+        return best;
+    }
+
+    private BlockedFailure bestBlockedFailure() {
+        BlockedFailure best = null;
+        for (SearchNode node : blockedNodes) {
+            if (node.unavailableDependencies == null) continue;
+            for (Unavailability unavailable : node.unavailableDependencies.values()) {
+                BlockedFailure candidate = new BlockedFailure(node.f, unavailable, node.endpoint);
+                if (best == null || BlockedFailure.ORDER.compare(candidate, best) < 0) best = candidate;
+            }
+        }
+        return best;
+    }
+
+    @Nullable
+    private SectionPos bestPendingSection() {
+        SearchNode bestNode = null;
+        for (SearchNode node : blockedNodes) {
+            if (node.pendingParts != null && (bestNode == null || node.f < bestNode.f)) {
+                bestNode = node;
+            }
+        }
+        if (bestNode == null) {
+            return null;
+        }
+        return bestNode.pendingParts.keySet().stream()
+                .map(DependencyKey::position)
+                .min(Comparator.comparingInt((SectionPos section) -> section.x())
+                        .thenComparingInt(section -> section.y())
+                        .thenComparingInt(section -> section.z()))
+                .orElse(null);
+    }
+
+    private SearchNode node(Endpoint endpoint) {
+        SearchNode existing = nodes.get(endpoint.id());
+        if (existing != null) {
+            if (!existing.endpoint.anchor().equals(endpoint.anchor())
+                    || existing.endpoint.revision() != endpoint.revision()) {
+                throw new IllegalStateException("graph reused a node ID for another endpoint");
+            }
+            return existing;
+        }
+        SearchNode created = new SearchNode(endpoint);
+        nodes.put(endpoint.id(), created);
+        return created;
+    }
+
+    private float checkedHeuristic(Endpoint endpoint) {
+        float heuristic = graph.heuristic(endpoint);
+        if (!Float.isFinite(heuristic) || heuristic < 0.0F) {
+            throw new IllegalStateException("graph returned an invalid heuristic");
+        }
+        return heuristic;
+    }
+
+    private Corridor trace(SearchNode goal) {
+        List<SearchNode> reversed = new ArrayList<>();
+        for (SearchNode current = goal; current.previous != null; current = current.previous) {
+            reversed.add(current);
+        }
+        Collections.reverse(reversed);
+        List<Endpoint> endpoints = new ArrayList<>(reversed.size() + 1);
+        endpoints.add(graph.start());
+        List<Connection> connections = new ArrayList<>(reversed.size());
+        float cost = 0.0F;
+        for (SearchNode node : reversed) {
+            SearchNode previous = Objects.requireNonNull(node.previous);
+            Transition transition = materializeTransition(
+                    node.viaKind,
+                    node.viaPayload,
+                    node.viaPayloadIndex,
+                    node.viaPrimitivePayload
+            );
+            connections.add(new Connection(
+                    node.viaId,
+                    previous.endpoint,
+                    node.endpoint,
+                    node.viaLowerBound,
+                    transition
+            ));
+            endpoints.add(node.endpoint);
+            cost += node.viaLowerBound;
+        }
+        return new Corridor(endpoints, connections, cost);
+    }
+
+    private static Transition materializeTransition(byte kind,
+                                                    Object payload,
+                                                    int payloadIndex,
+                                                    long primitivePayload) {
+        return switch (kind) {
+            case ExpansionBuffer.DIRECT -> (Transition) Objects.requireNonNull(payload);
+            case ExpansionBuffer.MEMBERSHIP -> MembershipTransition.INSTANCE;
+            case ExpansionBuffer.LOCAL -> LocalTransition.INSTANCE;
+            case ExpansionBuffer.BOUNDARY -> materializeBoundary(
+                    (SuperClusterTopology.BoundaryLinks) Objects.requireNonNull(payload),
+                    payloadIndex,
+                    primitivePayload
+            );
+            case ExpansionBuffer.AGGREGATE -> AggregateTransition.INSTANCE;
+            default -> throw new IllegalStateException("unknown transition descriptor " + kind);
+        };
+    }
+
+    private static BoundaryTransition materializeBoundary(SuperClusterTopology.BoundaryLinks links,
+                                                            int edgeIndex,
+                                                            long movementMask) {
+        int count = 0;
+        for (int band = links.bandStart(edgeIndex); band < links.bandEnd(edgeIndex); band++) {
+            if ((links.capabilityMask(band) & movementMask) != 0L) count++;
+        }
+        short[] descriptors = new short[count];
+        long[] masks = new long[count * 4];
+        int selected = 0;
+        for (int band = links.bandStart(edgeIndex); band < links.bandEnd(edgeIndex); band++) {
+            if ((links.capabilityMask(band) & movementMask) == 0L) continue;
+            descriptors[selected] = links.descriptor(band);
+            for (int word = 0; word < 4; word++) {
+                masks[selected * 4 + word] = links.maskWord(band, word);
+            }
+            selected++;
+        }
+        return new BoundaryTransition(links.face(), descriptors, masks);
+    }
+
+    private Status fail(Failure reason) {
+        status = Status.FAILED;
+        failure = Objects.requireNonNull(reason, "reason");
+        result = null;
+        return status;
+    }
+
+    static int failureRank(Failure failure) {
+        return switch (failure) {
+            case FACTS_RECOVERY_FAILED -> 0;
+            case FACTS_PERSISTENCE_UNAVAILABLE -> 1;
+            case UNAVAILABLE_CHUNK -> 2;
+            default -> throw new IllegalArgumentException("not a facts availability failure");
+        };
+    }
+
+    record Unavailability(Failure reason, SectionPos section) {
+        Unavailability {
+            failureRank(reason);
+            Objects.requireNonNull(section, "section");
+        }
+    }
+
+    private static int sourceLayer(Endpoint endpoint) {
+        return endpoint instanceof AggregateEndpoint ? 2 : endpoint instanceof ComponentEndpoint ? 1 : 0;
+    }
+
+    private static SectionPos sourceSection(Endpoint endpoint) {
+        return endpoint instanceof AggregateEndpoint aggregate ? aggregate.origin()
+                : endpoint instanceof ComponentEndpoint component ? component.section()
+                : SectionPos.of(endpoint.anchor());
+    }
+
+    private static int sourceComponent(Endpoint endpoint) {
+        return endpoint instanceof AggregateEndpoint aggregate ? aggregate.aggregateId()
+                : endpoint instanceof ComponentEndpoint component ? component.componentId() : -1;
+    }
+
+    // Geometry and movement are fixed within one search; allocation IDs are not part of this key.
+    private static final Comparator<Endpoint> SOURCE_ORDER = Comparator
+            .comparingInt(MacroSearch::sourceLayer)
+            .thenComparingInt(value -> sourceSection(value).x())
+            .thenComparingInt(value -> sourceSection(value).y())
+            .thenComparingInt(value -> sourceSection(value).z())
+            .thenComparingInt(MacroSearch::sourceComponent)
+            .thenComparingInt(value -> value.anchor().getX())
+            .thenComparingInt(value -> value.anchor().getY())
+            .thenComparingInt(value -> value.anchor().getZ());
+
+    private record BlockedFailure(float f, Unavailability unavailability, Endpoint source) {
+        private static final Comparator<BlockedFailure> ORDER = Comparator
+                .comparingDouble(BlockedFailure::f)
+                .thenComparingInt(value -> failureRank(value.unavailability.reason()))
+                .thenComparingInt(value -> value.unavailability.section().x())
+                .thenComparingInt(value -> value.unavailability.section().y())
+                .thenComparingInt(value -> value.unavailability.section().z())
+                .thenComparing(BlockedFailure::source, SOURCE_ORDER);
+    }
+
+    public interface Graph {
+        Endpoint start();
+
+        Endpoint goal();
+
+        void expandInto(Endpoint from, ExpansionBuffer output);
+
+        boolean revisionsValid();
+
+        default float heuristic(Endpoint endpoint) {
+            BlockPos from = endpoint.anchor();
+            BlockPos goalPosition = goal().anchor();
+            double dx = goalPosition.getX() - from.getX();
+            double dy = goalPosition.getY() - from.getY();
+            double dz = goalPosition.getZ() - from.getZ();
+            return (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        default float prefetchSlack() {
+            return 0.0F;
+        }
+    }
+
+    /** Reused adjacency storage for the allocation-sensitive production search path. */
+    public static final class ExpansionBuffer {
+        private static final byte DIRECT = 0;
+        private static final byte MEMBERSHIP = 1;
+        private static final byte LOCAL = 2;
+        private static final byte BOUNDARY = 3;
+        private static final byte AGGREGATE = 4;
+
+        private Endpoint source;
+        private long[] ids = new long[16];
+        private Endpoint[] targets = new Endpoint[16];
+        private float[] costs = new float[16];
+        private byte[] kinds = new byte[16];
+        private Object[] payloads = new Object[16];
+        private int[] payloadIndexes = new int[16];
+        private long[] primitivePayloads = new long[16];
+        private int connectionCount;
+        private DependencyKey[] dependencies = new DependencyKey[4];
+        private long[] dependencyParts = new long[4];
+        private int dependencyCount;
+        private long completedParts;
+        private long skippedParts;
+
+        void reset(Endpoint source, long completedParts, long pendingParts) {
+            this.source = Objects.requireNonNull(source, "source");
+            this.completedParts = completedParts;
+            this.skippedParts = completedParts | pendingParts;
+            for (int index = 0; index < connectionCount; index++) {
+                targets[index] = null;
+                payloads[index] = null;
+            }
+            for (int index = 0; index < dependencyCount; index++) {
+                dependencies[index] = null;
+            }
+            connectionCount = 0;
+            dependencyCount = 0;
+        }
+
+        public void add(Connection connection) {
+            Objects.requireNonNull(connection, "connection");
+            if (connection.from().id() != source.id()) {
+                throw new IllegalArgumentException("connection source does not match the expansion source");
+            }
+            add(connection.id(), connection.to(), connection.lowerBound(), DIRECT,
+                    connection.transition(), 0, 0L);
+        }
+
+        public void addMembership(long id, Endpoint target, float lowerBound) {
+            add(id, target, lowerBound, MEMBERSHIP, null, 0, 0L);
+        }
+
+        public void addLocal(long id,
+                             Endpoint target,
+                             float lowerBound) {
+            add(id, target, lowerBound, LOCAL, null, 0, 0L);
+        }
+
+        public void addBoundary(long id,
+                                Endpoint target,
+                                float lowerBound,
+                                SuperClusterTopology.BoundaryLinks links,
+                                int edgeIndex,
+                                long movementMask) {
+            add(id, target, lowerBound, BOUNDARY, Objects.requireNonNull(links, "links"),
+                    edgeIndex, movementMask);
+        }
+
+        public void addAggregate(long id, Endpoint target, float lowerBound) {
+            add(id, target, lowerBound, AGGREGATE, null, 0, 0L);
+        }
+
+        // Part 0 is node-local work; parts 1..14 map directly to boundary slots 0..13.
+        public boolean needsPart(int part) {
+            return (skippedParts & partMask(part)) == 0L;
+        }
+
+        public void completePart(int part) {
+            long mask = partMask(part);
+            completedParts |= mask;
+            skippedParts |= mask;
+        }
+
+        public void addDependency(int part, DependencyKey dependency) {
+            Objects.requireNonNull(dependency, "dependency");
+            ensureDependencyCapacity(dependencyCount + 1);
+            dependencies[dependencyCount] = dependency;
+            dependencyParts[dependencyCount++] = partMask(part);
+        }
+
+        private void add(long id,
+                         Endpoint target,
+                         float lowerBound,
+                         byte kind,
+                         @Nullable Object payload,
+                         int payloadIndex,
+                         long primitivePayload) {
+            Objects.requireNonNull(target, "target");
+            if (!Float.isFinite(lowerBound) || lowerBound < 0.0F) {
+                throw new IllegalArgumentException("lowerBound must be finite and non-negative");
+            }
+            ensureConnectionCapacity(connectionCount + 1);
+            ids[connectionCount] = id;
+            targets[connectionCount] = target;
+            costs[connectionCount] = lowerBound;
+            kinds[connectionCount] = kind;
+            payloads[connectionCount] = payload;
+            payloadIndexes[connectionCount] = payloadIndex;
+            primitivePayloads[connectionCount] = primitivePayload;
+            connectionCount++;
+        }
+
+        private int connectionCount() {
+            return connectionCount;
+        }
+
+        private long connectionId(int index) {
+            return ids[index];
+        }
+
+        private Endpoint target(int index) {
+            return targets[index];
+        }
+
+        private float lowerBound(int index) {
+            return costs[index];
+        }
+
+        private byte transitionKind(int index) {
+            return kinds[index];
+        }
+
+        private Object transitionPayload(int index) {
+            return payloads[index];
+        }
+
+        private int transitionPayloadIndex(int index) {
+            return payloadIndexes[index];
+        }
+
+        private long transitionPrimitivePayload(int index) {
+            return primitivePayloads[index];
+        }
+
+        private int dependencyCount() {
+            return dependencyCount;
+        }
+
+        private DependencyKey dependency(int index) {
+            return dependencies[index];
+        }
+
+        private long dependencyParts(int index) {
+            return dependencyParts[index];
+        }
+
+        private long completedParts() {
+            return completedParts;
+        }
+
+        private static long partMask(int part) {
+            if (part < 0 || part >= Long.SIZE) throw new IllegalArgumentException("expansion part");
+            return 1L << part;
+        }
+
+        private void ensureConnectionCapacity(int required) {
+            if (required <= ids.length) {
+                return;
+            }
+            int capacity = Math.max(required, ids.length << 1);
+            ids = java.util.Arrays.copyOf(ids, capacity);
+            targets = java.util.Arrays.copyOf(targets, capacity);
+            costs = java.util.Arrays.copyOf(costs, capacity);
+            kinds = java.util.Arrays.copyOf(kinds, capacity);
+            payloads = java.util.Arrays.copyOf(payloads, capacity);
+            payloadIndexes = java.util.Arrays.copyOf(payloadIndexes, capacity);
+            primitivePayloads = java.util.Arrays.copyOf(primitivePayloads, capacity);
+        }
+
+        private void ensureDependencyCapacity(int required) {
+            if (required > dependencies.length) {
+                int capacity = Math.max(required, dependencies.length << 1);
+                dependencies = java.util.Arrays.copyOf(dependencies, capacity);
+                dependencyParts = java.util.Arrays.copyOf(dependencyParts, capacity);
+            }
+        }
+    }
+
+    public record DependencyKey(DependencyKind kind,
+                                SectionPos position,
+                                @Nullable SectionPos target,
+                                @Nullable Direction face) {
+        public DependencyKey {
+            Objects.requireNonNull(kind, "kind");
+            Objects.requireNonNull(position, "position");
+            boolean boundary = kind == DependencyKind.BASE_BOUNDARY
+                    || kind == DependencyKind.SUPER_BOUNDARY;
+            if (boundary ? target == null || face == null : target != null || face != null) {
+                throw new IllegalArgumentException(
+                        "boundary dependencies require a target section and face"
+                );
+            }
+            if (boundary) {
+                int distance = kind == DependencyKind.SUPER_BOUNDARY
+                        ? SuperClusterTopology.CHILDREN_PER_AXIS
+                        : 1;
+                SectionPos direct = SuperClusterTopology.offset(position, face, distance);
+                int verticalDelta = target.y() - position.y();
+                boolean adjacent = face.getAxis().isVertical()
+                        ? target.equals(direct)
+                        : target.x() == direct.x() && target.z() == direct.z()
+                        && Math.abs(verticalDelta) <= distance
+                        && verticalDelta % distance == 0;
+                if (!adjacent) {
+                    throw new IllegalArgumentException("boundary dependency is not adjacent");
+                }
+            }
+        }
+
+        public DependencyKey(DependencyKind kind, SectionPos position) {
+            this(kind, position, null, null);
+        }
+
+        public static DependencyKey superCluster(SectionPos origin) {
+            return new DependencyKey(DependencyKind.SUPER_CLUSTER, origin);
+        }
+
+        public static DependencyKey baseBoundary(SectionPos source,
+                                                 SectionPos target,
+                                                 Direction face) {
+            return new DependencyKey(DependencyKind.BASE_BOUNDARY, source, target, face);
+        }
+
+        public static DependencyKey superBoundary(SectionPos source,
+                                                  SectionPos target,
+                                                  Direction face) {
+            return new DependencyKey(DependencyKind.SUPER_BOUNDARY, source, target, face);
+        }
+    }
+
+    public enum DependencyKind {
+        BASE_CLUSTER,
+        SUPER_CLUSTER,
+        BASE_BOUNDARY,
+        SUPER_BOUNDARY
+    }
+
+    public sealed interface Endpoint permits ExactEndpoint, ComponentEndpoint, AggregateEndpoint {
+        long id();
+
+        BlockPos anchor();
+
+        long revision();
+    }
+
+    public record ExactEndpoint(long id, BlockPos anchor, long revision) implements Endpoint {
+        public ExactEndpoint {
+            anchor = Objects.requireNonNull(anchor, "anchor").immutable();
+        }
+    }
+
+    public record ComponentEndpoint(long id,
+                                    BlockPos anchor,
+                                    long revision,
+                                    SectionPos section,
+                                    BaseClusterTopology.Channel channel,
+                                    int componentId) implements Endpoint {
+        public ComponentEndpoint {
+            anchor = Objects.requireNonNull(anchor, "anchor").immutable();
+            Objects.requireNonNull(section, "section");
+            Objects.requireNonNull(channel, "channel");
+            if (componentId < 0) {
+                throw new IllegalArgumentException("componentId must be non-negative");
+            }
+        }
+    }
+
+    public record AggregateEndpoint(long id,
+                                    BlockPos anchor,
+                                    long revision,
+                                    SectionPos origin,
+                                    BaseClusterTopology.Channel channel,
+                                    int aggregateId) implements Endpoint {
+        public AggregateEndpoint {
+            anchor = Objects.requireNonNull(anchor, "anchor").immutable();
+            Objects.requireNonNull(origin, "origin");
+            Objects.requireNonNull(channel, "channel");
+            if (aggregateId < 0) {
+                throw new IllegalArgumentException("aggregate ID must be non-negative");
+            }
+        }
+    }
+
+    public record Connection(long id,
+                             Endpoint from,
+                             Endpoint to,
+                             float lowerBound,
+                             Transition transition) {
+        public Connection {
+            Objects.requireNonNull(from, "from");
+            Objects.requireNonNull(to, "to");
+            Objects.requireNonNull(transition, "transition");
+            if (!Float.isFinite(lowerBound) || lowerBound < 0.0F) {
+                throw new IllegalArgumentException("lowerBound must be finite and non-negative");
+            }
+        }
+    }
+
+    public sealed interface Transition
+            permits MembershipTransition, LocalTransition, BoundaryTransition, AggregateTransition {
+    }
+
+    public record MembershipTransition() implements Transition {
+        private static final MembershipTransition INSTANCE = new MembershipTransition();
+    }
+
+    public record LocalTransition() implements Transition {
+        private static final LocalTransition INSTANCE = new LocalTransition();
+    }
+
+    public static final class BoundaryTransition implements Transition {
+        private final Direction face;
+        private final short[] descriptors;
+        private final long[] spatialMasks;
+
+        private BoundaryTransition(Direction face, short[] descriptors, long[] spatialMasks) {
+            this.face = Objects.requireNonNull(face, "face");
+            this.descriptors = descriptors;
+            this.spatialMasks = spatialMasks;
+            if (descriptors.length == 0 || spatialMasks.length != descriptors.length * 4) {
+                throw new IllegalArgumentException("boundary transition requires complete bands");
+            }
+        }
+
+        public Direction face() { return face; }
+        public int bandCount() { return descriptors.length; }
+        public int sourceInset(int band) { return SuperClusterTopology.bandInset(descriptors[band]); }
+        public Direction horizontalDirection(int band) {
+            return SuperClusterTopology.bandDirection(descriptors[band]);
+        }
+        public int horizontalDistance(int band) {
+            return SuperClusterTopology.bandDistance(descriptors[band]);
+        }
+        public int verticalShift(int band) { return SuperClusterTopology.bandShift(descriptors[band]); }
+        public long maskWord(int band, int word) {
+            if (word < 0 || word >= 4) throw new IndexOutOfBoundsException("boundary mask word");
+            return spatialMasks[band * 4 + word];
+        }
+        public int retainedBytes() {
+            return 40 + descriptors.length * Short.BYTES + spatialMasks.length * Long.BYTES;
+        }
+    }
+
+    public record AggregateTransition() implements Transition {
+        private static final AggregateTransition INSTANCE = new AggregateTransition();
+    }
+
+    public record Corridor(List<Endpoint> endpoints, List<Connection> connections, float cost) {
+        public Corridor {
+            endpoints = List.copyOf(endpoints);
+            connections = List.copyOf(connections);
+            if (endpoints.size() != connections.size() + 1) {
+                throw new IllegalArgumentException("corridor endpoint count must be connection count plus one");
+            }
+            if (!Float.isFinite(cost) || cost < 0.0F) {
+                throw new IllegalArgumentException("corridor cost must be finite and non-negative");
+            }
+        }
+    }
+
+    public record Metrics(long expansionWorkUnits,
+                          long expandedNodes,
+                          long generatedConnections,
+                          long reopenedNodes,
+                          long reexpandedBlockedNodes,
+                          int maximumDegree,
+                          int maximumBlockedNodes) {
+        public static final Metrics EMPTY = new Metrics(0L, 0L, 0L, 0L, 0L, 0, 0);
+
+        public Metrics plus(@Nullable Metrics other) {
+            if (other == null) {
+                return this;
+            }
+            return new Metrics(
+                    expansionWorkUnits + other.expansionWorkUnits,
+                    expandedNodes + other.expandedNodes,
+                    generatedConnections + other.generatedConnections,
+                    reopenedNodes + other.reopenedNodes,
+                    reexpandedBlockedNodes + other.reexpandedBlockedNodes,
+                    Math.max(maximumDegree, other.maximumDegree),
+                    Math.max(maximumBlockedNodes, other.maximumBlockedNodes)
+            );
+        }
+    }
+
+    public record Progress(Status status, Failure failure, Metrics metrics,
+                           long workerTasks, long dependencyWaits, int pendingDependencies,
+                           boolean hierarchical, int witnessSegments,
+                           long queueNanos, long wallNanos,
+                           @Nullable SectionPos blockedSection) {
+        public static final Progress PENDING = new Progress(Status.RUNNING, Failure.NONE,
+                Metrics.EMPTY, 0L, 0L, 0, false, 0, 0L, 0L, null);
+
+        public Progress after(Progress previous) {
+            return new Progress(status, failure, previous.metrics.plus(metrics),
+                    previous.workerTasks + workerTasks,
+                    previous.dependencyWaits + dependencyWaits, pendingDependencies,
+                    previous.hierarchical || hierarchical,
+                    previous.witnessSegments + witnessSegments,
+                    previous.queueNanos + queueNanos,
+                    previous.wallNanos + wallNanos, blockedSection);
+        }
+
+        public Progress withOutcome(Status outcome, Failure reason,
+                                    @Nullable SectionPos blocked) {
+            return new Progress(outcome, reason, metrics, workerTasks, dependencyWaits,
+                    pendingDependencies, hierarchical, witnessSegments,
+                    queueNanos, wallNanos, blocked);
+        }
+    }
+
+    public enum Failure {
+        NONE,
+        NO_STRUCTURAL_ROUTE,
+        SEARCH_LIMIT_REACHED,
+        UNAVAILABLE_CHUNK,
+        FACTS_RECOVERY_FAILED,
+        FACTS_PERSISTENCE_UNAVAILABLE,
+        STALE_WORLD,
+        CANCELLED
+    }
+
+    private final class SearchNode extends Node {
+        private final Endpoint endpoint;
+        private SearchNode previous;
+        private long viaId;
+        private float viaLowerBound;
+        private byte viaKind;
+        private Object viaPayload;
+        private int viaPayloadIndex;
+        private long viaPrimitivePayload;
+        private boolean expansionStarted;
+        private long completedExpansionParts;
+        private Map<DependencyKey, Long> pendingParts;
+        private Map<DependencyKey, Unavailability> unavailableDependencies;
+
+        private SearchNode(Endpoint endpoint) {
+            super((int) endpoint.id(), (int) (endpoint.id() >>> 32), 0);
+            this.endpoint = endpoint;
+            this.g = Float.POSITIVE_INFINITY;
+        }
+
+        private long pendingPartMask() {
+            if (pendingParts == null) return 0L;
+            long mask = 0L;
+            for (long parts : pendingParts.values()) mask |= parts;
+            return mask;
+        }
+    }
+}
