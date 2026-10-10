@@ -24,6 +24,7 @@ import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
+import net.minecraft.world.phys.shapes.Shapes;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
@@ -59,6 +60,20 @@ public final class TopologyService {
             | BaseClusterTopology.GROUND_OPEN | BaseClusterTopology.FLUID
             | BaseClusterTopology.EXACT_REQUIRED;
     private static final int COLLIDES = 1 << 4;
+    private static final CollisionSample LIQUID_DRY = new CollisionSample(
+            BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN,
+            SectionGeometry.empty());
+    private static final CollisionSample LIQUID_WET = new CollisionSample(
+            BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN
+                    | BaseClusterTopology.FLUID, SectionGeometry.empty());
+    private static final CollisionSample EMPTY_DRY = new CollisionSample(
+            BaseClusterTopology.VOLUME_OPEN, SectionGeometry.empty());
+    private static final CollisionSample EMPTY_WET = new CollisionSample(
+            BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.FLUID, SectionGeometry.empty());
+    private static final CollisionSample FULL_DRY = new CollisionSample(COLLIDES,
+            SectionGeometry.fullBlock());
+    private static final CollisionSample FULL_WET = new CollisionSample(
+            COLLIDES | BaseClusterTopology.FLUID, SectionGeometry.fullBlock());
     private static final int HAS_ABOVE = 1 << 16;
     private static final int MAX_MACRO_REQUESTS = 1_024;
     public static final int MAX_GRAPH_CAPTURE_DISTANCE = BaseGraphCapture.MAX_DISTANCE;
@@ -1270,18 +1285,14 @@ public final class TopologyService {
         boolean fluid = !state.getFluidState().isEmpty();
         int fluidFlag = fluid ? BaseClusterTopology.FLUID : 0;
         if (state.getBlock() instanceof LiquidBlock) {
-            return new CollisionSample(
-                    fluidFlag | BaseClusterTopology.VOLUME_OPEN
-                            | BaseClusterTopology.GROUND_OPEN,
-                    SectionGeometry.empty());
+            return fluid ? LIQUID_WET : LIQUID_DRY;
         }
         VoxelShape shape = state.getCollisionShape(getter, position, CollisionContext.empty());
         if (shape.isEmpty()) {
-            return new CollisionSample(fluidFlag | BaseClusterTopology.VOLUME_OPEN,
-                    SectionGeometry.empty());
+            return fluid ? EMPTY_WET : EMPTY_DRY;
         }
-        if (Block.isShapeFullBlock(shape)) {
-            return new CollisionSample(fluidFlag | COLLIDES, SectionGeometry.fullBlock());
+        if (shape == Shapes.block() || Block.isShapeFullBlock(shape)) {
+            return fluid ? FULL_WET : FULL_DRY;
         }
         List<SectionGeometry.Box> boxes = new ArrayList<>();
         for (net.minecraft.world.phys.AABB box : shape.toAabbs()) {

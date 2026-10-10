@@ -75,7 +75,7 @@ final class DoorContracts {
 
     private static byte[] encode(SectionGeometry geometry) throws Exception {
         var bytes = new ByteArrayOutputStream();
-        geometry.write(new DataOutputStream(bytes));
+        geometry.write(new DataOutputStream(bytes), new byte[8192]);
         return bytes.toByteArray();
     }
 
@@ -122,7 +122,7 @@ final class DoorContracts {
         var packed = BaseClusterTopology.PackedFacts.fromCells(new byte[4096], original);
         var payload = new ByteArrayOutputStream(); var output = new DataOutputStream(payload);
         output.writeInt(0x414e544f); output.writeInt(6); output.writeInt(7); output.writeInt(1);
-        output.writeInt(0); output.writeLong(1); output.write(packed.bytes()); original.write(output);
+        output.writeInt(0); output.writeLong(1); output.write(packed.bytes()); original.write(output, new byte[8192]);
         var decoder = TopologyStore.class.getDeclaredMethod("decodeChunk", DataInputStream.class); decoder.setAccessible(true);
         Object image = decoder.invoke(null, new DataInputStream(new ByteArrayInputStream(payload.toByteArray())));
         Method sections = image.getClass().getDeclaredMethod("sections"); sections.setAccessible(true);

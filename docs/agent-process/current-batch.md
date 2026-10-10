@@ -4,4 +4,4 @@
 
 | 任务键 | 恢复正文 | 当前状态 |
 | --- | --- | --- |
-| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 原型288批及真实城市48批完成；保留两组，真实编码压缩改善17–18%；用户预授权先push基线再新工程接入，当前待前置push |
+| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 第一轮生产优化本地完成；第二轮排队合并原型/144批诊断及DeepSeek共识成立，按持续授权先push当前基线再接入Store |

@@ -658,7 +658,7 @@ public final class CoreContracts {
 
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            geometry.write(output);
+            geometry.write(output, new byte[8192]);
         }
         SectionGeometry restored;
         try (DataInputStream input = new DataInputStream(

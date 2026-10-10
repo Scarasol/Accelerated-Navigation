@@ -27,6 +27,10 @@ final class SectionGeometry {
     private static final int MAX_PALETTE = 4096;
     private static final int MAX_BOXES = 64;
 
+    private static final Cell EMPTY_CELL = new Cell(Shape.EMPTY);
+    private static final Cell FULL_CELL = new Cell(Shape.FULL);
+    private static final Cell UNKNOWN_CELL = new Cell(Shape.UNKNOWN);
+
     private final short[] cells;
     private final Shape[] palette;
     private final long fingerprint;
@@ -55,13 +59,15 @@ final class SectionGeometry {
         shapes.add(Shape.FULL);
         shapes.add(Shape.UNKNOWN);
         Map<Shape, Short> ids = new HashMap<>();
-        ids.put(Shape.EMPTY, (short) EMPTY);
-        ids.put(Shape.FULL, (short) FULL_BLOCK);
-        ids.put(Shape.UNKNOWN, (short) UNKNOWN);
         short[] cells = new short[values.length];
         for (int cell = 0; cell < values.length; cell++) {
             Cell value = Objects.requireNonNull(values[cell], "geometry cell");
             Shape shape = value.shape();
+            if (shape == Shape.EMPTY || shape == Shape.FULL || shape == Shape.UNKNOWN) {
+                cells[cell] = (short) (shape == Shape.EMPTY ? EMPTY
+                        : shape == Shape.FULL ? FULL_BLOCK : UNKNOWN);
+                continue;
+            }
             Short id = ids.get(shape);
             if (id == null) {
                 if (shapes.size() >= MAX_PALETTE) {
@@ -84,10 +90,10 @@ final class SectionGeometry {
         Cell[] cells = new Cell[flags.length];
         for (int cell = 0; cell < flags.length; cell++) {
             int value = Byte.toUnsignedInt(flags[cell]);
-            cells[cell] = new Cell((value & BaseClusterTopology.EXACT_REQUIRED) != 0
-                    ? Shape.UNKNOWN
+            cells[cell] = (value & BaseClusterTopology.EXACT_REQUIRED) != 0
+                    ? unknown()
                     : (value & BaseClusterTopology.VOLUME_OPEN) == 0
-                    ? Shape.FULL : Shape.EMPTY);
+                    ? fullBlock() : empty();
         }
         return fromCells(cells);
     }
@@ -125,7 +131,9 @@ final class SectionGeometry {
         return new SectionGeometry(cells, palette);
     }
 
-    void write(DataOutput output) throws IOException {
+    void write(DataOutput output, byte[] scratch) throws IOException {
+        if (scratch.length < BaseClusterTopology.CELL_COUNT * Short.BYTES)
+            throw new IllegalArgumentException("geometry scratch buffer too small");
         output.writeInt(palette.length);
         for (int index = 3; index < palette.length; index++) {
             Shape shape = palette[index];
@@ -133,7 +141,12 @@ final class SectionGeometry {
             output.writeByte(boxes | (shape.kind == 4 ? 128 : shape.kind == 5 ? 64 : 0));
             for (short coordinate : shape.coordinates) output.writeByte(coordinate);
         }
-        for (short cell : cells) output.writeShort(Short.toUnsignedInt(cell));
+        int offset = 0;
+        for (short cell : cells) {
+            scratch[offset++] = (byte) (Short.toUnsignedInt(cell) >>> 8);
+            scratch[offset++] = (byte) cell;
+        }
+        output.write(scratch, 0, BaseClusterTopology.CELL_COUNT * Short.BYTES);
     }
 
     Shape shape(int cell) {
@@ -196,15 +209,15 @@ final class SectionGeometry {
     }
 
     static Cell empty() {
-        return new Cell(Shape.EMPTY);
+        return EMPTY_CELL;
     }
 
     static Cell fullBlock() {
-        return new Cell(Shape.FULL);
+        return FULL_CELL;
     }
 
     static Cell unknown() {
-        return new Cell(Shape.UNKNOWN);
+        return UNKNOWN_CELL;
     }
 
     static Cell door(Cell cell, boolean openable) {

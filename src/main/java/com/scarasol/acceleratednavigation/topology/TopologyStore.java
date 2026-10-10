@@ -55,6 +55,8 @@ final class TopologyStore implements AutoCloseable {
     private final ArrayDeque<IoTask> background = new ArrayDeque<>();
     private final LinkedHashMap<RegionKey, RegionFile> regions =
             new LinkedHashMap<>(16, 0.75F, true);
+    private final byte[] geometryScratch =
+            new byte[BaseClusterTopology.CELL_COUNT * Short.BYTES];
     private final Thread worker;
 
     private boolean accepting = true;
@@ -568,7 +570,7 @@ final class TopologyStore implements AutoCloseable {
                 output.writeLong(section.getValue().version);
                 BaseClusterTopology.PackedFacts facts = section.getValue().facts;
                 output.write(facts.bytes());
-                facts.geometry().write(output);
+                facts.geometry().write(output, geometryScratch);
             }
         }
     }
