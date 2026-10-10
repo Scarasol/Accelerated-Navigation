@@ -4,4 +4,4 @@
 
 | 任务键 | 恢复正文 | 当前状态 |
 | --- | --- | --- |
-| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 门原型接入条件成立；获准先push新工程基线到1.20.1，再生产接入。当前02，基线待push，旧工程只读 |
+| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 原型288批及真实城市48批完成；保留两组，真实编码压缩改善17–18%；用户预授权先push基线再新工程接入，当前待前置push |

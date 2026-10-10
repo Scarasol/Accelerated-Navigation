@@ -21,7 +21,7 @@ public final class BaseClusterTopology {
     public static final int SIDE = 16;
     public static final int CELL_COUNT = SIDE * SIDE * SIDE;
     static final int PACKED_FACT_BYTES = CELL_COUNT / 2;
-    static final int FACTS_ALGORITHM_VERSION = 6;
+    static final int FACTS_ALGORITHM_VERSION = 7;
     public static final int VOLUME_OPEN = 1;
     public static final int GROUND_OPEN = 1 << 1;
     public static final int FLUID = 1 << 2;
@@ -108,7 +108,7 @@ public final class BaseClusterTopology {
         Objects.requireNonNull(geometry, "geometry");
         Objects.requireNonNull(scratch, "scratch").reset();
         deriveLegalAnchors(input, geometry, scratch);
-        int componentCount = labelComponents(geometry.channel(), scratch);
+        int componentCount = labelComponents(input, geometry, scratch);
         BitStorage labels = compactLabels(scratch.labels, componentCount);
         int uniformLabel = uniformLabel(scratch.labels);
         int baseLabel = uniformLabel < 0 ? 0 : uniformLabel;
@@ -281,6 +281,7 @@ public final class BaseClusterTopology {
         json.name("width").value(geometry.width());
         json.name("height").value(geometry.height());
         json.name("acceptsFluid").value(geometry.acceptsFluid());
+        json.name("canOpenDoors").value(geometry.canOpenDoors());
         json.endObject();
         json.name("baseLabel").value(baseLabel);
         json.name("labelCellOrder").value("(y << 8) | (z << 4) | x");
@@ -350,7 +351,7 @@ public final class BaseClusterTopology {
                         volume |= 1 << (x - EXTENDED_MIN);
                     }
                     if (y < SIDE && (geometry.acceptsFluid() || (flags & FLUID) == 0)
-                            && (flags & GROUND_OPEN) != 0) {
+                            && input.groundOpen(x, y, z, flags, geometry, scratch)) {
                         ground |= 1 << (x - EXTENDED_MIN);
                     }
                 }
@@ -450,7 +451,9 @@ public final class BaseClusterTopology {
         }
     }
 
-    private static int labelComponents(Channel channel, BuildScratch scratch) {
+    private static int labelComponents(BuildInput input, GeometryKey geometry, BuildScratch scratch) {
+        Channel channel = geometry.channel();
+        BoundaryGeometry collision = input.hasDoors ? new BoundaryGeometry(input) : null;
         int componentCount = 0;
         for (int candidate = 0; candidate < CELL_COUNT; candidate++) {
             if (!isSet(scratch.legalMask, candidate) || scratch.labels[candidate] != 0) {
@@ -473,13 +476,13 @@ public final class BaseClusterTopology {
                 minX = Math.min(minX, x); maxX = Math.max(maxX, x);
                 minY = Math.min(minY, y); maxY = Math.max(maxY, y);
                 minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
-                tail = enqueue(x - 1, y, z, componentCount, scratch, tail);
-                tail = enqueue(x + 1, y, z, componentCount, scratch, tail);
-                tail = enqueue(x, y, z - 1, componentCount, scratch, tail);
-                tail = enqueue(x, y, z + 1, componentCount, scratch, tail);
+                tail = enqueue(x - 1, y, z, componentCount, scratch, tail, cell, input, geometry, collision);
+                tail = enqueue(x + 1, y, z, componentCount, scratch, tail, cell, input, geometry, collision);
+                tail = enqueue(x, y, z - 1, componentCount, scratch, tail, cell, input, geometry, collision);
+                tail = enqueue(x, y, z + 1, componentCount, scratch, tail, cell, input, geometry, collision);
                 if (channel == Channel.VOLUME) {
-                    tail = enqueue(x, y - 1, z, componentCount, scratch, tail);
-                    tail = enqueue(x, y + 1, z, componentCount, scratch, tail);
+                    tail = enqueue(x, y - 1, z, componentCount, scratch, tail, cell, input, geometry, collision);
+                    tail = enqueue(x, y + 1, z, componentCount, scratch, tail, cell, input, geometry, collision);
                 }
             }
             scratch.componentMetadata[componentCount] = candidate
@@ -495,12 +498,17 @@ public final class BaseClusterTopology {
                                int z,
                                int componentId,
                                BuildScratch scratch,
-                               int tail) {
+                               int tail, int sourceCell, BuildInput input, GeometryKey geometry,
+                               BoundaryGeometry collision) {
         if (!inBounds(x, y, z)) {
             return tail;
         }
         int cell = cellIndex(x, y, z);
         if (isSet(scratch.legalMask, cell) && scratch.labels[cell] == 0) {
+            int sx = x(sourceCell), sy = y(sourceCell), sz = z(sourceCell);
+            if (collision != null && sy == y && !input.doorMoveOpen(
+                    sx, sy, sz, x > sx ? Direction.EAST : x < sx ? Direction.WEST
+                    : z > sz ? Direction.SOUTH : Direction.NORTH, 1, 0, geometry, collision)) return tail;
             scratch.labels[cell] = (char) (componentId + 1);
             scratch.queue[tail++] = cell;
         }
@@ -512,6 +520,7 @@ public final class BaseClusterTopology {
                                                     BuildScratch scratch,
                                                     int componentCount) {
         Long2LongOpenHashMap merged = scratch.edgeMap;
+        BoundaryGeometry collision = input.hasDoors ? new BoundaryGeometry(input) : null;
         for (int cell = 0; cell < CELL_COUNT; cell++) {
             int encoded = scratch.labels[cell];
             if (encoded == 0) {
@@ -551,6 +560,8 @@ public final class BaseClusterTopology {
                         )) {
                             continue;
                         }
+                        if (collision != null && !input.doorMoveOpen(
+                                x, y, z, direction, horizontal, dy, geometry, collision)) continue;
                         long capabilityMask = supportingCapabilities(
                                 requiredStep,
                                 jumpClass,
@@ -732,14 +743,8 @@ public final class BaseClusterTopology {
                               int heightCells,
                               float width,
                               float height,
-                              boolean acceptsFluid) {
-        public GeometryKey(Channel channel,
-                           int widthCells,
-                           int heightCells,
-                           boolean acceptsFluid) {
-            this(channel, widthCells, heightCells, widthCells, heightCells, acceptsFluid);
-        }
-
+                              boolean acceptsFluid,
+                              boolean canOpenDoors) {
         public GeometryKey {
             Objects.requireNonNull(channel, "channel");
             if (widthCells < 1 || widthCells > SIDE || heightCells < 1 || heightCells > SIDE) {
@@ -775,9 +780,10 @@ public final class BaseClusterTopology {
                                    int maxStep,
                                    int maxJump,
                                    int maxDrop,
-                                   boolean acceptsFluid) {
+                                   boolean acceptsFluid,
+                                   boolean canOpenDoors) {
         public static final TraversalProfile DEFAULT_GROUND =
-                new TraversalProfile(0.6F, 1.95F, 1, 0, 3, false);
+                new TraversalProfile(0.6F, 1.95F, 1, 0, 3, false, false);
 
         public TraversalProfile {
             if (!Float.isFinite(width) || width <= 0.0F
@@ -792,7 +798,7 @@ public final class BaseClusterTopology {
         public GeometryKey geometry(Channel channel) {
             int widthCells = (int) Math.ceil(width);
             int heightCells = (int) Math.ceil(height);
-            return new GeometryKey(channel, widthCells, heightCells, width, height, acceptsFluid);
+            return new GeometryKey(channel, widthCells, heightCells, width, height, acceptsFluid, canOpenDoors);
         }
 
         public MovementKey movement(Channel channel) {
@@ -811,6 +817,7 @@ public final class BaseClusterTopology {
         private final PackedFacts[] facts;
         private final long[] revisions;
         private final long[] fingerprints;
+        private final boolean hasDoors;
 
         BuildInput(PackedFacts center,
                    byte[] offsets,
@@ -822,6 +829,8 @@ public final class BaseClusterTopology {
             this.facts = facts.clone();
             this.revisions = revisions.clone();
             this.fingerprints = fingerprints.clone();
+            this.hasDoors = center.geometry().hasDoors()
+                    || Arrays.stream(facts).anyMatch(f -> f.geometry().hasDoors());
             if (offsets.length != facts.length || offsets.length != revisions.length
                     || offsets.length != fingerprints.length || offsets.length > 26) {
                 throw new IllegalArgumentException("inconsistent halo facts");
@@ -924,6 +933,35 @@ public final class BaseClusterTopology {
             ));
         }
 
+        boolean groundOpen(int x, int y, int z, int currentFlags, GeometryKey body, BuildScratch scratch) {
+            if (!body.canOpenDoors() || !hasDoors) return (currentFlags & GROUND_OPEN) != 0;
+            PackedFacts current = sourceFacts(x, y, z, scratch);
+            boolean door = current != null && current.geometry().hasDoors() && current.geometry().shape(cellIndex(
+                    Math.floorMod(x,16),Math.floorMod(y,16),Math.floorMod(z,16))).openableDoor();
+            int belowFlags = flags(x, y-1, z, scratch);
+            PackedFacts below = (y & 15) != 0 ? current : sourceFacts(x, y-1, z, scratch);
+            boolean belowDoor = below != null && below.geometry().hasDoors() && below.geometry().shape(cellIndex(
+                    Math.floorMod(x,16),Math.floorMod(y-1,16),Math.floorMod(z,16))).openableDoor();
+            if (belowDoor) return false;
+            if (!door) return (currentFlags & GROUND_OPEN) != 0;
+            return below != null && ((belowFlags & VOLUME_OPEN) == 0 || (belowFlags & EXACT_REQUIRED) != 0);
+        }
+
+        boolean doorMoveOpen(int x, int y, int z, Direction direction, int distance, int dy,
+                             GeometryKey body, BoundaryGeometry collision) {
+            double half = body.width()*.5;
+            int x2=x+direction.getStepX()*distance, z2=z+direction.getStepZ()*distance;
+            int minX=(int)Math.floor(Math.min(x,x2)+.5-half), maxX=(int)Math.ceil(Math.max(x,x2)+.5+half)-1;
+            int minZ=(int)Math.floor(Math.min(z,z2)+.5-half), maxZ=(int)Math.ceil(Math.max(z,z2)+.5+half)-1;
+            int minY=Math.min(y,y+dy), maxY=(int)Math.ceil(Math.max(y,y+dy)+(distance>1?1:0)+body.height())-1;
+            for(int cy=minY;cy<=maxY;cy++) for(int cz=minZ;cz<=maxZ;cz++) for(int cx=minX;cx<=maxX;cx++) {
+                PackedFacts fact=sourceFacts(cx,cy,cz,null);
+                if(fact!=null && fact.geometry().hasDoors() && fact.geometry().shape(cellIndex(Math.floorMod(cx,16),Math.floorMod(cy,16),Math.floorMod(cz,16))).isDoor())
+                    return collision.open(body,x,y,z,direction,distance,dy);
+            }
+            return true;
+        }
+
         boolean volumeOpen(int x,
                            int y,
                            int z,
@@ -939,7 +977,7 @@ public final class BaseClusterTopology {
                     Math.floorMod(x, SIDE),
                     Math.floorMod(y, SIDE),
                     Math.floorMod(z, SIDE)
-            ), geometry.width(), geometry.height());
+            ), geometry.width(), geometry.height(), geometry.canOpenDoors());
         }
 
         @Nullable
@@ -1040,7 +1078,7 @@ public final class BaseClusterTopology {
             SectionGeometry sectionGeometry = source.geometry();
             return sectionGeometry != null
                     && !sectionGeometry.occupied(cellIndex(x, y, z),
-                    geometry.width(), geometry.height());
+                    geometry.width(), geometry.height(), geometry.canOpenDoors());
         }
 
         HaloStamps usedStamps(boolean[] used) {

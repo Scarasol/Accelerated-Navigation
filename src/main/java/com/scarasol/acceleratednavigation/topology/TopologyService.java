@@ -14,6 +14,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -1287,11 +1288,15 @@ public final class TopologyService {
             boxes.add(SectionGeometry.quantized(
                     box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ));
         }
+        SectionGeometry.Cell geometry = SectionGeometry.boxes(boxes);
+        if (state.getBlock() instanceof DoorBlock) {
+            geometry = SectionGeometry.door(geometry, DoorBlock.isWoodenDoor(state));
+        }
         return new CollisionSample(
                 fluidFlag | BaseClusterTopology.VOLUME_OPEN
                         | BaseClusterTopology.GROUND_OPEN
                         | BaseClusterTopology.EXACT_REQUIRED | COLLIDES,
-                SectionGeometry.boxes(boxes));
+                geometry);
     }
 
     public interface ChunkFactsCarrier {

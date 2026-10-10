@@ -32,7 +32,7 @@ import java.util.concurrent.TimeUnit;
 final class TopologyStore implements AutoCloseable {
 
     private static final int MAGIC = 0x414E544F;
-    private static final int SCHEMA_VERSION = 5;
+    private static final int SCHEMA_VERSION = 6;
     private static final int MAX_SECTIONS_PER_CHUNK = 1_024;
     private static final int MAX_DECODED_CHUNKS = 256;
     private static final int MAX_OPEN_REGIONS = 256;

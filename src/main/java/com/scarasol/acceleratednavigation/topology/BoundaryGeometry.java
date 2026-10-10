@@ -16,16 +16,26 @@ final class BoundaryGeometry {
 
     private final BaseClusterTopology source;
     private final BaseClusterTopology target;
+    private final BaseClusterTopology.BuildInput local;
     private final Long2ObjectOpenHashMap<SectionGeometry> sections = new Long2ObjectOpenHashMap<>();
 
     BoundaryGeometry(BaseClusterTopology source, BaseClusterTopology target) {
         this.source = source;
         this.target = target;
+        this.local = null;
+    }
+
+    BoundaryGeometry(BaseClusterTopology.BuildInput input) {
+        this.source = null; this.target = null; this.local = input;
     }
 
     @Nullable
     private SectionGeometry at(int x, int y, int z) {
         int sx = Math.floorDiv(x, 16), sy = Math.floorDiv(y, 16), sz = Math.floorDiv(z, 16);
+        if (local != null) {
+            var fact = local.atSection(sx, sy, sz);
+            return fact == null ? null : fact.geometry();
+        }
         long key = SectionPos.asLong(sx, sy, sz);
         if (sections.containsKey(key)) return sections.get(key);
         int ax = sx - source.section().x(), ay = sy - source.section().y(), az = sz - source.section().z();
@@ -62,6 +72,7 @@ final class BoundaryGeometry {
                 if (geometry == null) return false;
                 SectionGeometry.Shape shape = geometry.shape(BaseClusterTopology.cellIndex(
                         Math.floorMod(cx, 16), Math.floorMod(cy, 16), Math.floorMod(cz, 16)));
+                if (body.canOpenDoors() && shape.openableDoor()) continue;
                 for (int box = 0; box < shape.coordinateCount(); box += 6) {
                     double aS = (xAxis ? cx : cz) + shape.coordinate(box + (xAxis ? 0 : 2)) / 16.;
                     double bS = (xAxis ? cx : cz) + shape.coordinate(box + (xAxis ? 3 : 5)) / 16.;

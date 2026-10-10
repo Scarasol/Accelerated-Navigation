@@ -101,6 +101,7 @@ final class BaseGraphCapture {
                 json.name("maxJump").value(profile.maxJump());
                 json.name("maxDrop").value(profile.maxDrop());
                 json.name("acceptsFluid").value(profile.acceptsFluid());
+                json.name("canOpenDoors").value(profile.canOpenDoors());
                 json.endObject();
                 json.name("sections").beginArray();
             } catch (IOException | RuntimeException failure) {

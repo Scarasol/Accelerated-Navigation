@@ -54,7 +54,10 @@ final class NavigationCommand {
                 .then(Commands.argument("start", BlockPosArgument.blockPos())
                         .then(Commands.argument("goal", BlockPosArgument.blockPos())
                                 .then(Commands.argument("detailed", BoolArgumentType.bool())
-                                        .executes(this::execute)))));
+                                        .executes(context -> execute(context, false))
+                                        .then(Commands.argument("canOpenDoors", BoolArgumentType.bool())
+                                                .executes(context -> execute(context,
+                                                        BoolArgumentType.getBool(context, "canOpenDoors"))))))));
     }
 
     private int executeGraph(CommandContext<CommandSourceStack> context) {
@@ -113,7 +116,7 @@ final class NavigationCommand {
         }
     }
 
-    private int execute(CommandContext<CommandSourceStack> context) {
+    private int execute(CommandContext<CommandSourceStack> context, boolean canOpenDoors) {
         CommandSourceStack source = context.getSource();
         ServerPlayer player = source.getPlayer();
         if (player == null) return 0;
@@ -138,13 +141,14 @@ final class NavigationCommand {
             report(level.getServer(), old, "CANCELLED_REPLACED", null,
                     System.nanoTime() - old.startedNanos);
         }
-        Session session = new Session(owner, level.dimension(), start, goal, System.nanoTime());
+        Session session = new Session(owner, level.dimension(), start, goal, canOpenDoors, System.nanoTime());
         sessions.put(owner, session);
         try {
             TopologyService.MacroRequest request = TopologyService.forServer(level.getServer())
                     .requestMacroQuery(level, owner, start, goal,
                             BaseClusterTopology.Channel.GROUND,
-                            BaseClusterTopology.TraversalProfile.DEFAULT_GROUND,
+                            new BaseClusterTopology.TraversalProfile(0.6F, 1.95F, 1, 0, 3,
+                                    false, canOpenDoors),
                             NavigationScheduler.Priority.ACTIVE);
             session.request = request;
             player.sendSystemMessage(Component.literal("宏观寻路已提交，完成后会报告结果与耗时。"));
@@ -237,8 +241,8 @@ final class NavigationCommand {
     private static void report(MinecraftServer server, Session session, String result,
                                Throwable failure, long elapsedNanos) {
         long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(Math.max(0L, elapsedNanos));
-        AcceleratedNavigation.LOGGER.info("Navigation macro query owner={} dimension={} start={} goal={} result={} elapsedMs={}",
-                session.owner, session.dimension.location(), session.start, session.goal, result, elapsedMillis);
+        AcceleratedNavigation.LOGGER.info("Navigation macro query owner={} dimension={} start={} goal={} canOpenDoors={} result={} elapsedMs={}",
+                session.owner, session.dimension.location(), session.start, session.goal, session.canOpenDoors, result, elapsedMillis);
         if (failure != null && !(failure instanceof CancellationException)) {
             AcceleratedNavigation.LOGGER.warn("Navigation macro query failed for {}", session.owner, failure);
         }
@@ -346,17 +350,20 @@ final class NavigationCommand {
         private final long startedNanos;
         private final BlockPos start;
         private final BlockPos goal;
+        private final boolean canOpenDoors;
         private TopologyService.MacroRequest request;
         private List<Vec3> points = List.of();
         private long displayUntilNanos;
         private int nextRefreshTick;
 
-        private Session(UUID owner, ResourceKey<Level> dimension, BlockPos start, BlockPos goal, long startedNanos) {
+        private Session(UUID owner, ResourceKey<Level> dimension, BlockPos start, BlockPos goal,
+                        boolean canOpenDoors, long startedNanos) {
             this.owner = owner;
             this.dimension = dimension;
             this.start = start.immutable();
             this.goal = goal.immutable();
             this.startedNanos = startedNanos;
+            this.canOpenDoors = canOpenDoors;
         }
     }
 }

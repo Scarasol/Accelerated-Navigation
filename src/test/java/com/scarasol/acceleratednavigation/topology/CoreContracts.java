@@ -33,6 +33,12 @@ public final class CoreContracts {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && args[0].equals("door")) {
+            DoorContracts.run();
+            graphCaptureKeepsStructureAndMarksMissingSections();
+            System.out.println("Door integration and graph export contracts passed");
+            return;
+        }
         if (args.length == 1 && args[0].equals("boundary-recovery")) {
             runtimeSearchSurvivesSameVersionBoundaryRecovery(false);
             runtimeSearchSurvivesSameVersionBoundaryRecovery(true);
@@ -362,7 +368,7 @@ public final class CoreContracts {
                 "production crossing ignored closed or open door geometry");
         for (float width : new float[]{.3F, .6F, 1.2F}) {
             var body = new BaseClusterTopology.GeometryKey(BaseClusterTopology.Channel.GROUND,
-                    (int) Math.ceil(width), 2, width, 1.95F, false);
+                    (int) Math.ceil(width), 2, width, 1.95F, false, false);
             require(!new BoundaryGeometry(closed, target).open(body, 15, 4, 8, Direction.EAST, 1, 0),
                     "body width bypassed door geometry");
         }
@@ -384,7 +390,7 @@ public final class CoreContracts {
                         == connected.aggregateId(east, target.componentAt(0, 4, 8)),
                 "parent internal boundary removed the open passage");
         var volumeBody = new BaseClusterTopology.GeometryKey(BaseClusterTopology.Channel.VOLUME,
-                1, 1, .3F, .4F, false);
+                1, 1, .3F, .4F, false, false);
         BaseClusterTopology lower = BaseClusterTopology.build(west, 1,
                 BaseClusterTopology.BuildInput.center(BaseClusterTopology.PackedFacts.allAir()),
                 volumeBody, new BaseClusterTopology.BuildScratch());
@@ -660,7 +666,7 @@ public final class CoreContracts {
             restored = SectionGeometry.read(input);
         }
         require(restored.fingerprint() == geometry.fingerprint()
-                        && restored.occupied(wallCell, 0.6F, 1.95F),
+                        && restored.occupied(wallCell, 0.6F, 1.95F, false),
                 "section geometry persistence changed collision semantics");
     }
 
@@ -799,6 +805,8 @@ public final class CoreContracts {
                                 .equals(Long.toUnsignedString(graph.signature(), 16))
                                 && encoded.getAsJsonArray("outgoingOffsets").size() == graph.componentCount() + 1
                                 && document.getAsJsonObject("profile").get("maxDrop").getAsInt() == 3
+                                && !document.getAsJsonObject("profile").get("canOpenDoors").getAsBoolean()
+                                && !encoded.getAsJsonObject("geometry").get("canOpenDoors").getAsBoolean()
                                 && encoded.getAsJsonArray("componentLabelValues").get(
                                 BaseClusterTopology.cellIndex(0, 0, 0)).getAsInt()
                                 + encoded.get("baseLabel").getAsInt() - 1 == graph.componentAt(0, 0, 0)

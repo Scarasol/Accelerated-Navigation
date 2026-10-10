@@ -30,11 +30,13 @@ final class SectionGeometry {
     private final short[] cells;
     private final Shape[] palette;
     private final long fingerprint;
+    private final boolean hasDoors;
 
     private SectionGeometry(short[] cells, Shape[] palette) {
         this.cells = cells;
         this.palette = palette;
         this.fingerprint = fingerprint(cells, palette);
+        this.hasDoors = Arrays.stream(palette).anyMatch(Shape::isDoor);
         validate();
     }
 
@@ -100,7 +102,9 @@ final class SectionGeometry {
         palette[FULL_BLOCK] = Shape.FULL;
         palette[UNKNOWN] = Shape.UNKNOWN;
         for (int index = 3; index < paletteSize; index++) {
-            int boxCount = input.readUnsignedByte();
+            int header = input.readUnsignedByte();
+            int kind = (header & 128) != 0 ? 4 : header > 64 ? 5 : 3;
+            int boxCount = kind == 4 ? header & 127 : kind == 5 ? header & 63 : header;
             if (boxCount < 1 || boxCount > MAX_BOXES) {
                 throw new IllegalArgumentException("invalid geometry box count");
             }
@@ -110,7 +114,7 @@ final class SectionGeometry {
                 if (value > 16) throw new IllegalArgumentException("invalid geometry coordinate");
                 coordinates[coordinate] = (short) value;
             }
-            palette[index] = new Shape(coordinates);
+            palette[index] = new Shape(kind, coordinates);
         }
         short[] cells = new short[BaseClusterTopology.CELL_COUNT];
         for (int cell = 0; cell < cells.length; cell++) {
@@ -125,7 +129,8 @@ final class SectionGeometry {
         output.writeInt(palette.length);
         for (int index = 3; index < palette.length; index++) {
             Shape shape = palette[index];
-            output.writeByte(shape.coordinates.length / 6);
+            int boxes = shape.coordinates.length / 6;
+            output.writeByte(boxes | (shape.kind == 4 ? 128 : shape.kind == 5 ? 64 : 0));
             for (short coordinate : shape.coordinates) output.writeByte(coordinate);
         }
         for (short cell : cells) output.writeShort(Short.toUnsignedInt(cell));
@@ -136,9 +141,11 @@ final class SectionGeometry {
         return palette[Short.toUnsignedInt(cells[cell])];
     }
 
-    boolean occupied(int cell, float width, float height) {
+    boolean hasDoors() { return hasDoors; }
+
+    boolean occupied(int cell, float width, float height, boolean canOpenDoors) {
         Shape shape = shape(cell);
-        if (shape == Shape.EMPTY) return false;
+        if (shape == Shape.EMPTY || canOpenDoors && shape.openableDoor()) return false;
         if (shape == Shape.FULL || shape == Shape.UNKNOWN) return true;
         // The coarse graph anchor is at the center of the cell.  The exact
         // palette still preserves the shape boundary, so a thin plate outside
@@ -200,6 +207,12 @@ final class SectionGeometry {
         return new Cell(Shape.UNKNOWN);
     }
 
+    static Cell door(Cell cell, boolean openable) {
+        if (cell.shape.kind != 3 || cell.shape.coordinates.length / 6 > 63)
+            throw new IllegalArgumentException("door requires bounded partial geometry");
+        return new Cell(new Shape(openable ? 4 : 5, cell.shape.coordinates));
+    }
+
     static Cell boxes(List<Box> boxes) {
         Objects.requireNonNull(boxes, "boxes");
         if (boxes.isEmpty()) return empty();
@@ -241,6 +254,7 @@ final class SectionGeometry {
                 hash = (hash ^ Short.toUnsignedInt(coordinate)) * 0x100000001b3L;
             }
             hash = (hash ^ shape.coordinates.length) * 0x100000001b3L;
+            if (shape.isDoor()) hash = (hash ^ (256 + shape.kind)) * 0x100000001b3L;
         }
         return hash;
     }
@@ -283,6 +297,9 @@ final class SectionGeometry {
             this.coordinates = coordinates.clone();
         }
 
+        boolean isDoor() { return kind == 4 || kind == 5; }
+        boolean openableDoor() { return kind == 4; }
+
         int coordinateCount() {
             return coordinates.length;
         }
@@ -315,7 +332,8 @@ final class SectionGeometry {
             for (short coordinate : coordinates) {
                 hash = (hash ^ Short.toUnsignedInt(coordinate)) * 0x100000001b3L;
             }
-            return (hash ^ coordinates.length) * 0x100000001b3L;
+            hash = (hash ^ coordinates.length) * 0x100000001b3L;
+            return isDoor() ? (hash ^ (256 + kind)) * 0x100000001b3L : hash;
         }
 
         @Override
