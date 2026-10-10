@@ -33,6 +33,36 @@ public final class CoreContracts {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && args[0].equals("boundary-recovery")) {
+            runtimeSearchSurvivesSameVersionBoundaryRecovery(false);
+            runtimeSearchSurvivesSameVersionBoundaryRecovery(true);
+            runtimeMissingBoundaryChangesRejectCachedViews();
+            runtimeRestoredBoundaryFactsRefreshMissingSnapshots();
+            runtimeParentRefreshesStaleBoundaryChildren();
+            incomingBoundaryRestoresOriginalForwardTransition();
+            runtimeReverseSearchWaitsUpdatesAndReleases();
+            boundaryGeometryFiltersAndParents();
+            runtimeGeometryChangesAndReleases();
+            System.out.println("Boundary recovery and affected integration contracts: 9 passed");
+            return;
+        }
+        if (args.length == 1 && args[0].equals("boundary-recovery-search")) {
+            runtimeSearchSurvivesSameVersionBoundaryRecovery(false);
+            runtimeSearchSurvivesSameVersionBoundaryRecovery(true);
+            System.out.println("Boundary recovery search contracts: 2 passed");
+            return;
+        }
+        if (args.length == 1 && args[0].equals("boundary-parent")) {
+            runtimeParentRefreshesStaleBoundaryChildren();
+            System.out.println("Parent boundary lifecycle contract: 1 passed");
+            return;
+        }
+        if (args.length == 1 && args[0].equals("boundary-lifecycle")) {
+            runtimeMissingBoundaryChangesRejectCachedViews();
+            runtimeRestoredBoundaryFactsRefreshMissingSnapshots();
+            System.out.println("Boundary lifecycle contracts: 2 passed");
+            return;
+        }
         if (args.length == 1 && args[0].equals("boundary")) {
             incomingBoundaryRestoresOriginalForwardTransition();
             runtimeReverseSearchWaitsUpdatesAndReleases();
@@ -419,6 +449,183 @@ public final class CoreContracts {
 
     private static BaseClusterTopology.GeometryKey closedBody() {
         return BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.geometry(BaseClusterTopology.Channel.GROUND);
+    }
+
+    private static ResourceKey<Level> lifecycleDimension() throws Exception {
+        var factory = ResourceKey.class.getDeclaredMethod("create", ResourceLocation.class, ResourceLocation.class);
+        factory.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        ResourceKey<Level> dimension = (ResourceKey<Level>) factory.invoke(null,
+                new ResourceLocation("minecraft:dimension"), new ResourceLocation("navigation:lifecycle"));
+        return dimension;
+    }
+
+    private static void evictDecodedFacts(TopologyWorkerRuntime runtime,
+                                         ResourceKey<Level> dimension, SectionPos section) throws Exception {
+        var lockField = TopologyWorkerRuntime.class.getDeclaredField("runtimeLock");
+        var clustersField = TopologyWorkerRuntime.class.getDeclaredField("clusters");
+        lockField.setAccessible(true); clustersField.setAccessible(true);
+        synchronized (lockField.get(runtime)) {
+            Object entry = ((Map<?, ?>) clustersField.get(runtime)).get(
+                    new TopologyWorkerRuntime.ClusterKey(dimension, section));
+            var removeIdle = TopologyWorkerRuntime.class.getDeclaredMethod("removeIdleFact", entry.getClass());
+            var factsField = entry.getClass().getDeclaredField("facts");
+            var stateField = entry.getClass().getDeclaredField("factState");
+            removeIdle.setAccessible(true); factsField.setAccessible(true); stateField.setAccessible(true);
+            removeIdle.invoke(runtime, entry);
+            factsField.set(entry, null);
+            stateField.set(entry, TopologyWorkerRuntime.FactState.PENDING);
+        }
+    }
+
+    private static void runtimeSearchSurvivesSameVersionBoundaryRecovery(boolean hierarchical) throws Exception {
+        var dimension = lifecycleDimension();
+        BlockPos[] floor = new BlockPos[256];
+        for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++)
+            floor[z * 16 + x] = new BlockPos(x, 4, z);
+        var facts = groundFacts(floor);
+        var owner = new java.util.concurrent.atomic.AtomicReference<TopologyWorkerRuntime>();
+        var restored = java.util.concurrent.ConcurrentHashMap.<SectionPos>newKeySet();
+        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {
+            if (delta > 0 && restored.add(key.section()))
+                publishFacts(owner.get(), dimension, key.section(), 1, facts);
+        }, decision -> { throw new AssertionError("unexpected persistence request"); });
+        owner.set(runtime);
+        try {
+            for (int x = 0; x < (hierarchical ? 6 : 4); x++)
+                for (int y = 0; y < (hierarchical ? 2 : 1); y++)
+                    for (int z = 0; z < (hierarchical ? 2 : 1); z++)
+                        publishFacts(runtime, dimension, SectionPos.of(x, y, z), 1, facts);
+            awaitEvents(runtime);
+            evictDecodedFacts(runtime, dimension, SectionPos.of(hierarchical ? 2 : 1, 0, 0));
+            evictDecodedFacts(runtime, dimension, SectionPos.of(hierarchical ? 3 : 2, 0, 0));
+            var result = request(runtime, dimension, new BlockPos(8, 4, 8),
+                    new BlockPos(hierarchical ? 72 : 56, 4, 8));
+            var metrics = runtime.metrics();
+            System.out.println("Same-version recovery search: hierarchical=" + hierarchical
+                    + ", result=" + result.progress().failure()
+                    + ", restored=" + restored.size() + ", stale=" + metrics.workerStaleResults()
+                    + ", retries=" + metrics.automaticStaleRetries());
+            require(result.corridor() != null && result.progress().hierarchical() == hierarchical
+                            && restored.size() == 2
+                            && metrics.workerStaleResults() == 0 && metrics.automaticStaleRetries() == 0,
+                    "unchanged world was rejected while restoring decoded boundary facts");
+        } finally {
+            require(runtime.awaitStopped(10, TimeUnit.SECONDS), "recovery search workers did not stop");
+        }
+        require(runtime.metrics().activeReferences() == 0 && runtime.metrics().facts().activeFactsBytes() == 0,
+                "recovery search retained geometry facts");
+    }
+
+    private static void runtimeMissingBoundaryChangesRejectCachedViews() throws Exception {
+        var dimension = lifecycleDimension();
+        SectionPos center = SectionPos.of(0, 0, 0), halo = SectionPos.of(1, 1, 0);
+        CountDownLatch demanded = new CountDownLatch(1);
+        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {
+            if (delta > 0 && key.section().equals(halo)) demanded.countDown();
+        },
+                decision -> { throw new AssertionError("unexpected persistence request"); });
+        try {
+            publishFacts(runtime, dimension, center, 1, groundFacts(new BlockPos(8, 4, 8)));
+            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                    new TopologyWorkerRuntime.ClusterKey(dimension, halo), 1, 0, 1,
+                    TopologyWorkerRuntime.FactState.PENDING, null, Map.of()));
+            awaitEvents(runtime);
+            var pending = runtime.requestBaseGraph(dimension, center, closedBody());
+            require(demanded.await(10, TimeUnit.SECONDS) && !pending.isDone(),
+                    "published a boundary snapshot before its loaded facts were ready");
+            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                    new TopologyWorkerRuntime.ClusterKey(dimension, halo), 1, 0, 1,
+                    TopologyWorkerRuntime.FactState.RECOVERY_FAILED, null, Map.of()));
+            try (var before = pending.get(10, TimeUnit.SECONDS)) {
+                require(before.current() && before.topology().boundaryFacts().atSection(1, 1, 0) == null,
+                        "terminal optional boundary did not retain conservative missing geometry");
+                runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                        new TopologyWorkerRuntime.ClusterKey(dimension, halo), 1, 0, 1,
+                        TopologyWorkerRuntime.FactState.UNLOADED, null, Map.of()));
+                awaitEvents(runtime);
+                require(!before.current(), "unloaded boundary identity did not invalidate the captured view");
+                try (var after = runtime.requestBaseGraph(dimension, center, closedBody()).get(10, TimeUnit.SECONDS)) {
+                    require(after.current() && after.topology() != before.topology(),
+                            "cache returned the stale view rejected by the parent input gate");
+                }
+            }
+        } finally {
+            require(runtime.awaitStopped(10, TimeUnit.SECONDS), "lifecycle workers did not stop");
+        }
+        require(runtime.metrics().activeReferences() == 0 && runtime.metrics().facts().activeFactsBytes() == 0,
+                "lifecycle control retained geometry facts");
+    }
+
+    private static void runtimeRestoredBoundaryFactsRefreshMissingSnapshots() throws Exception {
+        var dimension = lifecycleDimension();
+        SectionPos center = SectionPos.of(0, 0, 0), halo = SectionPos.of(1, 1, 0);
+        CountDownLatch demanded = new CountDownLatch(1);
+        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {
+            if (delta > 0 && key.section().equals(halo)) demanded.countDown();
+        },
+                decision -> { throw new AssertionError("unexpected persistence request"); });
+        try {
+            publishFacts(runtime, dimension, center, 1, groundFacts(new BlockPos(8, 4, 8)));
+            publishFacts(runtime, dimension, halo, 1, BaseClusterTopology.PackedFacts.allAir());
+            awaitEvents(runtime);
+            // Reproduce the existing decoded-fact eviction, preserving world identity.
+            evictDecodedFacts(runtime, dimension, halo);
+            var pending = runtime.requestBaseGraph(dimension, center, closedBody());
+            require(demanded.await(10, TimeUnit.SECONDS) && !pending.isDone(),
+                    "published a snapshot while same-version boundary decoding was still pending");
+            publishFacts(runtime, dimension, halo, 1, BaseClusterTopology.PackedFacts.allAir());
+            awaitEvents(runtime);
+            try (var restored = pending.get(10, TimeUnit.SECONDS)) {
+                require(restored.current() && restored.topology().boundaryFacts().atSection(1, 1, 0) != null,
+                        "restored snapshot omitted the prepared boundary geometry");
+                publishFacts(runtime, dimension, halo, 1, BaseClusterTopology.PackedFacts.allAir());
+                awaitEvents(runtime);
+                try (var unchanged = runtime.requestBaseGraph(dimension, center, closedBody()).get(10, TimeUnit.SECONDS)) {
+                    require(unchanged.topology() == restored.topology(),
+                            "unchanged decoded facts unnecessarily rebuilt a complete snapshot");
+                }
+            }
+        } finally {
+            require(runtime.awaitStopped(10, TimeUnit.SECONDS), "restoration workers did not stop");
+        }
+        require(runtime.metrics().activeReferences() == 0 && runtime.metrics().facts().activeFactsBytes() == 0,
+                "restoration control retained geometry facts");
+    }
+
+    private static void runtimeParentRefreshesStaleBoundaryChildren() throws Exception {
+        var dimension = lifecycleDimension();
+        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {},
+                decision -> { throw new AssertionError("unexpected persistence request"); });
+        SectionPos halo = SectionPos.of(1, 1, -1);
+        BlockPos[] floor = new BlockPos[256];
+        for (int z = 0; z < 16; z++) for (int x = 0; x < 16; x++)
+            floor[z * 16 + x] = new BlockPos(x, 4, z);
+        try {
+            for (int x = 0; x < 6; x++) for (int y = 0; y < 2; y++) for (int z = 0; z < 2; z++)
+                publishFacts(runtime, dimension, SectionPos.of(x, y, z), 1, groundFacts(floor));
+            awaitEvents(runtime);
+            for (SectionPos child : SuperClusterTopology.childSections(SectionPos.of(0, 0, 0))) {
+                try (var view = runtime.requestBaseGraph(dimension, child, closedBody()).get(10, TimeUnit.SECONDS)) {
+                    require(view.current(), "parent child was not captured before boundary recovery");
+                }
+            }
+            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                    new TopologyWorkerRuntime.ClusterKey(dimension, halo), 1, 0, 1,
+                    TopologyWorkerRuntime.FactState.PENDING, null, Map.of()));
+            publishFacts(runtime, dimension, halo, 1, BaseClusterTopology.PackedFacts.allAir());
+            awaitEvents(runtime);
+            long builds = runtime.metrics().tasks().completed().builds();
+            var result = request(runtime, dimension, new BlockPos(8, 4, 8), new BlockPos(72, 4, 8));
+            require(result.corridor() != null && result.progress().hierarchical(),
+                    "parent query did not progress past stale child input");
+            System.out.println("Parent refresh completed build tasks="
+                    + (runtime.metrics().tasks().completed().builds() - builds));
+        } finally {
+            require(runtime.awaitStopped(10, TimeUnit.SECONDS), "parent workers did not stop");
+        }
+        require(runtime.metrics().activeReferences() == 0 && runtime.metrics().facts().activeFactsBytes() == 0,
+                "parent control retained geometry facts");
     }
 
     private static void geometryFactsBlockPartialShapeAndRoundTrip() throws Exception {

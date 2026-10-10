@@ -534,7 +534,7 @@ final class TopologyWorkerRuntime {
                     boolean affectedView = direct || (nextState == FactState.AVAILABLE
                             ? requiresHalo(view.geometry, -dx, -dy, -dz)
                             : view.topology != null && referencesHalo(
-                            view.topology, -dx, -dy, -dz));
+                            view, -dx, -dy, -dz));
                     if (affectedView) view.validity++;
                 }
                 Set<SuperCacheKey> parents = superKeysByOrigin.get(new SuperOriginKey(
@@ -2177,10 +2177,13 @@ final class TopologyWorkerRuntime {
         int upper = demand.geometry.channel() == BaseClusterTopology.Channel.GROUND
                 || demand.geometry.heightCells() > 1 ? 1 : 0;
         ClusterEntry failedHalo = null;
-        for (int dx = -horizontal; dx <= horizontal; dx++) {
-            for (int dy = lower; dy <= upper; dy++) {
-                for (int dz = -horizontal; dz <= horizontal; dz++) {
-                    if (dx == 0 && dy == 0 && dz == 0) continue;
+        // A published Base view owns boundary geometry as well as local structure.
+        // Restore every loaded input before capture; decoding later during search
+        // must not invalidate an otherwise unchanged world snapshot.
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    if (!requiresHalo(demand.geometry, dx, dy, dz)) continue;
                     SectionPos section = SectionPos.of(demand.key.section().x() + dx,
                             demand.key.section().y() + dy, demand.key.section().z() + dz);
                     ClusterKey neighborKey = new ClusterKey(demand.key.dimension(), section);
@@ -2188,7 +2191,10 @@ final class TopologyWorkerRuntime {
                     if (neighbor == null || neighbor.factState == FactState.UNLOADED) continue;
                     factsReady(neighborKey, neighbor, demand, false);
                     FactState state = neighbor.latest.state();
-                    if (state == FactState.RECOVERY_FAILED || state == FactState.PERSISTENCE_UNAVAILABLE) {
+                    boolean structural = Math.abs(dx) <= horizontal && Math.abs(dz) <= horizontal
+                            && dy >= lower && dy <= upper;
+                    if (structural && (state == FactState.RECOVERY_FAILED
+                            || state == FactState.PERSISTENCE_UNAVAILABLE)) {
                         // The loop supplies x/y/z order within each failure rank.
                         if (failedHalo == null || state == FactState.RECOVERY_FAILED
                                 && failedHalo.latest.state() != FactState.RECOVERY_FAILED) failedHalo = neighbor;
@@ -2489,8 +2495,10 @@ final class TopologyWorkerRuntime {
                     if (entry == null) continue;
                     for (ViewEntry view : entry.views.values()) {
                         boolean affected = view.topology != null
-                                && view.topologyValidity != view.validity;
+                                && (view.topologyValidity != view.validity
+                                || !isCurrent(view.topologyStamps));
                         if (!affected) continue;
+                        if (view.topologyValidity == view.validity) view.validity++;
                         BaseClusterTopology stale = view.topology;
                         invalidateBaseBoundaryLinks(key, stale);
                         retireBaseTopology(view);
@@ -2515,13 +2523,15 @@ final class TopologyWorkerRuntime {
                 && Math.abs(dz) <= horizontal && dy >= lower && dy <= upper;
     }
 
-    private static boolean referencesHalo(BaseClusterTopology topology,
+    private static boolean referencesHalo(ViewEntry view,
                                           int dx,
                                           int dy,
                                           int dz) {
-        int encoded = BaseClusterTopology.haloIndex(dx, dy, dz);
-        for (int index = 0; index < topology.haloStampCount(); index++) {
-            if (Byte.toUnsignedInt(topology.haloOffset(index)) == encoded) return true;
+        SectionPos section = view.owner.key.section();
+        for (SectionStamp stamp : view.topologyStamps) {
+            SectionPos dependency = stamp.key().section();
+            if (dependency.x() == section.x() + dx && dependency.y() == section.y() + dy
+                    && dependency.z() == section.z() + dz) return true;
         }
         return false;
     }
@@ -2567,7 +2577,8 @@ final class TopologyWorkerRuntime {
 
     @Nullable
     private List<SectionStamp> captureBaseStamps(ClusterKey key,
-                                                  BaseClusterTopology topology) {
+                                                  BaseClusterTopology topology,
+                                                  List<SectionStamp> inputStamps) {
         Map<ClusterKey, SectionStamp> stamps = new HashMap<>();
         SectionStamp center = currentFactStamp(
                 key, topology.revision(), topology.sourceFingerprint());
@@ -2585,19 +2596,9 @@ final class TopologyWorkerRuntime {
             if (stamp == null) return null;
             stamps.put(halo, stamp);
         }
-        for (int code = 0; code < 27; code++) {
-            int dx = BaseClusterTopology.haloX(code), dy = BaseClusterTopology.haloY(code);
-            int dz = BaseClusterTopology.haloZ(code);
-            if (!requiresHalo(topology.geometry(), dx, dy, dz)) continue;
-            ClusterKey halo = new ClusterKey(key.dimension(), SectionPos.of(
-                    key.section().x() + dx, key.section().y() + dy, key.section().z() + dz));
-            if (stamps.containsKey(halo)) continue;
-            ClusterEntry missing = clusters.get(halo);
-            if (missing == null || missing.latest.state() == FactState.UNLOADED) {
-                stamps.put(halo, absentStamp(halo));
-            } else {
-                stamps.put(halo, new SectionStamp(halo, missing.latest, missing.latest.get()));
-            }
+        // Missing inputs retain the identity captured before the build.
+        for (SectionStamp stamp : inputStamps) {
+            stamps.putIfAbsent(stamp.key(), stamp);
         }
         return stamps.values().stream()
                 .sorted(Comparator.comparingLong(stamp -> stamp.key().section().asLong()))
@@ -2628,7 +2629,9 @@ final class TopologyWorkerRuntime {
             ViewEntry owner = baseView(dimension, topology);
             if (owner == null || owner.topologyStamps.isEmpty()
                     || !isCurrent(owner.topologyStamps)) return null;
-            for (SectionStamp stamp : owner.topologyStamps) merged.put(stamp.key(), stamp);
+            for (SectionStamp stamp : owner.topologyStamps) {
+                merged.put(stamp.key(), stamp);
+            }
         }
         return merged.values().stream()
                 .sorted(Comparator.comparingLong(stamp -> stamp.key().section().asLong()))
@@ -2941,8 +2944,9 @@ final class TopologyWorkerRuntime {
             }
         }
         demand.fingerprint = entry.facts.fingerprint();
-        List<SectionStamp> inputStamps = new ArrayList<>();
-        inputStamps.add(new SectionStamp(demand.key, entry.latest, entry.latest.get()));
+        BaseClusterTopology.BuildInput input = buildInput(demand.key, entry.facts);
+        List<SectionStamp> stamps = new ArrayList<>();
+        stamps.add(new SectionStamp(demand.key, entry.latest, entry.latest.get()));
         for (int code = 0; code < 27; code++) {
             int dx = BaseClusterTopology.haloX(code), dy = BaseClusterTopology.haloY(code);
             int dz = BaseClusterTopology.haloZ(code);
@@ -2951,11 +2955,14 @@ final class TopologyWorkerRuntime {
                     demand.key.section().x() + dx, demand.key.section().y() + dy,
                     demand.key.section().z() + dz));
             ClusterEntry neighbor = clusters.get(halo);
-            inputStamps.add(neighbor == null || neighbor.latest.state() == FactState.UNLOADED
-                    ? absentStamp(halo) : new SectionStamp(halo, neighbor.latest, neighbor.latest.get()));
+            if (neighbor == null || neighbor.latest.state() == FactState.UNLOADED) {
+                stamps.add(absentStamp(halo));
+            } else {
+                stamps.add(new SectionStamp(halo, neighbor.latest, neighbor.latest.get()));
+            }
         }
-        demand.buildStamps = List.copyOf(inputStamps);
-        return buildInput(demand.key, entry.facts);
+        demand.buildStamps = List.copyOf(stamps);
+        return input;
     }
 
     private void publish(TopologyDemand demand, BaseClusterTopology topology) {
@@ -2965,19 +2972,21 @@ final class TopologyWorkerRuntime {
         ViewEntry view = entry == null ? null : entry.views.get(demand.geometry);
         demand.buildTask = UNTRACKED_TASK;
         List<SectionStamp> inputStamps = demand.buildStamps;
-        releaseHeldFacts(demand);
         if (closed || entry == null || !entry.current()
                 || entry.revision != demand.generation
                 || view == null || view.demand != demand) {
+            releaseHeldFacts(demand);
             return;
         }
         if (topology.sourceFingerprint() != demand.fingerprint || !haloCurrent(key, topology)
                 || !isCurrent(inputStamps)) {
+            releaseHeldFacts(demand);
             prepareDemand(entry, demand);
             return;
         }
-        List<SectionStamp> topologyStamps = captureBaseStamps(key, topology);
+        List<SectionStamp> topologyStamps = captureBaseStamps(key, topology, inputStamps);
         if (topologyStamps == null) {
+            releaseHeldFacts(demand);
             prepareDemand(entry, demand);
             return;
         }
@@ -2990,6 +2999,7 @@ final class TopologyWorkerRuntime {
         }
         view.topology = topology;
         changeTopologyFactReferences(topology, 0, 1);
+        releaseHeldFacts(demand);
         view.topologyStamps = topologyStamps;
         view.topologyValidity = view.validity;
         view.handoffUntilTick = topologyTick + 1L;
@@ -3663,7 +3673,6 @@ final class TopologyWorkerRuntime {
         private final ClusterKey key;
         private final Supplier<LatestFacts> source;
         private final LatestFacts expected;
-
         private SectionStamp(ClusterKey key, LatestFactsRef latest, LatestFacts expected) {
             this(key, latest::get, expected);
         }
@@ -3876,6 +3885,7 @@ final class TopologyWorkerRuntime {
             if (!current()) return null;
             ViewEntry view = views.get(geometry);
             return view == null || view.topologyValidity != view.validity
+                    || view.topologyStamps.isEmpty() || !isCurrent(view.topologyStamps)
                     ? null : view.topology;
         }
 

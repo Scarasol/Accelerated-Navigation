@@ -4,4 +4,4 @@
 
 | 任务键 | 恢复正文 | 当前状态 |
 | --- | --- | --- |
-| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 2026-10-10：生产边界几何接入完成，compileJava/test/verifyCoreContracts及边界4项通过；待提交并推送接入后新提交，真实夹具/性能验收未执行 |
+| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 门原型接入条件成立；获准先push新工程基线到1.20.1，再生产接入。当前02，基线待push，旧工程只读 |
