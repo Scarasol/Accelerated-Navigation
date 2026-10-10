@@ -3,6 +3,7 @@
 日期：2026-10-06。目标工程：`D:\Workspace\AcceleratedNavigation-forge-1.20.1`。
 
 ## 恢复栏
+- 本轮完成（2026-10-10）：按用户“先把新工作区的当前代码push到1.20.1分支，然后接入生产”执行。新工程基线已先推送并核对；随后完成生产边界几何接入，旧工程保持只读。修改覆盖 `BaseClusterTopology`、`BoundaryGeometry`、`SectionGeometry`、`SuperClusterTopology`、`TopologyWorkerRuntime`、`TopologyService` 及受影响 `CoreContracts`。生产三个边界消费者统一消费量化几何；Halo 版本/指纹、缺失拒绝、缓存失效、闲置/执行/导出引用和关闭释放均接线。首次定向反馈发现夹具缺少跨区落差所需 Halo，补齐夹具依赖后边界集成4项通过。`compileJava`、`test`、`verifyCoreContracts` 全部退出0，反向3项、核心9项和边界4项成立；报告见 `../../reports/2026-10-10-production-boundary-integration-zh.md`。当前源码修改尚未提交/push；下一动作只读退出核对后提交并推送 `origin/1.20.1`。真实世界夹具、性能和正式验收仍未执行。
 
 - 当前授权（2026-10-10）：用户“好的，那先把新工作区的当前代码push到1.20.1分支，然后接入生产”。明确顺序：先在新工程提交并普通push当前代码到origin/1.20.1，验证成功后才修改生产。仅新工程；旧工程只读，不操作旧分支，不委派或启动世界。生产接入采用已验证边界几何过滤及两项简化，包含几何快照/版本/引用寿命、普通边界和父图消费者、编译和必要受影响定向反馈；不自动声称正式验收。已读/复用AGENTS、00/01/02，后续诊断按04路由；无适用技能。分支及远端默认均为1.20.1，当前远端与本地基线相同。当前生产修改前身份保存`.tmp/boundary-production-integration-20261010/before-production-identities.json`；下一动作提交/push当前源码与已有文档，再具体化接线设计。
 

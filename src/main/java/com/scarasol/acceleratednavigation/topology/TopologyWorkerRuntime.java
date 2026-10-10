@@ -1976,8 +1976,9 @@ final class TopologyWorkerRuntime {
         ClusterEntry target = clusters.get(new ClusterKey(key.dimension(), key.target().section()));
         BaseClusterTopology currentTarget = target == null
                 ? null : target.topology(key.target().geometry());
-        return source != null && source.topology(key.source().geometry()) == key.source()
-                && currentTarget != null && currentTarget.signature() == key.target().signature();
+        return source != null && baseView(key.dimension(), key.source()) != null
+                && currentTarget != null && baseView(key.dimension(), currentTarget) != null
+                && currentTarget.signature() == key.target().signature();
     }
 
     @Nullable
@@ -1986,6 +1987,7 @@ final class TopologyWorkerRuntime {
         ViewEntry view = entry == null ? null : entry.views.get(topology.geometry());
         return entry != null && entry.current() && view != null
                 && view.topologyValidity == view.validity && view.topology == topology
+                && !view.topologyStamps.isEmpty() && isCurrent(view.topologyStamps)
                 ? view : null;
     }
 
@@ -2172,7 +2174,8 @@ final class TopologyWorkerRuntime {
         if (!factsReady(demand.key, entry, demand, true)) return false;
         int horizontal = demand.geometry.widthCells() == 1 ? 0 : 1;
         int lower = demand.geometry.channel() == BaseClusterTopology.Channel.GROUND ? -1 : 0;
-        int upper = demand.geometry.heightCells() == 1 ? 0 : 1;
+        int upper = demand.geometry.channel() == BaseClusterTopology.Channel.GROUND
+                || demand.geometry.heightCells() > 1 ? 1 : 0;
         ClusterEntry failedHalo = null;
         for (int dx = -horizontal; dx <= horizontal; dx++) {
             for (int dy = lower; dy <= upper; dy++) {
@@ -2308,6 +2311,7 @@ final class TopologyWorkerRuntime {
         removeIdleBase(view);
         if (baseIdle(view) && idleBaseEntries.add(view)) {
             baseRetainedBytes += baseIdleBytes(view);
+            changeTopologyFactReferences(view.topology, 1, -1);
             recordBaseCachePeak();
         }
     }
@@ -2335,6 +2339,7 @@ final class TopologyWorkerRuntime {
     private void removeIdleBase(ViewEntry view) {
         if (!idleBaseEntries.remove(view)) return;
         baseRetainedBytes -= baseIdleBytes(view);
+        changeTopologyFactReferences(view.topology, -1, 1);
     }
 
     private void removeIdleSuper(SuperEntry entry) {
@@ -2505,7 +2510,8 @@ final class TopologyWorkerRuntime {
         int horizontal = geometry.widthCells() == 1 ? 0 : 1;
         int lower = geometry.channel() == BaseClusterTopology.Channel.GROUND ? -1 : 0;
         int upper = geometry.heightCells() == 1 ? 0 : 1;
-        return (dx | dy | dz) != 0 && Math.abs(dx) <= horizontal
+        return BaseClusterTopology.boundaryHaloRequired(geometry, dx, dy, dz)
+                || (dx | dy | dz) != 0 && Math.abs(dx) <= horizontal
                 && Math.abs(dz) <= horizontal && dy >= lower && dy <= upper;
     }
 
@@ -2531,8 +2537,9 @@ final class TopologyWorkerRuntime {
             ClusterEntry neighbor = clusters.get(new ClusterKey(key.dimension(), section));
             if (neighbor == null || !neighbor.current()
                     || neighbor.revision != topology.haloRevision(index)
-                    || neighbor.factState != FactState.AVAILABLE || neighbor.facts == null
-                    || neighbor.facts.fingerprint() != topology.haloFingerprint(index)) {
+                    || neighbor.latest.state() != FactState.AVAILABLE
+                    || !neighbor.factFingerprintKnown
+                    || neighbor.factFingerprint != topology.haloFingerprint(index)) {
                 return false;
             }
         }
@@ -2578,6 +2585,20 @@ final class TopologyWorkerRuntime {
             if (stamp == null) return null;
             stamps.put(halo, stamp);
         }
+        for (int code = 0; code < 27; code++) {
+            int dx = BaseClusterTopology.haloX(code), dy = BaseClusterTopology.haloY(code);
+            int dz = BaseClusterTopology.haloZ(code);
+            if (!requiresHalo(topology.geometry(), dx, dy, dz)) continue;
+            ClusterKey halo = new ClusterKey(key.dimension(), SectionPos.of(
+                    key.section().x() + dx, key.section().y() + dy, key.section().z() + dz));
+            if (stamps.containsKey(halo)) continue;
+            ClusterEntry missing = clusters.get(halo);
+            if (missing == null || missing.latest.state() == FactState.UNLOADED) {
+                stamps.put(halo, absentStamp(halo));
+            } else {
+                stamps.put(halo, new SectionStamp(halo, missing.latest, missing.latest.get()));
+            }
+        }
         return stamps.values().stream()
                 .sorted(Comparator.comparingLong(stamp -> stamp.key().section().asLong()))
                 .toList();
@@ -2615,13 +2636,29 @@ final class TopologyWorkerRuntime {
     }
 
     /** Captures a built base view and the exact live facts identities that produced it. */
-    record BaseGraphView(BaseClusterTopology topology, List<SectionStamp> stamps) {
-        BaseGraphView {
-            stamps = List.copyOf(stamps);
+    static final class BaseGraphView implements AutoCloseable {
+        private final BaseClusterTopology topology;
+        private final List<SectionStamp> stamps;
+        private final Runnable release;
+        private final AtomicBoolean released = new AtomicBoolean();
+
+        private BaseGraphView(BaseClusterTopology topology, List<SectionStamp> stamps, Runnable release) {
+            this.topology = topology;
+            this.stamps = List.copyOf(stamps);
+            this.release = release;
         }
 
+        BaseClusterTopology topology() { return topology; }
+
+        List<SectionStamp> stamps() { return stamps; }
+
         boolean current() {
-            return stamps.stream().allMatch(SectionStamp::current);
+            return !released.get() && stamps.stream().allMatch(SectionStamp::current);
+        }
+
+        @Override
+        public void close() {
+            if (released.compareAndSet(false, true)) release.run();
         }
     }
 
@@ -2645,8 +2682,13 @@ final class TopologyWorkerRuntime {
                         finishFuture(result, null,
                                 new StaleTopologyException("base graph changed during capture"));
                     } else {
-                        finishFuture(result,
-                                new BaseGraphView(completed.value, view.topologyStamps), null);
+                        BaseClusterTopology topology = completed.value;
+                        pinBase(view, topology);
+                        BaseGraphView snapshot = new BaseGraphView(topology, view.topologyStamps,
+                                () -> runRuntimeTransition(() -> releaseBasePin(view, topology)));
+                        afterRuntimeLock(() -> {
+                            if (!result.complete(snapshot)) snapshot.close();
+                        });
                     }
                 });
                 result.whenComplete((value, failure) -> {
@@ -2818,6 +2860,7 @@ final class TopologyWorkerRuntime {
                     clearBaseLink(view, slot, "topology service stopped");
                 }
                 if (view.demand != null) failDemand(entry, view.demand, stopped);
+                retireBaseTopology(view);
                 view.topology = null;
                 view.topologyStamps = List.of();
             }
@@ -2898,6 +2941,20 @@ final class TopologyWorkerRuntime {
             }
         }
         demand.fingerprint = entry.facts.fingerprint();
+        List<SectionStamp> inputStamps = new ArrayList<>();
+        inputStamps.add(new SectionStamp(demand.key, entry.latest, entry.latest.get()));
+        for (int code = 0; code < 27; code++) {
+            int dx = BaseClusterTopology.haloX(code), dy = BaseClusterTopology.haloY(code);
+            int dz = BaseClusterTopology.haloZ(code);
+            if (!requiresHalo(demand.geometry, dx, dy, dz)) continue;
+            ClusterKey halo = new ClusterKey(demand.key.dimension(), SectionPos.of(
+                    demand.key.section().x() + dx, demand.key.section().y() + dy,
+                    demand.key.section().z() + dz));
+            ClusterEntry neighbor = clusters.get(halo);
+            inputStamps.add(neighbor == null || neighbor.latest.state() == FactState.UNLOADED
+                    ? absentStamp(halo) : new SectionStamp(halo, neighbor.latest, neighbor.latest.get()));
+        }
+        demand.buildStamps = List.copyOf(inputStamps);
         return buildInput(demand.key, entry.facts);
     }
 
@@ -2907,13 +2964,15 @@ final class TopologyWorkerRuntime {
         ClusterEntry entry = clusters.get(key);
         ViewEntry view = entry == null ? null : entry.views.get(demand.geometry);
         demand.buildTask = UNTRACKED_TASK;
+        List<SectionStamp> inputStamps = demand.buildStamps;
         releaseHeldFacts(demand);
         if (closed || entry == null || !entry.current()
                 || entry.revision != demand.generation
                 || view == null || view.demand != demand) {
             return;
         }
-        if (topology.sourceFingerprint() != demand.fingerprint || !haloCurrent(key, topology)) {
+        if (topology.sourceFingerprint() != demand.fingerprint || !haloCurrent(key, topology)
+                || !isCurrent(inputStamps)) {
             prepareDemand(entry, demand);
             return;
         }
@@ -2930,6 +2989,7 @@ final class TopologyWorkerRuntime {
             view.topology = null;
         }
         view.topology = topology;
+        changeTopologyFactReferences(topology, 0, 1);
         view.topologyStamps = topologyStamps;
         view.topologyValidity = view.validity;
         view.handoffUntilTick = topologyTick + 1L;
@@ -3109,6 +3169,7 @@ final class TopologyWorkerRuntime {
     }
 
     private void releaseHeldFacts(TopologyDemand demand) {
+        demand.buildStamps = List.of();
         for (Map.Entry<ClusterEntry, BaseClusterTopology.PackedFacts> pin
                 : demand.heldFacts.entrySet()) {
             ClusterEntry entry = pin.getKey();
@@ -3439,7 +3500,12 @@ final class TopologyWorkerRuntime {
     private void pinBase(ViewEntry view, BaseClusterTopology topology) {
         removeIdleBase(view);
         view.pinnedTopologies.merge(topology, 1, Integer::sum);
+        changeTopologyFactReferences(topology, 0, 1);
         addActiveReference();
+    }
+
+    private void changeTopologyFactReferences(BaseClusterTopology topology, int idle, int active) {
+        topology.boundaryFacts().visitFacts(facts -> changeFactReferences(facts, idle, active));
     }
 
     @Nullable
@@ -3544,6 +3610,7 @@ final class TopologyWorkerRuntime {
         Integer count = view.pinnedTopologies.remove(topology);
         if (count == null) throw new IllegalStateException("base topology pin is not owned");
         if (count > 1) view.pinnedTopologies.put(topology, count - 1);
+        changeTopologyFactReferences(topology, 0, -1);
         removeActiveReference();
         touchBase(view);
         pruneView(view);
@@ -3553,6 +3620,7 @@ final class TopologyWorkerRuntime {
 
     private void retireBaseTopology(ViewEntry view) {
         removeIdleBase(view);
+        if (view.topology != null) changeTopologyFactReferences(view.topology, 0, -1);
         baseHandoffs.remove(view);
         view.topologyStamps = List.of();
     }
@@ -3861,6 +3929,7 @@ final class TopologyWorkerRuntime {
                 new IdentityHashMap<>();
         private final IdentityHashMap<ClusterEntry, BaseClusterTopology.PackedFacts> heldFacts =
                 new IdentityHashMap<>();
+        private List<SectionStamp> buildStamps = List.of();
         private NavigationScheduler.Priority priority = NavigationScheduler.Priority.BACKGROUND;
         private TopologyTaskExecutor.TaskHandle buildTask = UNTRACKED_TASK;
         private long fingerprint;

@@ -331,20 +331,23 @@ public final class TopologyService {
                     CompletableFuture<TopologyWorkerRuntime.BaseGraphView> pending =
                             runtime.requestBaseGraph(dimension, item.section(), geometry);
                     try {
-                        TopologyWorkerRuntime.BaseGraphView view = pending.get(60L, TimeUnit.SECONDS);
-                        boolean current = view.current();
-                        if (!current) stable = false;
-                        // READY means current when written; the final flag also checks later changes.
-                        writer.add(new BaseGraphCapture.Entry(item.section(),
-                                current ? "READY" : "STALE", view.topology(),
-                                current ? null : "source facts changed during export"));
-                        for (TopologyWorkerRuntime.SectionStamp stamp : view.stamps()) {
-                            stamps.putIfAbsent(stamp.key(), stamp);
+                        try (TopologyWorkerRuntime.BaseGraphView view = pending.get(60L, TimeUnit.SECONDS)) {
+                            boolean current = view.current();
+                            if (!current) stable = false;
+                            // READY means current when written; the final flag also checks later changes.
+                            writer.add(new BaseGraphCapture.Entry(item.section(),
+                                    current ? "READY" : "STALE", view.topology(),
+                                    current ? null : "source facts changed during export"));
+                            for (TopologyWorkerRuntime.SectionStamp stamp : view.stamps()) {
+                                stamps.putIfAbsent(stamp.key(), stamp);
+                            }
                         }
                     } catch (TimeoutException failure) {
+                        pending.thenAccept(TopologyWorkerRuntime.BaseGraphView::close);
                         pending.cancel(false);
                         writer.add(new BaseGraphCapture.Entry(item.section(), "BUILD_FAILED", null, "build exceeded 60 s"));
                     } catch (InterruptedException failure) {
+                        pending.thenAccept(TopologyWorkerRuntime.BaseGraphView::close);
                         pending.cancel(false);
                         throw failure;
                     } catch (ExecutionException failure) {

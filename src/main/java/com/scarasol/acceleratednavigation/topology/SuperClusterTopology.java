@@ -290,6 +290,7 @@ final class SuperClusterTopology {
         }
 
         Long2ObjectOpenHashMap<long[]> masks = new Long2ObjectOpenHashMap<>();
+        BoundaryGeometry collision = new BoundaryGeometry(source, target);
         int sectionYDelta = (target.section().y() - source.section().y()) * BaseClusterTopology.SIDE;
         boolean vertical = face.getAxis().isVertical();
         boolean volume = source.geometry().channel() == BaseClusterTopology.Channel.VOLUME;
@@ -311,7 +312,7 @@ final class SuperClusterTopology {
                     for (Direction direction : directions) {
                         for (int distance = firstDistance; distance <= maximumDistance; distance++) {
                             for (int dy = minimumDy; dy <= maximumDy; dy++) {
-                                addBoundaryMask(masks, component, target, face, cell, faceIndex(u, v),
+                                addBoundaryMask(masks, collision, source, component, target, face, cell, faceIndex(u, v),
                                         inset, direction, distance, dy, sectionYDelta);
                             }
                         }
@@ -323,6 +324,8 @@ final class SuperClusterTopology {
     }
 
     private static void addBoundaryMask(Long2ObjectOpenHashMap<long[]> masks,
+                                         BoundaryGeometry collision,
+                                         BaseClusterTopology source,
                                          int sourceComponent,
                                          BaseClusterTopology target,
                                          Direction face,
@@ -339,6 +342,11 @@ final class SuperClusterTopology {
                 BaseClusterTopology.z(sourceCell) + direction.getStepZ() * distance - face.getStepZ() * 16
         );
         if (targetComponent < 0) return;
+        if (!collision.open(source.geometry(),
+                source.section().minBlockX() + BaseClusterTopology.x(sourceCell),
+                source.section().minBlockY() + BaseClusterTopology.y(sourceCell),
+                source.section().minBlockZ() + BaseClusterTopology.z(sourceCell),
+                direction, distance, dy)) return;
         int directionBits = distance == 0 ? 0 : direction.get2DDataValue();
         // Bits: inset 0..1, horizontal direction 2..3, distance 4..5, dy + 4 in 6..8.
         int descriptor = sourceInset | directionBits << 2 | distance << 4 | (dy + 4) << 6;

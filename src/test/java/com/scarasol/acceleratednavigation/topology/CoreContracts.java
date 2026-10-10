@@ -33,6 +33,14 @@ public final class CoreContracts {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && args[0].equals("boundary")) {
+            incomingBoundaryRestoresOriginalForwardTransition();
+            runtimeReverseSearchWaitsUpdatesAndReleases();
+            boundaryGeometryFiltersAndParents();
+            runtimeGeometryChangesAndReleases();
+            System.out.println("Boundary integration contracts: 4 passed");
+            return;
+        }
         if (args.length == 1 && args[0].equals("reverse-runtime")) {
             runtimeReverseSearchWaitsUpdatesAndReleases();
             System.out.println("Reverse runtime contract: 1 passed");
@@ -84,8 +92,26 @@ public final class CoreContracts {
     }
 
     private static void incomingBoundaryRestoresOriginalForwardTransition() {
-        BaseClusterTopology source = groundGraph(SectionPos.of(0, 1, 0),
-                groundFacts(new BlockPos(15, 1, 8)));
+        BaseClusterTopology.PackedFacts sourceFacts = groundFacts(new BlockPos(15, 1, 8));
+        BaseClusterTopology.BuildInput sourceInput = new BaseClusterTopology.BuildInput(
+                sourceFacts,
+                new byte[]{
+                        (byte) BaseClusterTopology.haloIndex(0, -1, 0),
+                        (byte) BaseClusterTopology.haloIndex(1, 0, 0)
+                },
+                new BaseClusterTopology.PackedFacts[]{
+                        BaseClusterTopology.PackedFacts.allAir(),
+                        BaseClusterTopology.PackedFacts.allAir()
+                },
+                new long[]{1L, 1L},
+                new long[]{
+                        BaseClusterTopology.PackedFacts.allAir().fingerprint(),
+                        BaseClusterTopology.PackedFacts.allAir().fingerprint()
+                });
+        BaseClusterTopology source = BaseClusterTopology.build(SectionPos.of(0, 1, 0), 1L,
+                sourceInput,
+                BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.geometry(BaseClusterTopology.Channel.GROUND),
+                new BaseClusterTopology.BuildScratch());
         BaseClusterTopology target = groundGraph(SectionPos.of(1, 0, 0),
                 groundFacts(new BlockPos(0, 14, 8)));
         SuperClusterTopology.BoundaryLinks links =
@@ -162,6 +188,10 @@ public final class CoreContracts {
         try {
             publishFacts(runtime, dimension, source, 1L, groundFacts(new BlockPos(15, 1, 8)));
             publishFacts(runtime, dimension, target, 1L, targetFacts);
+            publishFacts(runtime, dimension, SectionPos.of(0, 0, 0), 1L,
+                    BaseClusterTopology.PackedFacts.allAir());
+            publishFacts(runtime, dimension, SectionPos.of(1, 1, 0), 1L,
+                    BaseClusterTopology.PackedFacts.allAir());
             TopologyWorkerRuntime.WorkerResult result = request(runtime, dimension, start, goal);
             require(result.corridor() != null && !result.progress().hierarchical()
                             && result.progress().dependencyWaits() > 0,
@@ -234,6 +264,19 @@ public final class CoreContracts {
                 TopologyWorkerRuntime.FactState.AVAILABLE, facts, Map.of()));
     }
 
+    private static void awaitEvents(TopologyWorkerRuntime runtime) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            var events = runtime.metrics().events();
+            if (events.pendingKeys() == 0 && events.activeBatchKeys() == 0
+                    && !events.taskOutstanding() && !events.batchActive()) {
+                return;
+            }
+            Thread.sleep(5L);
+        }
+        throw new AssertionError("runtime events did not settle");
+    }
+
     private static BaseClusterTopology.PackedFacts groundFacts(BlockPos... anchors) {
         byte[] flags = new byte[BaseClusterTopology.CELL_COUNT];
         Arrays.fill(flags, (byte) BaseClusterTopology.VOLUME_OPEN);
@@ -248,6 +291,134 @@ public final class CoreContracts {
         return BaseClusterTopology.build(section, 1L, BaseClusterTopology.BuildInput.center(facts),
                 BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.geometry(BaseClusterTopology.Channel.GROUND),
                 new BaseClusterTopology.BuildScratch());
+    }
+
+    private static BaseClusterTopology.PackedFacts doorwayFacts(boolean open) {
+        SectionGeometry.Cell[] cells = new SectionGeometry.Cell[BaseClusterTopology.CELL_COUNT];
+        Arrays.fill(cells, SectionGeometry.empty());
+        byte[] flags = new byte[BaseClusterTopology.CELL_COUNT];
+        Arrays.fill(flags, (byte) BaseClusterTopology.VOLUME_OPEN);
+        flags[BaseClusterTopology.cellIndex(15, 4, 8)] |= BaseClusterTopology.GROUND_OPEN;
+        for (int y = 4; y <= 5; y++) {
+            int cell = BaseClusterTopology.cellIndex(15, y, 8);
+            flags[cell] |= BaseClusterTopology.EXACT_REQUIRED;
+            cells[cell] = SectionGeometry.boxes(List.of(open
+                    ? SectionGeometry.quantized(0, 0, 0, 1, 1, 3. / 16)
+                    : SectionGeometry.quantized(13. / 16, 0, 0, 1, 1, 1)));
+        }
+        return BaseClusterTopology.PackedFacts.fromCells(flags, SectionGeometry.fromCells(cells));
+    }
+
+    private static boolean hasBoundary(SuperClusterTopology.BoundaryLinks links, int component,
+                                       BaseClusterTopology.MovementKey movement) {
+        for (int edge = links.edgeStart(component); edge < links.edgeEnd(component); edge++)
+            if (links.supports(edge, movement)) return true;
+        return false;
+    }
+
+    private static void boundaryGeometryFiltersAndParents() {
+        SectionPos west = SectionPos.of(0, 0, 0), east = SectionPos.of(1, 0, 0);
+        var movement = BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.movement(BaseClusterTopology.Channel.GROUND);
+        BaseClusterTopology closed = groundGraph(west, doorwayFacts(false));
+        BaseClusterTopology open = groundGraph(west, doorwayFacts(true));
+        BaseClusterTopology target = groundGraph(east, groundFacts(new BlockPos(0, 4, 8)));
+        int sourceComponent = closed.componentAt(15, 4, 8);
+        require(sourceComponent >= 0 && target.componentAt(0, 4, 8) >= 0,
+                "door control blocked an endpoint instead of the crossing");
+        require(!hasBoundary(SuperClusterTopology.boundaryLinks(closed, target, Direction.EAST),
+                        sourceComponent, movement)
+                        && hasBoundary(SuperClusterTopology.boundaryLinks(open, target, Direction.EAST),
+                        open.componentAt(15, 4, 8), movement),
+                "production crossing ignored closed or open door geometry");
+        for (float width : new float[]{.3F, .6F, 1.2F}) {
+            var body = new BaseClusterTopology.GeometryKey(BaseClusterTopology.Channel.GROUND,
+                    (int) Math.ceil(width), 2, width, 1.95F, false);
+            require(!new BoundaryGeometry(closed, target).open(body, 15, 4, 8, Direction.EAST, 1, 0),
+                    "body width bypassed door geometry");
+        }
+        BaseClusterTopology[] children = new BaseClusterTopology[8];
+        List<SectionPos> sections = SuperClusterTopology.childSections(west);
+        for (int i = 0; i < children.length; i++)
+            children[i] = groundGraph(sections.get(i), groundFacts());
+        children[sections.indexOf(west)] = closed;
+        children[sections.indexOf(east)] = target;
+        var body = closed.geometry();
+        var parent = SuperClusterTopology.build(west, children, body, movement, new BaseClusterTopology.BuildScratch());
+        int a = parent.aggregateId(west, sourceComponent);
+        int b = parent.aggregateId(east, target.componentAt(0, 4, 8));
+        require(a != b && parent.outgoingStart(a) == parent.outgoingEnd(a),
+                "parent internal boundary bypassed the closed door");
+        children[sections.indexOf(west)] = open;
+        var connected = SuperClusterTopology.build(west, children, body, movement, new BaseClusterTopology.BuildScratch());
+        require(connected.aggregateId(west, open.componentAt(15, 4, 8))
+                        == connected.aggregateId(east, target.componentAt(0, 4, 8)),
+                "parent internal boundary removed the open passage");
+        var volumeBody = new BaseClusterTopology.GeometryKey(BaseClusterTopology.Channel.VOLUME,
+                1, 1, .3F, .4F, false);
+        BaseClusterTopology lower = BaseClusterTopology.build(west, 1,
+                BaseClusterTopology.BuildInput.center(BaseClusterTopology.PackedFacts.allAir()),
+                volumeBody, new BaseClusterTopology.BuildScratch());
+        BaseClusterTopology upper = BaseClusterTopology.build(SectionPos.of(0, 1, 0), 1,
+                BaseClusterTopology.BuildInput.center(BaseClusterTopology.PackedFacts.allAir()),
+                volumeBody, new BaseClusterTopology.BuildScratch());
+        require(hasBoundary(SuperClusterTopology.boundaryLinks(lower, upper, Direction.UP),
+                        lower.componentAt(8, 15, 8), new BaseClusterTopology.MovementKey(0, 0, 0)),
+                "vertical volume crossing lost its existing movement definition");
+    }
+
+    private static void runtimeGeometryChangesAndReleases() throws Exception {
+        var keyFactory = ResourceKey.class.getDeclaredMethod("create", ResourceLocation.class, ResourceLocation.class);
+        keyFactory.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        ResourceKey<Level> dimension = (ResourceKey<Level>) keyFactory.invoke(null,
+                new ResourceLocation("minecraft:dimension"), new ResourceLocation("navigation:geometry"));
+        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {},
+                decision -> { throw new AssertionError("unexpected geometry persistence request"); });
+        SectionPos west = SectionPos.of(0, 0, 0), east = SectionPos.of(1, 0, 0);
+        BlockPos start = new BlockPos(15, 4, 8), goal = new BlockPos(16, 4, 8);
+        var closed = doorwayFacts(false);var open = doorwayFacts(true);
+        var target = groundFacts(new BlockPos(0, 4, 8));
+        try {
+            publishFacts(runtime, dimension, west, 1, closed);
+            publishFacts(runtime, dimension, east, 1, target);
+            require(request(runtime, dimension, start, goal).corridor() == null,
+                    "real runtime crossed a closed door");
+            try (var original = runtime.requestBaseGraph(dimension, west, closedBody()).get(10, TimeUnit.SECONDS)) {
+                int component = original.topology().componentAt(15, 4, 8);
+                publishFacts(runtime, dimension, west, 2, open);
+                require(request(runtime, dimension, start, goal).corridor() != null,
+                        "real runtime failed to rebuild the open door");
+                try (var changed = runtime.requestBaseGraph(dimension, west, closedBody()).get(10, TimeUnit.SECONDS)) {
+                    require(!original.current() && changed.current()
+                                    && changed.topology().componentAt(15, 4, 8) == component,
+                            "geometry-only change failed to invalidate the snapshot or changed the control labels");
+                    publishFacts(runtime, dimension, SectionPos.of(0, 1, 0), 1,
+                            BaseClusterTopology.PackedFacts.allAir());
+                    awaitEvents(runtime);
+                    try (var halo = runtime.requestBaseGraph(dimension, west, closedBody()).get(10, TimeUnit.SECONDS)) {
+                        require(!changed.current() && halo.current(),
+                                "previously absent Halo remained valid after it loaded");
+                    }
+                }
+            }
+            publishFacts(runtime, dimension, west, 3, closed);
+            require(request(runtime, dimension, start, goal).corridor() == null,
+                    "completed corridor or incoming boundary reused the open-door geometry");
+            var view = runtime.requestBaseGraph(dimension, west, closedBody()).get(10, TimeUnit.SECONDS);
+            view.close();view.close();
+            require(!view.current(), "closed export snapshot remained live");
+            runtime.endServerTick();runtime.endServerTick();
+        } finally {
+            require(runtime.awaitStopped(10, TimeUnit.SECONDS), "geometry runtime did not stop");
+        }
+        var stopped = runtime.metrics();
+        require(stopped.activeReferences() == 0 && stopped.facts().activeFactsBytes() == 0
+                        && stopped.baseCache().retainedBytes() == 0 && stopped.parentCache().retainedBytes() == 0,
+                "geometry snapshots retained fact ownership after closing");
+    }
+
+    private static BaseClusterTopology.GeometryKey closedBody() {
+        return BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.geometry(BaseClusterTopology.Channel.GROUND);
     }
 
     private static void geometryFactsBlockPartialShapeAndRoundTrip() throws Exception {

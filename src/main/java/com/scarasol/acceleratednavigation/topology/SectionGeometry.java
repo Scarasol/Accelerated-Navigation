@@ -283,6 +283,14 @@ final class SectionGeometry {
             this.coordinates = coordinates.clone();
         }
 
+        int coordinateCount() {
+            return coordinates.length;
+        }
+
+        short coordinate(int index) {
+            return coordinates[index];
+        }
+
         private boolean intersects(double minX, double maxX,
                                    double minY, double maxY,
                                    double minZ, double maxZ) {

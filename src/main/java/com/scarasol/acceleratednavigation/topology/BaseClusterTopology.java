@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 
 /** One immutable macro traversal view for a section generation and normalized geometry. */
 public final class BaseClusterTopology {
@@ -50,6 +51,7 @@ public final class BaseClusterTopology {
     private final byte[] haloOffsets;
     private final long[] haloRevisions;
     private final long[] haloFingerprints;
+    private final BuildInput boundaryFacts;
     private final long signature;
     private final int retainedBytes;
     private volatile IncomingEdges incomingEdges;
@@ -67,7 +69,8 @@ public final class BaseClusterTopology {
                                 float[] outgoingLowerBounds,
                                 byte[] haloOffsets,
                                 long[] haloRevisions,
-                                long[] haloFingerprints) {
+                                long[] haloFingerprints,
+                                BuildInput boundaryFacts) {
         this.section = Objects.requireNonNull(section, "section");
         this.revision = revision;
         this.sourceFingerprint = sourceFingerprint;
@@ -82,6 +85,7 @@ public final class BaseClusterTopology {
         this.haloOffsets = haloOffsets;
         this.haloRevisions = haloRevisions;
         this.haloFingerprints = haloFingerprints;
+        this.boundaryFacts = Objects.requireNonNull(boundaryFacts, "boundaryFacts");
         this.signature = signature(section, revision, sourceFingerprint, geometry,
                 haloOffsets, haloRevisions, haloFingerprints);
         this.retainedBytes = 128 + componentLabels.getRaw().length * Long.BYTES
@@ -90,6 +94,7 @@ public final class BaseClusterTopology {
                 + outgoingCapabilityMasks.length * Long.BYTES
                 + outgoingLowerBounds.length * Float.BYTES
                 + haloOffsets.length + (haloRevisions.length + haloFingerprints.length) * Long.BYTES
+                + boundaryFacts.referenceBytes()
                 + IncomingEdges.reservedBytes(componentCount(), outgoingTargets.length);
         validate();
     }
@@ -111,6 +116,7 @@ public final class BaseClusterTopology {
         PrimitiveEdges edges = geometry.channel() == Channel.GROUND
                 ? buildGroundEdges(input, geometry, scratch, componentCount)
                 : PrimitiveEdges.empty(componentCount);
+        BuildInput boundaryFacts = input.boundarySnapshot(geometry, scratch.haloUsed);
         HaloStamps stamps = input.usedStamps(scratch.haloUsed);
         return new BaseClusterTopology(
                 section,
@@ -126,7 +132,8 @@ public final class BaseClusterTopology {
                 edges.lowerBounds,
                 stamps.offsets,
                 stamps.revisions,
-                stamps.fingerprints
+                stamps.fingerprints,
+                boundaryFacts
         );
     }
 
@@ -144,6 +151,15 @@ public final class BaseClusterTopology {
 
     public GeometryKey geometry() {
         return geometry;
+    }
+
+    BuildInput boundaryFacts() {
+        return boundaryFacts;
+    }
+
+    static boolean boundaryHaloRequired(GeometryKey geometry, int dx, int dy, int dz) {
+        return (dx | dy | dz) != 0 && Math.abs(dx) <= 1 && Math.abs(dy) <= 1 && Math.abs(dz) <= 1
+                && (geometry.width() > 1.0F || dx == 0 || dz == 0);
     }
 
     public int componentCount() {
@@ -826,6 +842,51 @@ public final class BaseClusterTopology {
 
         PackedFacts center() {
             return center;
+        }
+
+        @Nullable
+        PackedFacts atSection(int dx, int dy, int dz) {
+            if ((dx | dy | dz) == 0) return center;
+            if (Math.abs(dx) > 1 || Math.abs(dy) > 1 || Math.abs(dz) > 1) return null;
+            int index = Arrays.binarySearch(offsets, (byte) haloIndex(dx, dy, dz));
+            return index < 0 ? null : facts[index];
+        }
+
+        long revisionAtSection(int dx, int dy, int dz, long centerRevision) {
+            if ((dx | dy | dz) == 0) return centerRevision;
+            int index = Arrays.binarySearch(offsets, (byte) haloIndex(dx, dy, dz));
+            if (index < 0) throw new IllegalArgumentException("missing geometry revision");
+            return revisions[index];
+        }
+
+        void visitFacts(Consumer<PackedFacts> consumer) {
+            consumer.accept(center);
+            for (PackedFacts fact : facts) consumer.accept(fact);
+        }
+
+        int referenceBytes() {
+            return 128 + offsets.length + facts.length * Long.BYTES
+                    + (revisions.length + fingerprints.length) * Long.BYTES;
+        }
+
+        private BuildInput boundarySnapshot(GeometryKey geometry, boolean[] used) {
+            byte[] selectedOffsets = new byte[offsets.length];
+            PackedFacts[] selectedFacts = new PackedFacts[facts.length];
+            long[] selectedRevisions = new long[revisions.length];
+            long[] selectedFingerprints = new long[fingerprints.length];
+            int count = 0;
+            for (int index = 0; index < offsets.length; index++) {
+                int code = Byte.toUnsignedInt(offsets[index]);
+                if (!boundaryHaloRequired(geometry, haloX(code), haloY(code), haloZ(code))) continue;
+                used[index] = true;
+                selectedOffsets[count] = offsets[index];
+                selectedFacts[count] = facts[index];
+                selectedRevisions[count] = revisions[index];
+                selectedFingerprints[count++] = fingerprints[index];
+            }
+            return new BuildInput(center, Arrays.copyOf(selectedOffsets, count),
+                    Arrays.copyOf(selectedFacts, count), Arrays.copyOf(selectedRevisions, count),
+                    Arrays.copyOf(selectedFingerprints, count));
         }
 
         int flags(int x, int y, int z, BuildScratch scratch) {

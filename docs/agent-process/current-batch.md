@@ -4,4 +4,4 @@
 
 | 任务键 | 恢复正文 | 当前状态 |
 | --- | --- | --- |
-| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 2026-10-10：轻量边界优化原型完成；四区段+两边界同JVM旧修复→组合1.405→0.947ms（降32.6%），101分类/24原生轨迹一致；生产快照、Runtime/完整查询未接入 |
+| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 2026-10-10：生产边界几何接入完成，compileJava/test/verifyCoreContracts及边界4项通过；待提交并推送接入后新提交，真实夹具/性能验收未执行 |
