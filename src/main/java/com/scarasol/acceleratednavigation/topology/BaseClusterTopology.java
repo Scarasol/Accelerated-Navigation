@@ -7,6 +7,7 @@ import net.minecraft.core.SectionPos;
 import net.minecraft.util.BitStorage;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.ZeroBitStorage;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.util.Arrays;
@@ -19,7 +20,7 @@ public final class BaseClusterTopology {
     public static final int SIDE = 16;
     public static final int CELL_COUNT = SIDE * SIDE * SIDE;
     static final int PACKED_FACT_BYTES = CELL_COUNT / 2;
-    static final int FACTS_ALGORITHM_VERSION = 5;
+    static final int FACTS_ALGORITHM_VERSION = 6;
     public static final int VOLUME_OPEN = 1;
     public static final int GROUND_OPEN = 1 << 1;
     public static final int FLUID = 1 << 2;
@@ -261,6 +262,8 @@ public final class BaseClusterTopology {
         json.name("channel").value(geometry.channel().name());
         json.name("widthCells").value(geometry.widthCells());
         json.name("heightCells").value(geometry.heightCells());
+        json.name("width").value(geometry.width());
+        json.name("height").value(geometry.height());
         json.name("acceptsFluid").value(geometry.acceptsFluid());
         json.endObject();
         json.name("baseLabel").value(baseLabel);
@@ -327,7 +330,7 @@ public final class BaseClusterTopology {
                 for (int x = minimum; x <= SIDE - 1 + maximum; x++) {
                     int flags = input.flags(x, y, z, scratch);
                     if ((geometry.acceptsFluid() || (flags & FLUID) == 0)
-                            && (flags & VOLUME_OPEN) != 0) {
+                            && input.volumeOpen(x, y, z, geometry, scratch)) {
                         volume |= 1 << (x - EXTENDED_MIN);
                     }
                     if (y < SIDE && (geometry.acceptsFluid() || (flags & FLUID) == 0)
@@ -363,7 +366,7 @@ public final class BaseClusterTopology {
                     scratch.legalMask.length);
         }
         if (geometry.widthCells() == 1 && geometry.heightCells() == 1) {
-            removeSealedCells(input, scratch);
+            removeSealedCells(input, geometry, scratch);
         }
     }
 
@@ -371,8 +374,10 @@ public final class BaseClusterTopology {
      * Bits 1..16 represent the center section x coordinates; bits 0 and 17 are
      * the west/east halo. The row grid uses the same one-cell shell for y and z.
      */
-    private static void removeSealedCells(BuildInput input, BuildScratch scratch) {
-        input.populateFullCollisionRows(scratch);
+    private static void removeSealedCells(BuildInput input,
+                                          GeometryKey geometry,
+                                          BuildScratch scratch) {
+        input.populateFullCollisionRows(geometry, scratch);
         for (int y = 0; y < SIDE; y++) {
             for (int z = 0; z < SIDE; z++) {
                 int row = (y + 1) * SEALED_SIDE + z + 1;
@@ -709,11 +714,24 @@ public final class BaseClusterTopology {
     public record GeometryKey(Channel channel,
                               int widthCells,
                               int heightCells,
+                              float width,
+                              float height,
                               boolean acceptsFluid) {
+        public GeometryKey(Channel channel,
+                           int widthCells,
+                           int heightCells,
+                           boolean acceptsFluid) {
+            this(channel, widthCells, heightCells, widthCells, heightCells, acceptsFluid);
+        }
+
         public GeometryKey {
             Objects.requireNonNull(channel, "channel");
             if (widthCells < 1 || widthCells > SIDE || heightCells < 1 || heightCells > SIDE) {
                 throw new IllegalArgumentException("unsupported macro geometry");
+            }
+            if (!Float.isFinite(width) || width <= 0.0F
+                    || !Float.isFinite(height) || height <= 0.0F) {
+                throw new IllegalArgumentException("invalid physical macro geometry");
             }
         }
     }
@@ -758,7 +776,7 @@ public final class BaseClusterTopology {
         public GeometryKey geometry(Channel channel) {
             int widthCells = (int) Math.ceil(width);
             int heightCells = (int) Math.ceil(height);
-            return new GeometryKey(channel, widthCells, heightCells, acceptsFluid);
+            return new GeometryKey(channel, widthCells, heightCells, width, height, acceptsFluid);
         }
 
         public MovementKey movement(Channel channel) {
@@ -845,20 +863,59 @@ public final class BaseClusterTopology {
             ));
         }
 
-        private void populateFullCollisionRows(BuildScratch scratch) {
+        boolean volumeOpen(int x,
+                           int y,
+                           int z,
+                           GeometryKey geometry,
+                           BuildScratch scratch) {
+            int flags = flags(x, y, z, scratch);
+            if ((flags & VOLUME_OPEN) == 0) return false;
+            PackedFacts source = sourceFacts(x, y, z, scratch);
+            if (source == null || (flags & EXACT_REQUIRED) == 0) return true;
+            SectionGeometry sectionGeometry = source.geometry();
+            if (sectionGeometry == null) return false;
+            return !sectionGeometry.occupied(cellIndex(
+                    Math.floorMod(x, SIDE),
+                    Math.floorMod(y, SIDE),
+                    Math.floorMod(z, SIDE)
+            ), geometry.width(), geometry.height());
+        }
+
+        @Nullable
+        private PackedFacts sourceFacts(int x, int y, int z, BuildScratch scratch) {
+            int sectionX = Math.floorDiv(x, SIDE);
+            int sectionY = Math.floorDiv(y, SIDE);
+            int sectionZ = Math.floorDiv(z, SIDE);
+            if (sectionX == 0 && sectionY == 0 && sectionZ == 0) return center;
+            if (Math.abs(sectionX) > 1 || Math.abs(sectionY) > 1 || Math.abs(sectionZ) > 1) {
+                return null;
+            }
+            int encoded = haloIndex(sectionX, sectionY, sectionZ);
+            int index = Arrays.binarySearch(offsets, (byte) encoded);
+            return index < 0 ? null : facts[index];
+        }
+
+        private void populateFullCollisionRows(GeometryKey geometry,
+                                               BuildScratch scratch) {
             for (int y = 0; y < SIDE; y++) {
                 for (int z = 0; z < SIDE; z++) {
-                    int open = scratch.volumeRows[y * EXTENDED_SIDE + z - EXTENDED_MIN];
-                    int full = (~(open >>> -EXTENDED_MIN)) & 0xffff;
+                    int full = 0;
+                    for (int x = -1; x <= SIDE; x++) {
+                        if (!volumeOpen(x, y, z, geometry, scratch)) {
+                            full |= 1 << (x + 1);
+                        }
+                    }
                     scratch.fullCollisionRows[(y + 1) * SEALED_SIDE + z + 1] = full << 1;
                 }
             }
             for (Direction face : Direction.values()) {
-                copyFullCollisionFace(face, scratch);
+                copyFullCollisionFace(face, geometry, scratch);
             }
         }
 
-        private void copyFullCollisionFace(Direction face, BuildScratch scratch) {
+        private void copyFullCollisionFace(Direction face,
+                                           GeometryKey geometry,
+                                           BuildScratch scratch) {
             int index = Arrays.binarySearch(offsets, (byte) haloIndex(
                     face.getStepX(), face.getStepY(), face.getStepZ()
             ));
@@ -902,13 +959,27 @@ public final class BaseClusterTopology {
                         }
                         default -> throw new IllegalStateException("unknown direction axis");
                     }
-                    if ((source.flags(cellIndex(sourceX, sourceY, sourceZ))
-                            & VOLUME_OPEN) == 0) {
+                    if (!sourceFlagsOpen(source, sourceX, sourceY, sourceZ, geometry, scratch)) {
                         scratch.fullCollisionRows[(targetY + 1) * SEALED_SIDE + targetZ + 1]
                                 |= 1 << (targetX + 1);
                     }
                 }
             }
+        }
+
+        private boolean sourceFlagsOpen(PackedFacts source,
+                                        int x,
+                                        int y,
+                                        int z,
+                                        GeometryKey geometry,
+                                        BuildScratch scratch) {
+            int flags = source.flags(cellIndex(x, y, z));
+            if ((flags & VOLUME_OPEN) == 0) return false;
+            if ((flags & EXACT_REQUIRED) == 0) return true;
+            SectionGeometry sectionGeometry = source.geometry();
+            return sectionGeometry != null
+                    && !sectionGeometry.occupied(cellIndex(x, y, z),
+                    geometry.width(), geometry.height());
         }
 
         HaloStamps usedStamps(boolean[] used) {
@@ -983,11 +1054,16 @@ public final class BaseClusterTopology {
         private final byte[] data;
         private final int uniformFlags;
         private final long fingerprint;
+        private final SectionGeometry geometryFacts;
 
-        private PackedFacts(byte[] data, int uniformFlags, long fingerprint) {
+        private PackedFacts(byte[] data,
+                            int uniformFlags,
+                            long fingerprint,
+                            SectionGeometry geometryFacts) {
             this.data = data;
             this.uniformFlags = uniformFlags;
             this.fingerprint = fingerprint;
+            this.geometryFacts = Objects.requireNonNull(geometryFacts, "geometryFacts");
         }
 
         static PackedFacts fromBytes(byte[] packed) {
@@ -995,8 +1071,24 @@ public final class BaseClusterTopology {
             if (packed.length != PACKED_FACT_BYTES) {
                 throw new IllegalArgumentException("packed facts must contain exactly 2048 bytes");
             }
+            byte[] cells = new byte[CELL_COUNT];
+            for (int cell = 0; cell < CELL_COUNT; cell++) {
+                int value = Byte.toUnsignedInt(packed[cell >>> 1]);
+                cells[cell] = (byte) ((cell & 1) == 0 ? value & VALID_FLAGS : value >>> 4);
+            }
+            return fromBytes(packed, SectionGeometry.fromFlags(cells));
+        }
+
+        static PackedFacts fromBytes(byte[] packed, SectionGeometry geometry) {
+            Objects.requireNonNull(packed, "packed");
+            Objects.requireNonNull(geometry, "geometry");
+            if (packed.length != PACKED_FACT_BYTES) {
+                throw new IllegalArgumentException("packed facts must contain exactly 2048 bytes");
+            }
             byte[] copy = packed.clone();
-            return new PackedFacts(copy, -1, fingerprintPacked(copy));
+            return new PackedFacts(copy, -1,
+                    fingerprintPacked(copy) ^ Long.rotateLeft(geometry.fingerprint(), 17),
+                    geometry);
         }
 
         static PackedFacts allAir() {
@@ -1006,7 +1098,8 @@ public final class BaseClusterTopology {
         private static PackedFacts createAllAir() {
             byte[] cells = new byte[CELL_COUNT];
             Arrays.fill(cells, (byte) VOLUME_OPEN);
-            return new PackedFacts(null, VOLUME_OPEN, fingerprintCells(cells));
+            return new PackedFacts(null, VOLUME_OPEN, fingerprintCells(cells),
+                    SectionGeometry.allAir());
         }
 
         static PackedFacts fromCells(byte[] cells) {
@@ -1014,16 +1107,28 @@ public final class BaseClusterTopology {
             if (cells.length != CELL_COUNT) {
                 throw new IllegalArgumentException("facts must contain exactly 4096 cells");
             }
-            return fromCells(cells, fingerprintCells(cells));
+            return fromCells(cells, fingerprintCells(cells), SectionGeometry.fromFlags(cells));
         }
 
-        private static PackedFacts fromCells(byte[] cells, long fingerprint) {
+        static PackedFacts fromCells(byte[] cells, SectionGeometry geometry) {
+            Objects.requireNonNull(cells, "cells");
+            Objects.requireNonNull(geometry, "geometry");
+            if (cells.length != CELL_COUNT) {
+                throw new IllegalArgumentException("facts must contain exactly 4096 cells");
+            }
+            return fromCells(cells, fingerprintCells(cells), geometry);
+        }
+
+        private static PackedFacts fromCells(byte[] cells,
+                                             long fingerprint,
+                                             SectionGeometry geometry) {
             byte[] packed = new byte[PACKED_FACT_BYTES];
             for (int cell = 0; cell < CELL_COUNT; cell += 2) {
                 packed[cell >>> 1] = (byte) ((cells[cell] & VALID_FLAGS)
                         | ((cells[cell + 1] & VALID_FLAGS) << 4));
             }
-            return new PackedFacts(packed, -1, fingerprint);
+            long combined = fingerprint ^ Long.rotateLeft(geometry.fingerprint(), 17);
+            return new PackedFacts(packed, -1, combined, geometry);
         }
 
         int flags(int cell) {
@@ -1088,6 +1193,9 @@ public final class BaseClusterTopology {
             if (fingerprint != other.fingerprint) {
                 return false;
             }
+            if (!geometryFacts.contentEquals(other.geometryFacts)) {
+                return false;
+            }
             for (int cell = 0; cell < CELL_COUNT; cell++) {
                 if (flags(cell) != other.flags(cell)) {
                     return false;
@@ -1100,8 +1208,12 @@ public final class BaseClusterTopology {
             return fingerprint;
         }
 
+        SectionGeometry geometry() {
+            return geometryFacts;
+        }
+
         int retainedBytes() {
-            return data == null ? 32 : 32 + data.length;
+            return (data == null ? 32 : 32 + data.length) + geometryFacts.retainedBytes();
         }
 
     }

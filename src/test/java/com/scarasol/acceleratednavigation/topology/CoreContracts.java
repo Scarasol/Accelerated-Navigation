@@ -13,6 +13,10 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
 import java.io.InputStreamReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -43,8 +47,9 @@ public final class CoreContracts {
         nodeLimitReportsItsOwnFailure();
         queuedWorkCanBeCancelledAndWorkersStop();
         graphCaptureKeepsStructureAndMarksMissingSections();
+        geometryFactsBlockPartialShapeAndRoundTrip();
         reverseContracts();
-        System.out.println("Core contracts: 8 passed");
+        System.out.println("Core contracts: 9 passed");
     }
 
     private static void reverseContracts() throws Exception {
@@ -243,6 +248,42 @@ public final class CoreContracts {
         return BaseClusterTopology.build(section, 1L, BaseClusterTopology.BuildInput.center(facts),
                 BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.geometry(BaseClusterTopology.Channel.GROUND),
                 new BaseClusterTopology.BuildScratch());
+    }
+
+    private static void geometryFactsBlockPartialShapeAndRoundTrip() throws Exception {
+        byte[] flags = new byte[BaseClusterTopology.CELL_COUNT];
+        for (int x = 0; x <= 2; x++) {
+            flags[BaseClusterTopology.cellIndex(x, 0, 0)] =
+                    (byte) (BaseClusterTopology.VOLUME_OPEN | BaseClusterTopology.GROUND_OPEN);
+            flags[BaseClusterTopology.cellIndex(x, 1, 0)] =
+                    (byte) BaseClusterTopology.VOLUME_OPEN;
+        }
+        SectionGeometry.Cell[] cells = new SectionGeometry.Cell[BaseClusterTopology.CELL_COUNT];
+        Arrays.fill(cells, SectionGeometry.empty());
+        int wallCell = BaseClusterTopology.cellIndex(1, 0, 0);
+        cells[wallCell] = SectionGeometry.boxes(List.of(
+                SectionGeometry.quantized(0.45, 0.0, 0.0, 0.55, 1.0, 1.0)));
+        flags[wallCell] |= BaseClusterTopology.EXACT_REQUIRED;
+        SectionGeometry geometry = SectionGeometry.fromCells(cells);
+        BaseClusterTopology.PackedFacts facts = BaseClusterTopology.PackedFacts.fromCells(flags, geometry);
+        BaseClusterTopology graph = groundGraph(SectionPos.of(0, 0, 0), facts);
+        int left = graph.componentAt(0, 0, 0);
+        int right = graph.componentAt(2, 0, 0);
+        require(left >= 0 && right >= 0 && left != right,
+                "partial collision geometry did not split the crossing components");
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            geometry.write(output);
+        }
+        SectionGeometry restored;
+        try (DataInputStream input = new DataInputStream(
+                new ByteArrayInputStream(bytes.toByteArray()))) {
+            restored = SectionGeometry.read(input);
+        }
+        require(restored.fingerprint() == geometry.fingerprint()
+                        && restored.occupied(wallCell, 0.6F, 1.95F),
+                "section geometry persistence changed collision semantics");
     }
 
     private static void searchCompletesOnlyWithConnectedGraph() {

@@ -32,7 +32,7 @@ import java.util.concurrent.TimeUnit;
 final class TopologyStore implements AutoCloseable {
 
     private static final int MAGIC = 0x414E544F;
-    private static final int SCHEMA_VERSION = 4;
+    private static final int SCHEMA_VERSION = 5;
     private static final int MAX_SECTIONS_PER_CHUNK = 1_024;
     private static final int MAX_DECODED_CHUNKS = 256;
     private static final int MAX_OPEN_REGIONS = 256;
@@ -541,7 +541,8 @@ final class TopologyStore implements AutoCloseable {
             byte[] packed = new byte[BaseClusterTopology.PACKED_FACT_BYTES];
             input.readFully(packed);
             SectionRecord record = new SectionRecord(
-                    version, BaseClusterTopology.PackedFacts.fromBytes(packed));
+                    version, BaseClusterTopology.PackedFacts.fromBytes(
+                            packed, SectionGeometry.read(input)));
             if (sections.put(sectionY, record) != null) {
                 throw new IllegalArgumentException("duplicate topology section");
             }
@@ -565,7 +566,9 @@ final class TopologyStore implements AutoCloseable {
             for (Map.Entry<Integer, SectionRecord> section : image.sections.entrySet()) {
                 output.writeInt(section.getKey());
                 output.writeLong(section.getValue().version);
-                output.write(section.getValue().facts.bytes());
+                BaseClusterTopology.PackedFacts facts = section.getValue().facts;
+                output.write(facts.bytes());
+                facts.geometry().write(output);
             }
         }
     }

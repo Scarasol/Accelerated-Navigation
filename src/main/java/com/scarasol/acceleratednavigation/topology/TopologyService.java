@@ -21,6 +21,7 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import org.jetbrains.annotations.Nullable;
 
@@ -614,10 +615,10 @@ public final class TopologyService {
             section.recoveryAttempted = true;
             RecoveryResult recovered = scanSection(section);
             if (recovered.firstFailure != null) {
-                AcceleratedNavigation.LOGGER.warn(
-                        "Recovered macro facts for {} with {} degraded collision cells; first at {} state={} ({})",
-                        key, recovered.degradedCount, recovered.firstPosition,
-                        recovered.firstState, recovered.firstFailure.toString());
+                throw new IllegalStateException(
+                        "collision geometry was not fully acquired at "
+                                + recovered.firstPosition + " state=" + recovered.firstState,
+                        recovered.firstFailure);
             }
             section.pendingChanges.clear();
             changedSections.remove(section);
@@ -652,6 +653,8 @@ public final class TopologyService {
     private RecoveryResult scanSection(LoadedSection section) {
         byte[] cells = new byte[BaseClusterTopology.CELL_COUNT];
         long[] collidingCells = new long[BaseClusterTopology.CELL_COUNT / Long.SIZE];
+        SectionGeometry.Cell[] geometryCells = new SectionGeometry.Cell[
+                BaseClusterTopology.CELL_COUNT];
         BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
         SectionPos origin = section.key.section();
         int degraded = 0;
@@ -667,13 +670,18 @@ public final class TopologyService {
                     BlockState state = section.chunk.chunk.getBlockState(cursor);
                     boolean fluid = !state.getFluidState().isEmpty();
                     int classified;
+                    SectionGeometry.Cell geometry;
                     try {
-                        classified = collisionClassification(state);
+                        CollisionSample sample = collisionSample(
+                                state, section.chunk.chunk, cursor);
+                        classified = sample.flags();
+                        geometry = sample.geometry();
                     } catch (RuntimeException failure) {
                         classified = BaseClusterTopology.VOLUME_OPEN
                                 | BaseClusterTopology.GROUND_OPEN
                                 | BaseClusterTopology.EXACT_REQUIRED | COLLIDES
                                 | (fluid ? BaseClusterTopology.FLUID : 0);
+                        geometry = SectionGeometry.unknown();
                         degraded++;
                         if (firstFailure == null) {
                             firstFailure = failure;
@@ -683,11 +691,13 @@ public final class TopologyService {
                     }
                     cells[cell] = (byte) addSupport(classified,
                             y > 0 && collisionBit(collidingCells, cell - 256));
+                    geometryCells[cell] = geometry;
                     if ((classified & COLLIDES) != 0) setCollisionBit(collidingCells, cell);
                 }
             }
         }
-        return new RecoveryResult(BaseClusterTopology.PackedFacts.fromCells(cells),
+        return new RecoveryResult(BaseClusterTopology.PackedFacts.fromCells(
+                        cells, SectionGeometry.fromCells(geometryCells)),
                 degraded, firstPosition, firstState, firstFailure);
     }
 
@@ -706,13 +716,45 @@ public final class TopologyService {
                                     long after) {
         requireServerThread();
         if (!isAvailable() || before == after) return;
-        recordCellChange(level, chunk, position,
+        boolean changed = false;
+        if ((before & FACT_MASK) != (after & FACT_MASK)) {
+            recordCellChange(level, chunk, position,
                 (byte) (before & FACT_MASK), (byte) (after & FACT_MASK));
+            changed = true;
+        }
         if ((before & HAS_ABOVE) != 0L && (after & HAS_ABOVE) != 0L) {
-            recordCellChange(level, chunk, position.above(),
+            if ((before >>> 8 & FACT_MASK) != (after >>> 8 & FACT_MASK)) {
+                recordCellChange(level, chunk, position.above(),
                     (byte) (before >>> 8 & FACT_MASK),
                     (byte) (after >>> 8 & FACT_MASK));
+                changed = true;
+            }
         }
+        if (!changed) {
+            markGeometryChange(level, chunk, position);
+        }
+    }
+
+    private void markGeometryChange(ServerLevel level,
+                                    LevelChunk chunk,
+                                    BlockPos position) {
+        TopologyWorkerRuntime.ClusterKey key = new TopologyWorkerRuntime.ClusterKey(
+                level.dimension(), SectionPos.of(position));
+        LoadedSection section = loadedSections.get(key);
+        LoadedChunk loaded = loadedChunks.get(
+                new ChunkKey(level.dimension(), chunk.getPos().toLong()));
+        if (section == null || loaded == null || section.chunk != loaded
+                || loaded.chunk != chunk) return;
+        long tick = server.getTickCount();
+        if (section.changedTick != tick) {
+            section.changedTick = tick;
+            section.changeOriginalVersion = section.version;
+            section.version++;
+            section.chunk.carrier.acceleratedNavigation$factsState()
+                    .setVersion(section.sectionY, section.version);
+        }
+        section.geometryDirty = true;
+        changedSections.add(section);
     }
 
     private void recordCellChange(ServerLevel level,
@@ -755,20 +797,38 @@ public final class TopologyService {
         List<LoadedSection> changed = List.copyOf(changedSections);
         changedSections.clear();
         for (LoadedSection section : changed) {
-            if (section.pendingChanges.isEmpty()) continue;
-            Map<Integer, Byte> changes = Map.copyOf(section.pendingChanges);
+            if (section.pendingChanges.isEmpty() && !section.geometryDirty) continue;
             section.pendingChanges.clear();
-            long original = section.changeOriginalVersion;
-            long targetVersion = section.version;
+            section.geometryDirty = false;
             section.changeOriginalVersion = -1L;
             section.changedTick = Long.MIN_VALUE;
             section.implicitAllAirBase = false;
             section.readRequest++;
             section.readInFlight = false;
             section.persistencePending = !section.recoveryFailed;
-            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
-                    section.key, section.chunk.identity, original, targetVersion,
-                    TopologyWorkerRuntime.FactState.AVAILABLE, null, changes));
+            try {
+                RecoveryResult recovered = scanSection(section);
+                if (recovered.firstFailure != null) {
+                    throw new IllegalStateException(
+                            "collision geometry was not fully acquired at "
+                                    + recovered.firstPosition + " state=" + recovered.firstState,
+                            recovered.firstFailure);
+                }
+                writeFull(section, recovered.facts);
+                recoveredSections++;
+                degradedRecoveryCells += recovered.degradedCount;
+            } catch (Throwable failure) {
+                if (failure instanceof VirtualMachineError fatal) throw fatal;
+                if (failure instanceof ThreadDeath fatal) throw fatal;
+                section.recoveryFailed = true;
+                section.persistencePending = false;
+                failedRecoveries++;
+                runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                        section.key, section.chunk.identity, section.version, section.version,
+                        TopologyWorkerRuntime.FactState.RECOVERY_FAILED, null, Map.of()));
+                AcceleratedNavigation.LOGGER.error(
+                        "Could not rescan macro geometry for " + section.key, failure);
+            }
         }
         runtime.endServerTick();
     }
@@ -1142,20 +1202,33 @@ public final class TopologyService {
         Objects.requireNonNull(position, "position");
         BlockState current = getter.getBlockState(position);
         int currentCollision = collisionClassification(current);
+        long currentGeometry = collisionGeometryFingerprint(current, getter, position);
         int belowCollision = (position.getY() & 15) == 0 ? 0 : collisionClassification(
                 getter.getBlockState(position.below()));
         int currentFlags = addSupport(
                 currentCollision, (belowCollision & COLLIDES) != 0);
         if (position.getY() + 1 >= getter.getMaxBuildHeight()) {
-            return currentFlags & FACT_MASK;
+            return (currentFlags & FACT_MASK) | (currentGeometry << 32);
         }
         BlockPos abovePosition = position.above();
-        int aboveCollision = collisionClassification(
-                getter.getBlockState(abovePosition));
+        BlockState aboveState = getter.getBlockState(abovePosition);
+        int aboveCollision = collisionClassification(aboveState);
+        long aboveGeometry = collisionGeometryFingerprint(aboveState, getter, abovePosition);
         int aboveFlags = addSupport(aboveCollision,
                 (abovePosition.getY() & 15) != 0 && (currentCollision & COLLIDES) != 0);
         return (currentFlags & FACT_MASK)
-                | (long) (aboveFlags & FACT_MASK) << 8 | HAS_ABOVE;
+                | (long) (aboveFlags & FACT_MASK) << 8 | HAS_ABOVE
+                | ((currentGeometry ^ Long.rotateLeft(aboveGeometry, 17)) << 32);
+    }
+
+    private static long collisionGeometryFingerprint(BlockState state,
+                                                      BlockGetter getter,
+                                                      BlockPos position) {
+        try {
+            return collisionSample(state, getter, position).geometry().fingerprint();
+        } catch (RuntimeException failure) {
+            return 0x9e3779b97f4a7c15L;
+        }
     }
 
     private static int addSupport(int classification, boolean supportBelow) {
@@ -1187,6 +1260,37 @@ public final class TopologyService {
         return flags | (shape.isEmpty() ? 0 : COLLIDES);
     }
 
+    private static CollisionSample collisionSample(BlockState state,
+                                                   BlockGetter getter,
+                                                   BlockPos position) {
+        boolean fluid = !state.getFluidState().isEmpty();
+        int fluidFlag = fluid ? BaseClusterTopology.FLUID : 0;
+        if (state.getBlock() instanceof LiquidBlock) {
+            return new CollisionSample(
+                    fluidFlag | BaseClusterTopology.VOLUME_OPEN
+                            | BaseClusterTopology.GROUND_OPEN,
+                    SectionGeometry.empty());
+        }
+        VoxelShape shape = state.getCollisionShape(getter, position, CollisionContext.empty());
+        if (shape.isEmpty()) {
+            return new CollisionSample(fluidFlag | BaseClusterTopology.VOLUME_OPEN,
+                    SectionGeometry.empty());
+        }
+        if (Block.isShapeFullBlock(shape)) {
+            return new CollisionSample(fluidFlag | COLLIDES, SectionGeometry.fullBlock());
+        }
+        List<SectionGeometry.Box> boxes = new ArrayList<>();
+        for (net.minecraft.world.phys.AABB box : shape.toAabbs()) {
+            boxes.add(SectionGeometry.quantized(
+                    box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ));
+        }
+        return new CollisionSample(
+                fluidFlag | BaseClusterTopology.VOLUME_OPEN
+                        | BaseClusterTopology.GROUND_OPEN
+                        | BaseClusterTopology.EXACT_REQUIRED | COLLIDES,
+                SectionGeometry.boxes(boxes));
+    }
+
     public interface ChunkFactsCarrier {
         ChunkFactsState acceleratedNavigation$factsState();
     }
@@ -1208,10 +1312,8 @@ public final class TopologyService {
     /** Per-chunk generation/version state; it never mirrors the global facts cache. */
     public static final class ChunkFactsState {
         private final Map<Integer, Long> versions = new HashMap<>();
-        private final Map<Integer, byte[]> generatedCells = new HashMap<>();
         private final Set<Integer> incompleteSections = new java.util.HashSet<>();
         private boolean generationInitialized;
-        private boolean loadedFromDisk;
         private boolean versionTagValid = true;
         @Nullable
         private volatile TopologyService consumer;
@@ -1238,39 +1340,17 @@ public final class TopologyService {
         public synchronized void recordGeneratedWrite(BlockGetter chunk, BlockPos position) {
             if (consumer != null) return;
             int sectionY = position.getY() >> 4;
-            if (loadedFromDisk || incompleteSections.contains(sectionY)) {
-                versions.remove(sectionY);
-                return;
-            }
-            long sampled = sampleColumnFacts(chunk, position);
-            recordGeneratedCell(position, (byte) (sampled & FACT_MASK));
-            if ((sampled & HAS_ABOVE) != 0L) {
-                recordGeneratedCell(position.above(),
-                        (byte) (sampled >>> 8 & FACT_MASK));
-            }
-        }
-
-        private void recordGeneratedCell(BlockPos position, byte flags) {
-            int sectionY = position.getY() >> 4;
-            if (incompleteSections.contains(sectionY)) return;
-            byte[] cells = generatedCells.computeIfAbsent(sectionY, ignored -> {
-                byte[] created = new byte[BaseClusterTopology.CELL_COUNT];
-                Arrays.fill(created, (byte) BaseClusterTopology.VOLUME_OPEN);
-                return created;
-            });
-            int cell = (position.getX() & 15) | (position.getZ() & 15) << 4
-                    | (position.getY() & 15) << 8;
-            if (cells[cell] == flags) return;
-            cells[cell] = flags;
-            versions.merge(sectionY, 1L, Long::sum);
+            // Generated writes do not have a stable section-wide geometry
+            // snapshot.  Keep the section pending and rescan it once the
+            // chunk is attached to the server-owned service.
+            versions.remove(sectionY);
+            incompleteSections.add(sectionY);
         }
 
         public synchronized void loadedVersions(Map<Integer, Long> loaded, boolean valid) {
             versions.clear();
             versions.putAll(Objects.requireNonNull(loaded, "loaded"));
-            generatedCells.clear();
             incompleteSections.clear();
-            loadedFromDisk = true;
             versionTagValid = valid;
         }
 
@@ -1279,13 +1359,7 @@ public final class TopologyService {
         }
 
         synchronized Map<Integer, TopologyStore.SectionRecord> drainGeneratedFacts() {
-            Map<Integer, TopologyStore.SectionRecord> result = new HashMap<>();
-            generatedCells.forEach((sectionY, cells) -> result.put(sectionY,
-                    new TopologyStore.SectionRecord(versions.getOrDefault(sectionY, 0L),
-                            BaseClusterTopology.PackedFacts.fromCells(cells))));
-            generatedCells.clear();
-            loadedFromDisk = true;
-            return Map.copyOf(result);
+            return Map.of();
         }
 
         synchronized boolean versionTagValid() {
@@ -1329,6 +1403,7 @@ public final class TopologyService {
         private long version;
         private long changedTick = Long.MIN_VALUE;
         private long changeOriginalVersion = -1L;
+        private boolean geometryDirty;
         private boolean persistencePending;
         private boolean persistenceUnavailable;
         private int foregroundWaiters;
@@ -1349,6 +1424,9 @@ public final class TopologyService {
             this.version = version;
             this.implicitAllAirBase = implicitAllAirBase;
         }
+    }
+
+    private record CollisionSample(int flags, SectionGeometry.Cell geometry) {
     }
 
     private record RecoveryResult(BaseClusterTopology.PackedFacts facts,

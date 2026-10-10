@@ -1,0 +1,324 @@
+package com.scarasol.acceleratednavigation.topology;
+
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.EOFException;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+/**
+ * Immutable, section-local collision geometry.
+ *
+ * <p>Shapes are stored once in a small palette and each cell keeps a palette
+ * index. Coordinates are quantized to sixteenths, which is the resolution
+ * used by Minecraft's block voxel shapes. Unknown geometry is deliberately a
+ * distinct palette entry and is treated as occupied by the derived graph.</p>
+ */
+final class SectionGeometry {
+
+    static final int EMPTY = 0;
+    static final int FULL_BLOCK = 1;
+    static final int UNKNOWN = 2;
+    private static final int MAX_PALETTE = 4096;
+    private static final int MAX_BOXES = 64;
+
+    private final short[] cells;
+    private final Shape[] palette;
+    private final long fingerprint;
+
+    private SectionGeometry(short[] cells, Shape[] palette) {
+        this.cells = cells;
+        this.palette = palette;
+        this.fingerprint = fingerprint(cells, palette);
+        validate();
+    }
+
+    static SectionGeometry allAir() {
+        return new SectionGeometry(new short[BaseClusterTopology.CELL_COUNT],
+                new Shape[]{Shape.EMPTY, Shape.FULL, Shape.UNKNOWN});
+    }
+
+    static SectionGeometry fromCells(Cell[] values) {
+        Objects.requireNonNull(values, "values");
+        if (values.length != BaseClusterTopology.CELL_COUNT) {
+            throw new IllegalArgumentException("geometry must contain exactly 4096 cells");
+        }
+        List<Shape> shapes = new ArrayList<>();
+        shapes.add(Shape.EMPTY);
+        shapes.add(Shape.FULL);
+        shapes.add(Shape.UNKNOWN);
+        Map<Shape, Short> ids = new HashMap<>();
+        ids.put(Shape.EMPTY, (short) EMPTY);
+        ids.put(Shape.FULL, (short) FULL_BLOCK);
+        ids.put(Shape.UNKNOWN, (short) UNKNOWN);
+        short[] cells = new short[values.length];
+        for (int cell = 0; cell < values.length; cell++) {
+            Cell value = Objects.requireNonNull(values[cell], "geometry cell");
+            Shape shape = value.shape();
+            Short id = ids.get(shape);
+            if (id == null) {
+                if (shapes.size() >= MAX_PALETTE) {
+                    throw new IllegalArgumentException("too many section geometry shapes");
+                }
+                id = (short) shapes.size();
+                shapes.add(shape);
+                ids.put(shape, id);
+            }
+            cells[cell] = id;
+        }
+        return new SectionGeometry(cells, shapes.toArray(Shape[]::new));
+    }
+
+    static SectionGeometry fromFlags(byte[] flags) {
+        Objects.requireNonNull(flags, "flags");
+        if (flags.length != BaseClusterTopology.CELL_COUNT) {
+            throw new IllegalArgumentException("facts must contain exactly 4096 cells");
+        }
+        Cell[] cells = new Cell[flags.length];
+        for (int cell = 0; cell < flags.length; cell++) {
+            int value = Byte.toUnsignedInt(flags[cell]);
+            cells[cell] = new Cell((value & BaseClusterTopology.EXACT_REQUIRED) != 0
+                    ? Shape.UNKNOWN
+                    : (value & BaseClusterTopology.VOLUME_OPEN) == 0
+                    ? Shape.FULL : Shape.EMPTY);
+        }
+        return fromCells(cells);
+    }
+
+    static SectionGeometry read(DataInput input) throws IOException {
+        int paletteSize = input.readInt();
+        if (paletteSize < 3 || paletteSize > MAX_PALETTE) {
+            throw new IllegalArgumentException("invalid geometry palette size");
+        }
+        Shape[] palette = new Shape[paletteSize];
+        palette[EMPTY] = Shape.EMPTY;
+        palette[FULL_BLOCK] = Shape.FULL;
+        palette[UNKNOWN] = Shape.UNKNOWN;
+        for (int index = 3; index < paletteSize; index++) {
+            int boxCount = input.readUnsignedByte();
+            if (boxCount < 1 || boxCount > MAX_BOXES) {
+                throw new IllegalArgumentException("invalid geometry box count");
+            }
+            short[] coordinates = new short[boxCount * 6];
+            for (int coordinate = 0; coordinate < coordinates.length; coordinate++) {
+                int value = input.readUnsignedByte();
+                if (value > 16) throw new IllegalArgumentException("invalid geometry coordinate");
+                coordinates[coordinate] = (short) value;
+            }
+            palette[index] = new Shape(coordinates);
+        }
+        short[] cells = new short[BaseClusterTopology.CELL_COUNT];
+        for (int cell = 0; cell < cells.length; cell++) {
+            int id = input.readUnsignedShort();
+            if (id >= paletteSize) throw new IllegalArgumentException("invalid geometry cell id");
+            cells[cell] = (short) id;
+        }
+        return new SectionGeometry(cells, palette);
+    }
+
+    void write(DataOutput output) throws IOException {
+        output.writeInt(palette.length);
+        for (int index = 3; index < palette.length; index++) {
+            Shape shape = palette[index];
+            output.writeByte(shape.coordinates.length / 6);
+            for (short coordinate : shape.coordinates) output.writeByte(coordinate);
+        }
+        for (short cell : cells) output.writeShort(Short.toUnsignedInt(cell));
+    }
+
+    Shape shape(int cell) {
+        if (cell < 0 || cell >= cells.length) throw new IndexOutOfBoundsException("geometry cell");
+        return palette[Short.toUnsignedInt(cells[cell])];
+    }
+
+    boolean occupied(int cell, float width, float height) {
+        Shape shape = shape(cell);
+        if (shape == Shape.EMPTY) return false;
+        if (shape == Shape.FULL || shape == Shape.UNKNOWN) return true;
+        // The coarse graph anchor is at the center of the cell.  The exact
+        // palette still preserves the shape boundary, so a thin plate outside
+        // the requested body footprint remains traversable.
+        double halfWidth = width * 0.5;
+        double minX = 0.5 - halfWidth;
+        double maxX = 0.5 + halfWidth;
+        double minY = 0.0;
+        double maxY = height;
+        double minZ = minX;
+        double maxZ = maxX;
+        return shape.intersects(minX, maxX, minY, maxY, minZ, maxZ);
+    }
+
+    int retainedBytes() {
+        int total = 16 + cells.length * Short.BYTES;
+        for (Shape shape : palette) total += shape.coordinates.length * Short.BYTES;
+        return total;
+    }
+
+    long fingerprint() {
+        return fingerprint;
+    }
+
+    boolean contentEquals(SectionGeometry other) {
+        if (this == other) return true;
+        if (other == null || !Arrays.equals(cells, other.cells)
+                || palette.length != other.palette.length) return false;
+        for (int index = 0; index < palette.length; index++) {
+            if (!palette[index].equals(other.palette[index])) return false;
+        }
+        return true;
+    }
+
+    private void validate() {
+        if (cells.length != BaseClusterTopology.CELL_COUNT
+                || palette.length < 3 || palette.length > MAX_PALETTE
+                || palette[EMPTY] != Shape.EMPTY
+                || palette[FULL_BLOCK] != Shape.FULL
+                || palette[UNKNOWN] != Shape.UNKNOWN) {
+            throw new IllegalArgumentException("invalid section geometry");
+        }
+        for (short id : cells) {
+            if (Short.toUnsignedInt(id) >= palette.length) {
+                throw new IllegalArgumentException("geometry cell id outside palette");
+            }
+        }
+    }
+
+    static Cell empty() {
+        return new Cell(Shape.EMPTY);
+    }
+
+    static Cell fullBlock() {
+        return new Cell(Shape.FULL);
+    }
+
+    static Cell unknown() {
+        return new Cell(Shape.UNKNOWN);
+    }
+
+    static Cell boxes(List<Box> boxes) {
+        Objects.requireNonNull(boxes, "boxes");
+        if (boxes.isEmpty()) return empty();
+        if (boxes.size() > MAX_BOXES) throw new IllegalArgumentException("too many geometry boxes");
+        short[] coordinates = new short[boxes.size() * 6];
+        int cursor = 0;
+        for (Box box : boxes) {
+            coordinates[cursor++] = box.minX;
+            coordinates[cursor++] = box.minY;
+            coordinates[cursor++] = box.minZ;
+            coordinates[cursor++] = box.maxX;
+            coordinates[cursor++] = box.maxY;
+            coordinates[cursor++] = box.maxZ;
+        }
+        return new Cell(new Shape(coordinates));
+    }
+
+    static Box quantized(double minX, double minY, double minZ,
+                         double maxX, double maxY, double maxZ) {
+        return new Box(
+                quantize(minX, false), quantize(minY, false), quantize(minZ, false),
+                quantize(maxX, true), quantize(maxY, true), quantize(maxZ, true)
+        );
+    }
+
+    private static short quantize(double value, boolean upper) {
+        double clamped = Math.max(0.0, Math.min(1.0, value));
+        int result = upper ? (int) Math.ceil(clamped * 16.0) : (int) Math.floor(clamped * 16.0);
+        return (short) Math.max(0, Math.min(16, result));
+    }
+
+    private static long fingerprint(short[] cells, Shape[] palette) {
+        long hash = 0xcbf29ce484222325L;
+        for (short cell : cells) {
+            hash = (hash ^ Short.toUnsignedInt(cell)) * 0x100000001b3L;
+        }
+        for (Shape shape : palette) {
+            for (short coordinate : shape.coordinates) {
+                hash = (hash ^ Short.toUnsignedInt(coordinate)) * 0x100000001b3L;
+            }
+            hash = (hash ^ shape.coordinates.length) * 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    record Cell(Shape shape) {
+        Cell {
+            Objects.requireNonNull(shape, "shape");
+        }
+
+        long fingerprint() {
+            return shape.fingerprint();
+        }
+    }
+
+    record Box(short minX, short minY, short minZ,
+               short maxX, short maxY, short maxZ) {
+        Box {
+            if (minX < 0 || minY < 0 || minZ < 0
+                    || maxX > 16 || maxY > 16 || maxZ > 16
+                    || minX >= maxX || minY >= maxY || minZ >= maxZ) {
+                throw new IllegalArgumentException("invalid quantized geometry box");
+            }
+        }
+    }
+
+    static final class Shape {
+        private static final Shape EMPTY = new Shape(0, new short[0]);
+        private static final Shape FULL = new Shape(1, new short[]{0, 0, 0, 16, 16, 16});
+        private static final Shape UNKNOWN = new Shape(2, new short[]{0, 0, 0, 16, 16, 16});
+
+        private final int kind;
+        private final short[] coordinates;
+
+        private Shape(short[] coordinates) {
+            this(3, coordinates);
+        }
+
+        private Shape(int kind, short[] coordinates) {
+            this.kind = kind;
+            this.coordinates = coordinates.clone();
+        }
+
+        private boolean intersects(double minX, double maxX,
+                                   double minY, double maxY,
+                                   double minZ, double maxZ) {
+            for (int offset = 0; offset < coordinates.length; offset += 6) {
+                double boxMinX = coordinates[offset] / 16.0;
+                double boxMinY = coordinates[offset + 1] / 16.0;
+                double boxMinZ = coordinates[offset + 2] / 16.0;
+                double boxMaxX = coordinates[offset + 3] / 16.0;
+                double boxMaxY = coordinates[offset + 4] / 16.0;
+                double boxMaxZ = coordinates[offset + 5] / 16.0;
+                if (boxMaxX > minX && boxMinX < maxX
+                        && boxMaxY > minY && boxMinY < maxY
+                        && boxMaxZ > minZ && boxMinZ < maxZ) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private long fingerprint() {
+            long hash = 0xcbf29ce484222325L;
+            for (short coordinate : coordinates) {
+                hash = (hash ^ Short.toUnsignedInt(coordinate)) * 0x100000001b3L;
+            }
+            return (hash ^ coordinates.length) * 0x100000001b3L;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Shape shape && kind == shape.kind
+                    && Arrays.equals(coordinates, shape.coordinates);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * kind + Arrays.hashCode(coordinates);
+        }
+    }
+}
