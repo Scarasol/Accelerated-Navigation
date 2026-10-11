@@ -4,4 +4,4 @@
 
 | 任务键 | 恢复正文 | 当前状态 |
 | --- | --- | --- |
-| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 恢复复用原型接入收尾：核心已随修复接入，补直接重叠链反馈后推送新工程1.20.1；无世界/UI |
+| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 恢复复用接入核对及代码push1.20.1完成；真实重叠链两扫描→一次，必要恢复保留；等待正常游戏确认 |
