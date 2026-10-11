@@ -473,7 +473,8 @@ public final class TopologyService {
         if (!isAvailable() || section.readInFlight || recoveryQueued(section)
                 || section.recoveryFailed) return;
         if (section.persistenceUnavailable) return;
-        if (hasUncommittedChanges(section) || section.persistencePending) return;
+        if (hasUncommittedChanges(section)
+                || runtime.factsPersistencePending(section.key, section.chunk.identity)) return;
         if (store == null) {
             registerRecovery(section);
             return;
@@ -650,7 +651,6 @@ public final class TopologyService {
             if (failure instanceof VirtualMachineError fatal) throw fatal;
             if (failure instanceof ThreadDeath fatal) throw fatal;
             section.recoveryFailed = true;
-            section.persistencePending = false;
             failedRecoveries++;
             runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                     section.key, section.chunk.identity, section.version, section.version,
@@ -824,7 +824,6 @@ public final class TopologyService {
             section.implicitAllAirBase = false;
             section.readRequest++;
             section.readInFlight = false;
-            section.persistencePending = !section.recoveryFailed;
             try {
                 RecoveryResult recovered = scanSection(section);
                 if (recovered.firstFailure != null) {
@@ -840,7 +839,6 @@ public final class TopologyService {
                 if (failure instanceof VirtualMachineError fatal) throw fatal;
                 if (failure instanceof ThreadDeath fatal) throw fatal;
                 section.recoveryFailed = true;
-                section.persistencePending = false;
                 failedRecoveries++;
                 runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                         section.key, section.chunk.identity, section.version, section.version,
@@ -868,7 +866,6 @@ public final class TopologyService {
 
     private void writeFull(LoadedSection section, BaseClusterTopology.PackedFacts facts) {
         if (!isAvailable()) return;
-        section.persistencePending = true;
         runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                 section.key, section.chunk.identity, section.version, section.version,
                 TopologyWorkerRuntime.FactState.AVAILABLE, facts, Map.of(), true));
@@ -927,10 +924,23 @@ public final class TopologyService {
         requireServerThread();
         LoadedSection section = current(decision.key(), decision.loadIdentity());
         if (section != null && !unsupportedThreading.get()) {
-            if (section.version == decision.version()) section.persistencePending = false;
             if (formed && !written) section.persistenceUnavailable = true;
-            if (written && section.version == decision.version()) section.persistenceUnavailable = false;
+            if (written && section.version == decision.version()
+                    && !runtime.factsPersistencePending(section.key, section.chunk.identity)
+                    && !hasUncommittedChanges(section)) {
+                section.persistenceUnavailable = false;
+                // A complete current-version write supersedes the queued rescan.
+                // Consume that recovery opportunity without scanning/publishing twice.
+                boolean supersededRecovery = foregroundRecovery.remove(section.key);
+                supersededRecovery |= ordinaryRecovery.remove(section.key);
+                if (supersededRecovery) section.recoveryAttempted = true;
+            }
             if (!formed && !written) registerRecovery(section);
+            if (section.foregroundWaiters > 0) {
+                // A fact demand may have arrived while its write was in flight.
+                // Clearing the guard must also restore its progress after eviction.
+                readPersisted(section);
+            }
         }
     }
 
@@ -1423,7 +1433,6 @@ public final class TopologyService {
         private long changedTick = Long.MIN_VALUE;
         private long changeOriginalVersion = -1L;
         private boolean geometryDirty;
-        private boolean persistencePending;
         private boolean persistenceUnavailable;
         private int foregroundWaiters;
         private long readRequest;

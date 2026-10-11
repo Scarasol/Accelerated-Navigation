@@ -127,8 +127,12 @@ controls和reader资格、measure两份原始JSON、summary、result-closure、r
 
 生产退出8对象按新身份结清，反向20命中重新绑定当前源并全部映射；旧捕获batch调用0，
 生产probe/QueueBridge等0；字节一致及编译/真实接线共同支持接入完成。
-当前排队合并修改仍在新工程本地，未再次提交或推送；前置远端基线已经包含上一轮采集/编码优化。
-这一状态满足“接入前先push”，也保持用户可以在当前工作区直接重启检查。
+本轮交付时排队合并修改在新工程本地；此前“接入前先push”的基线已包含采集/编码优化。
+用户后续授权“可以推送一版，然后对你觉得还有价值的方向进行原型验证”后，
+排队合并和既有报告也已提交并推送到origin/1.20.1，本地/远端核对一致。
+推送凭证为`.tmp/queued-write-prototype-20261011/current-authorized-push.json`；
+后续原型没有修改生产，最终实时远端核对见
+`.tmp/geometry-collection-prototype-20261011/final-state.json`。
 
 | 接入阶段要求 | 实际结清 |
 |---|---|

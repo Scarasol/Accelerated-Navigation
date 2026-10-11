@@ -443,6 +443,19 @@ final class TopologyWorkerRuntime {
         }));
     }
 
+    /** The runtime owns queued publications and writers; the service must not mirror them. */
+    boolean factsPersistencePending(ClusterKey key, long loadIdentity) {
+        synchronized (runtimeLock) {
+            SectionEvent queued = pendingSectionEvents.get(key);
+            if (queued != null && queued.loadIdentity() == loadIdentity && queued.persist()) return true;
+            SectionEvent processing = processingSectionEvents.get(key);
+            if (processing != null && processing.loadIdentity() == loadIdentity && processing.persist()) return true;
+            ClusterEntry entry = clusters.get(key);
+            return entry != null && entry.loadIdentity == loadIdentity
+                    && (entry.writeRequired || entry.decision != null);
+        }
+    }
+
     void publishSection(SectionEvent event) {
         boolean schedule;
         synchronized (runtimeLock) {
@@ -464,7 +477,17 @@ final class TopologyWorkerRuntime {
             }
             SectionEvent queued = pendingSectionEvents.get(event.key());
             SectionEvent previous = queued;
-            if (previous == null && sectionEventAlreadyApplied(entry, event)) return;
+            if (previous == null && sectionEventAlreadyApplied(entry, event)
+                    && !(event.persist() && entry.baselineFailed)) {
+                if (event.persist() && entry.decision != null
+                        && entry.decision.version() < event.version()) {
+                    // The older writer cannot acknowledge this version. Its completion
+                    // will decide the current facts without publishing them twice.
+                    entry.writeRequired = true;
+                    retainPendingFacts(entry);
+                }
+                return;
+            }
             SectionEvent merged = mergeSectionEvent(previous, event);
             if (queued == null && sameSectionEvent(previous, merged)) return;
             boolean invalidates = latest.loadIdentity() != merged.loadIdentity()
