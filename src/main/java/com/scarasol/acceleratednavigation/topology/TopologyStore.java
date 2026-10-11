@@ -335,20 +335,21 @@ final class TopologyStore implements AutoCloseable {
     }
 
     private void scheduleWriteLocked(ChunkKey key, PendingChunk chunk) {
-        if (chunk.inFlight != null || chunk.sections.isEmpty()) {
+        if (chunk.writeQueued || chunk.inFlight != null || chunk.sections.isEmpty()) {
             return;
         }
-        Map<Integer, PendingSection> batch = Map.copyOf(chunk.sections);
-        chunk.sections.clear();
-        chunk.inFlight = batch;
-        enqueueLocked(background, () -> writeChunk(key, chunk, batch));
+        chunk.writeQueued = true;
+        enqueueLocked(background, () -> writeChunk(key, chunk));
     }
 
-    private void writeChunk(ChunkKey key,
-                            PendingChunk expected,
-                            Map<Integer, PendingSection> batch) {
+    private void writeChunk(ChunkKey key, PendingChunk expected) {
+        Map<Integer, PendingSection> batch;
         ChunkLoad base;
         synchronized (monitor) {
+            batch = Map.copyOf(expected.sections);
+            expected.sections.clear();
+            expected.writeQueued = false;
+            expected.inFlight = batch;
             base = decodedLoadLocked(key);
         }
         if (base == null) {
@@ -430,7 +431,7 @@ final class TopologyStore implements AutoCloseable {
     }
 
     private void removePendingChunkIfIdleLocked(ChunkKey key, PendingChunk chunk) {
-        if (chunk.inFlight != null || !chunk.sections.isEmpty()
+        if (chunk.writeQueued || chunk.inFlight != null || !chunk.sections.isEmpty()
                 || !pending.remove(key, chunk)) {
             return;
         }
@@ -811,6 +812,8 @@ final class TopologyStore implements AutoCloseable {
             return new UpdateResult(UpdateStatus.COALESCED, null);
         }
 
+        // COALESCED transfers persistence to a newer queued record; it is not a disk acknowledgement.
+        // Runtime applies outcomes only to the matching decision and load identity.
         boolean accepted() {
             return status == UpdateStatus.WRITTEN || status == UpdateStatus.COALESCED;
         }
@@ -824,8 +827,10 @@ final class TopologyStore implements AutoCloseable {
     }
 
     private static final class PendingChunk {
+        // Private, non-null records; every access is under monitor, including queued batch capture.
         private final Map<Integer, PendingSection> sections = new HashMap<>();
         private Map<Integer, PendingSection> inFlight;
+        private boolean writeQueued;
         private boolean unloaded;
 
     }

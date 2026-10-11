@@ -4,4 +4,4 @@
 
 | 任务键 | 恢复正文 | 当前状态 |
 | --- | --- | --- |
-| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 第一轮生产优化本地完成；第二轮排队合并原型/144批诊断及DeepSeek共识成立，按持续授权先push当前基线再接入Store |
+| navigation-command-20260923 | [任务恢复](tasks/navigation-command-20260923.md) | 用户授权先push当前排队合并与记录，再研究有价值余项并原型验证；当前01入口核对，旧证据按差异复用，正式游戏验收未执行 |
