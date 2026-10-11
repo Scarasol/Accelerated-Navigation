@@ -123,8 +123,16 @@ final class SectionGeometry {
             palette[index] = new Shape(kind, coordinates);
         }
         short[] cells = new short[BaseClusterTopology.CELL_COUNT];
+        int bits = 32 - Integer.numberOfLeadingZeros(paletteSize - 1);
+        int mask = (1 << bits) - 1, buffer = 0, available = 0;
         for (int cell = 0; cell < cells.length; cell++) {
-            int id = input.readUnsignedShort();
+            while (available < bits) {
+                buffer |= input.readUnsignedByte() << available;
+                available += 8;
+            }
+            int id = buffer & mask;
+            buffer >>>= bits;
+            available -= bits;
             if (id >= paletteSize) throw new IllegalArgumentException("invalid geometry cell id");
             cells[cell] = (short) id;
         }
@@ -141,12 +149,18 @@ final class SectionGeometry {
             output.writeByte(boxes | (shape.kind == 4 ? 128 : shape.kind == 5 ? 64 : 0));
             for (short coordinate : shape.coordinates) output.writeByte(coordinate);
         }
-        int offset = 0;
+        int bits = 32 - Integer.numberOfLeadingZeros(palette.length - 1);
+        int offset = 0, buffer = 0, available = 0;
         for (short cell : cells) {
-            scratch[offset++] = (byte) (Short.toUnsignedInt(cell) >>> 8);
-            scratch[offset++] = (byte) cell;
+            buffer |= Short.toUnsignedInt(cell) << available;
+            available += bits;
+            while (available >= 8) {
+                scratch[offset++] = (byte) buffer;
+                buffer >>>= 8;
+                available -= 8;
+            }
         }
-        output.write(scratch, 0, BaseClusterTopology.CELL_COUNT * Short.BYTES);
+        output.write(scratch, 0, offset);
     }
 
     Shape shape(int cell) {

@@ -121,14 +121,14 @@ final class DoorContracts {
         check("incremental identity observes same-shape door material change", (before & 0xffff) == (after & 0xffff) && before != after);
         var packed = BaseClusterTopology.PackedFacts.fromCells(new byte[4096], original);
         var payload = new ByteArrayOutputStream(); var output = new DataOutputStream(payload);
-        output.writeInt(0x414e544f); output.writeInt(6); output.writeInt(7); output.writeInt(1);
+        output.writeInt(0x414e544f); output.writeInt(7); output.writeInt(7); output.writeInt(1);
         output.writeInt(0); output.writeLong(1); output.write(packed.bytes()); original.write(output, new byte[8192]);
         var decoder = TopologyStore.class.getDeclaredMethod("decodeChunk", DataInputStream.class); decoder.setAccessible(true);
         Object image = decoder.invoke(null, new DataInputStream(new ByteArrayInputStream(payload.toByteArray())));
         Method sections = image.getClass().getDeclaredMethod("sections"); sections.setAccessible(true);
         var record = (TopologyStore.SectionRecord) ((Map<?, ?>) sections.invoke(image)).get(0);
         check("Store current format consumes semantic geometry", record.facts().contentEquals(packed));
-        byte[] obsolete = payload.toByteArray(); obsolete[7] = 5;
+        byte[] obsolete = payload.toByteArray(); obsolete[7] = 6;
         rejected = false;
         try { decoder.invoke(null, new DataInputStream(new ByteArrayInputStream(obsolete))); }
         catch (InvocationTargetException failure) { rejected = failure.getCause() instanceof IllegalArgumentException; }
