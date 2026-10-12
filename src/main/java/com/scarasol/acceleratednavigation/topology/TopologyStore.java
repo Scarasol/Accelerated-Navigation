@@ -633,7 +633,7 @@ final class TopologyStore implements AutoCloseable {
         Files.createDirectories(directory);
         RegionFile created = new RegionFile(
                 directory.resolve("r." + key.regionX + "." + key.regionZ + ".mca"),
-                directory, false);
+                directory, TopologyCompression.VERSION, false);
         regions.put(key, created);
         return created;
     }
