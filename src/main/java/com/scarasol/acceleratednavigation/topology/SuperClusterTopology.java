@@ -708,7 +708,7 @@ final class SuperClusterTopology {
         }
     }
 
-    private static int faceCell(Direction face, int u, int v, int inset) {
+    static int faceCell(Direction face, int u, int v, int inset) {
         return switch (face) {
             case DOWN -> BaseClusterTopology.cellIndex(u, inset, v);
             case UP -> BaseClusterTopology.cellIndex(u, 15 - inset, v);

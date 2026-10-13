@@ -7,6 +7,9 @@ import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import com.scarasol.acceleratednavigation.topology.BaseClusterTopology;
 import com.scarasol.acceleratednavigation.topology.MacroSearch;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
+import com.scarasol.acceleratednavigation.navigation.NavigationPreview;
+import com.scarasol.acceleratednavigation.navigation.NavigationRequestPath;
+import com.scarasol.acceleratednavigation.navigation.SegmentedNavigationService;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
@@ -120,11 +123,7 @@ final class NavigationCommand {
         CommandSourceStack source = context.getSource();
         ServerPlayer player = source.getPlayer();
         if (player == null) return 0;
-        if (BoolArgumentType.getBool(context, "detailed")) {
-            source.sendFailure(Component.literal("详细寻路尚未接入；请使用 false 查询宏观走廊。"));
-            AcceleratedNavigation.LOGGER.info("Navigation detailed query is not implemented for {}", player.getUUID());
-            return 0;
-        }
+        boolean detailed=BoolArgumentType.getBool(context,"detailed");
 
         ServerLevel level = source.getLevel();
         BlockPos start = BlockPosArgument.getBlockPos(context, "start");
@@ -141,9 +140,31 @@ final class NavigationCommand {
             report(level.getServer(), old, "CANCELLED_REPLACED", null,
                     System.nanoTime() - old.startedNanos);
         }
+        if(old!=null&&old.preview!=null)old.preview.cancel();
         Session session = new Session(owner, level.dimension(), start, goal, canOpenDoors, System.nanoTime());
         sessions.put(owner, session);
         try {
+            if(detailed) {
+                session.detailed=true;
+                List<Vec3> points=new ArrayList<>();
+                session.preview=SegmentedNavigationService.forServer(level.getServer()).preview(level,owner,start,goal,
+                        canOpenDoors,nodes-> {
+                            for(Vec3 node:nodes)if(points.size()<MAX_POINTS)points.add(node);
+                        });
+                player.sendSystemMessage(Component.literal("详细预览已提交，按段执行原版节点查询。"));
+                session.preview.future.whenComplete((state,failure)-> {
+                    if(sessions.get(owner)!=session)return;
+                    session.preview=null;
+                    String result=failure!=null?"ERROR":state==NavigationRequestPath.State.SUCCEEDED?"SUCCESS":"FAILED_"+state;
+                    report(level.getServer(),session,result,failure,System.nanoTime()-session.startedNanos);
+                    if(state!=NavigationRequestPath.State.SUCCEEDED) { sessions.remove(owner,session);return; }
+                    session.points=List.copyOf(points);
+                    session.displayUntilNanos=System.nanoTime()+DISPLAY_NANOS;
+                    session.nextRefreshTick=level.getServer().getTickCount();
+                    player.sendSystemMessage(Component.literal("粒子展示按段查询的真实节点预览（最多4096点），不代表实体执行认证。"));
+                });
+                return 1;
+            }
             TopologyService.MacroRequest request = TopologyService.forServer(level.getServer())
                     .requestMacroQuery(level, owner, start, goal,
                             BaseClusterTopology.Channel.GROUND,
@@ -214,7 +235,8 @@ final class NavigationCommand {
                     session.request.cancel();
                     report(server, session, "CANCELLED_PLAYER_LEFT", null, now - session.startedNanos);
                 }
-            } else if (session.request == null) {
+                if(session.preview!=null)session.preview.cancel();
+            } else if (session.request == null&&session.preview==null) {
                 if (now >= session.displayUntilNanos) {
                     iterator.remove();
                 } else if (server.getTickCount() >= session.nextRefreshTick) {
@@ -235,6 +257,7 @@ final class NavigationCommand {
                 report(server, session, "CANCELLED_SERVER_STOPPING", null,
                         System.nanoTime() - session.startedNanos);
             }
+            if(session.preview!=null)session.preview.cancel();
         }
     }
 
@@ -248,7 +271,7 @@ final class NavigationCommand {
         }
         ServerPlayer player = server.getPlayerList().getPlayer(session.owner);
         if (player != null && player.level().dimension() == session.dimension) {
-            player.sendSystemMessage(Component.literal("宏观寻路" + resultText(result)
+            player.sendSystemMessage(Component.literal((session.detailed?"详细预览":"宏观寻路") + resultText(result)
                     + "；耗时 " + elapsedMillis + " ms（提交到查询终态，不含粒子展示）。"));
         }
     }
@@ -352,6 +375,8 @@ final class NavigationCommand {
         private final BlockPos goal;
         private final boolean canOpenDoors;
         private TopologyService.MacroRequest request;
+        private NavigationPreview preview;
+        private boolean detailed;
         private List<Vec3> points = List.of();
         private long displayUntilNanos;
         private int nextRefreshTick;

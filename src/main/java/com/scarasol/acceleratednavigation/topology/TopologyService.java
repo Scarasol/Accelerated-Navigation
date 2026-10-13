@@ -288,6 +288,16 @@ public final class TopologyService {
         return request;
     }
 
+    public CompletableFuture<GroundSegmentWindow> prepareGroundWindow(ServerLevel level,
+            BaseClusterTopology.TraversalProfile profile, NavigationScheduler.Priority priority,
+            BlockPos actual, List<MacroSearch.Connection> edges, MacroSearch.ComponentEndpoint destination,
+            @Nullable BlockPos reachTarget, int accuracy) {
+        requireServerThread();
+        if (!isAvailable() || level.getServer()!=server) return CompletableFuture.failedFuture(
+                new RejectedExecutionException("topology service unavailable"));
+        return GroundSegmentWindow.capture(runtime,level.dimension(),profile,priority,actual,edges,destination,reachTarget,accuracy);
+    }
+
     /** Diagnostic export of the current default-ground base graphs. */
     public CompletableFuture<GraphCaptureResult> captureBaseGraphs(ServerLevel level,
                                                                     Vec3 center, int distance) {
@@ -1105,6 +1115,7 @@ public final class TopologyService {
         private boolean active = true;
         private volatile MacroSearch.Progress progress = MacroSearch.Progress.PENDING;
         private volatile boolean completedFromCache;
+        private List<TopologyWorkerRuntime.SectionStamp> completedStamps = List.of();
 
         private MacroRequest(RequestKey key,
                              BlockPos start,
@@ -1183,6 +1194,7 @@ public final class TopologyService {
                     MacroSearch.Failure.STALE_WORLD, result.progress().blockedSection())
                     : result.progress();
             completedFromCache = result.completedFromCache();
+            completedStamps = List.copyOf(result.stamps());
             active = false;
             macroRequests.remove(key, this);
             if (!stale && result.corridor() != null) {
@@ -1222,6 +1234,17 @@ public final class TopologyService {
             return active && current != null ? current.progress() : progress;
         }
         public boolean completedFromCache() { return completedFromCache; }
+        public List<SectionPos> proofSections() {
+            requireServerThread();
+            return completedStamps.stream().filter(stamp->!stamp.absent())
+                    .map(stamp->stamp.key().section()).distinct().toList();
+        }
+        /** Revalidates a completed proof before a deferred business consumer uses it. */
+        public boolean current() {
+            requireServerThread();
+            return !stopped && !active && !future.isCompletedExceptionally()
+                    && resultCurrent(completedStamps);
+        }
         public void cancel() { future.cancel(false); }
     }
 

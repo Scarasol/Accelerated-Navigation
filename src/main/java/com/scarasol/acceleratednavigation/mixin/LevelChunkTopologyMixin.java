@@ -3,6 +3,7 @@ package com.scarasol.acceleratednavigation.mixin;
 import com.llamalad7.mixinextras.sugar.Share;
 import com.llamalad7.mixinextras.sugar.ref.LocalLongRef;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
+import com.scarasol.acceleratednavigation.navigation.NavigationChunkRevision;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
@@ -19,7 +20,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(LevelChunk.class)
-abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarrier {
+abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarrier,NavigationChunkRevision {
 
     @Shadow
     @Final
@@ -28,6 +29,8 @@ abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarr
     @Unique
     private TopologyService.ChunkFactsState acceleratedNavigation$facts =
             new TopologyService.ChunkFactsState();
+    @Unique private long acceleratedNavigation$navigationRevision;
+    public long acceleratedNavigation$navigationRevision() { return acceleratedNavigation$navigationRevision; }
 
     @Inject(method = "<init>*", at = @At("RETURN"))
     private void acceleratedNavigation$bindSections(CallbackInfo callback) {
@@ -74,6 +77,8 @@ abstract class LevelChunkTopologyMixin implements TopologyService.ChunkFactsCarr
             boolean moved,
             CallbackInfoReturnable<BlockState> callback,
             @Share("oldFacts") LocalLongRef oldFacts) {
+        if(level instanceof ServerLevel&&callback.getReturnValue()!=null&&callback.getReturnValue()!=state)
+            acceleratedNavigation$navigationRevision++;
         if (!(level instanceof ServerLevel serverLevel)
                 || !TopologyService.tracksFacts((LevelChunk) (Object) this)
                 || callback.getReturnValue() == null) {

@@ -4,6 +4,7 @@ import com.mojang.logging.LogUtils;
 import com.scarasol.acceleratednavigation.policy.NavigationPolicy;
 import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
+import com.scarasol.acceleratednavigation.navigation.SegmentedNavigationService;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.level.ChunkEvent;
@@ -63,12 +64,16 @@ public final class AcceleratedNavigation {
         if (event.phase == TickEvent.Phase.START) {
             NavigationScheduler.beginServerTick(event.getServer());
         } else {
-            TopologyService.endServerTick(event.getServer());
+            try (var ignored = NavigationScheduler.forServer(event.getServer()).account()) {
+                TopologyService.endServerTick(event.getServer());
+            }
+            SegmentedNavigationService.observeServer(event.getServer());
             NavigationScheduler.endServerTick(event.getServer(), event.haveTime());
         }
     }
 
     private void onServerStopping(ServerStoppingEvent event) {
+        SegmentedNavigationService.shutdown(event.getServer());
         TopologyService.beginStopping(event.getServer());
     }
 

@@ -19,6 +19,7 @@ public final class NavigationPolicy {
 
     private static final double NEARBY_PLAYER_RANGE = 32.0D;
     private static final ForgeConfigSpec.ConfigValue<List<? extends String>> BYPASS_ENTITY_IDS;
+    private static final ForgeConfigSpec.BooleanValue AUTOMATIC_NAVIGATION;
     private static final Set<String> WARNED_IDS = new HashSet<>();
 
     public static final ForgeConfigSpec CONFIG_SPEC;
@@ -27,6 +28,9 @@ public final class NavigationPolicy {
 
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
+        AUTOMATIC_NAVIGATION = builder
+                .comment("Automatically schedule supported vanilla navigation intents; bypassEntityIds retain vanilla behavior.")
+                .define("automaticNavigation", true);
         BYPASS_ENTITY_IDS = builder
                 .comment("Exact entity type registry IDs that retain original navigation without scheduling.")
                 .defineListAllowEmpty("bypassEntityIds", List.<String>of(), value -> value instanceof String);
@@ -35,6 +39,8 @@ public final class NavigationPolicy {
 
     private NavigationPolicy() {
     }
+
+    public static boolean automaticEnabled() { return AUTOMATIC_NAVIGATION.get(); }
 
     public static SchedulingMode modeFor(Mob mob) {
         ResourceLocation entityId = ForgeRegistries.ENTITY_TYPES.getKey(mob.getType());

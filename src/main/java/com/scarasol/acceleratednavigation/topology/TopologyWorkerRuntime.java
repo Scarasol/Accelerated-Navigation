@@ -2691,12 +2691,19 @@ final class TopologyWorkerRuntime {
     CompletableFuture<BaseGraphView> requestBaseGraph(ResourceKey<Level> dimension,
                                                        SectionPos section,
                                                        BaseClusterTopology.GeometryKey geometry) {
+        return requestBaseGraph(dimension, section, geometry, NavigationScheduler.Priority.BACKGROUND);
+    }
+
+    CompletableFuture<BaseGraphView> requestBaseGraph(ResourceKey<Level> dimension,
+                                                       SectionPos section,
+                                                       BaseClusterTopology.GeometryKey geometry,
+                                                       NavigationScheduler.Priority priority) {
         CompletableFuture<BaseGraphView> result = new CompletableFuture<>();
         try {
             runRuntimeTransition(() -> {
                 ClusterKey key = new ClusterKey(dimension, section);
                 TopologyWaiter<BaseClusterTopology> waiter = new TopologyWaiter<>(
-                        NavigationScheduler.Priority.BACKGROUND, completed -> {
+                        priority, completed -> {
                     if (completed.failure != null) {
                         finishFuture(result, null, completed.failure);
                         return;
@@ -2722,7 +2729,7 @@ final class TopologyWorkerRuntime {
                 });
                 try {
                     requestClusterDependency(dimension, section, geometry,
-                            NavigationScheduler.Priority.BACKGROUND, false, waiter);
+                            priority, false, waiter);
                 } catch (RuntimeException failure) {
                     waiter.cancel();
                     throw failure;
@@ -2732,6 +2739,10 @@ final class TopologyWorkerRuntime {
             result.completeExceptionally(failure);
         }
         return result;
+    }
+
+    TopologyTaskExecutor.TaskHandle submitWindowWork(NavigationScheduler.Priority priority, Runnable work) {
+        return taskExecutor.submit(priority, work);
     }
 
     MacroRequest requestMacroQuery(ResourceKey<Level> dimension,

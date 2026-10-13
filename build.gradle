@@ -8,6 +8,7 @@ plugins {
 
 version = mod_version
 group = mod_group_id
+jarJar.enable()
 
 base {
     archivesName = mod_id
@@ -222,6 +223,13 @@ tasks.named('jar', Jar).configure {
     // This is the preferred method to reobfuscate your jar file
     finalizedBy 'reobfJar'
 }
+tasks.named('jarJar', Jar).configure {
+    manifest.from(tasks.named('jar', Jar).get().manifest)
+    finalizedBy 'reobfJarJar'
+}
+reobf {
+    jarJar {}
+}
 
 // However if you are in a multi-project build, dev time needs unobfed jar files, so you can delay the obfuscation until publishing by doing:
 // tasks.named('publish').configure {
@@ -244,6 +252,11 @@ publishing {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8' // Use the UTF-8 charset for Java compilation
+}
+
+tasks.named('compileJava', JavaCompile).configure {
+    options.compilerArgs += ['-processor',
+        'com.llamalad7.mixinextras.ap.MixinExtrasAP,org.spongepowered.tools.obfuscation.MixinObfuscationProcessorInjection,org.spongepowered.tools.obfuscation.MixinObfuscationProcessorTargets']
 }
 
 tasks.register('verifyCoreContracts', JavaExec) {

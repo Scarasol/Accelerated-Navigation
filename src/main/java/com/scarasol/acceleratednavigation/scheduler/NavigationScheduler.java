@@ -18,6 +18,10 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.Collections;
+import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.function.LongSupplier;
 
 /**
  * Main-thread cooperative scheduler shared by all navigation backends on one
@@ -26,7 +30,7 @@ import java.util.concurrent.RejectedExecutionException;
 public final class NavigationScheduler {
 
     private static final long TICK_REFILL_NANOS = 4_000_000L;
-    private static final long TOKEN_CAP_NANOS = 6_000_000L;
+    private static final long TOKEN_CAP_NANOS = 4_000_000L;
     private static final long TICK_HEADROOM_DEADLINE_NANOS = 45_000_000L;
     private static final long MIN_SLICE_NANOS = 500_000L;
     private static final long MAX_SLICE_NANOS = 1_000_000L;
@@ -35,6 +39,7 @@ public final class NavigationScheduler {
     private static final int MAX_PENDING_REQUESTS = 1_024;
 
     private static final Map<MinecraftServer, NavigationScheduler> SERVICES = new IdentityHashMap<>();
+    private static final Set<MinecraftServer> CLOSED = Collections.newSetFromMap(new WeakHashMap<>());
 
     private final MinecraftServer server;
     private final EnumMap<Priority, BandQueue> queues = new EnumMap<>(Priority.class);
@@ -46,6 +51,10 @@ public final class NavigationScheduler {
     private long requestSequence;
     private long tokensNanos;
     private boolean draining;
+    private int accountingDepth;
+    private long accountingStarted;
+    private LongSupplier clock = System::nanoTime;
+    private long chargedNanos;
 
     private NavigationScheduler(MinecraftServer server) {
         this.server = server;
@@ -57,6 +66,7 @@ public final class NavigationScheduler {
     public static NavigationScheduler forServer(MinecraftServer server) {
         Objects.requireNonNull(server, "server");
         synchronized (SERVICES) {
+            if (CLOSED.contains(server)) throw new RejectedExecutionException("scheduler is stopped");
             return SERVICES.computeIfAbsent(server, NavigationScheduler::new);
         }
     }
@@ -72,6 +82,7 @@ public final class NavigationScheduler {
     public static void shutdown(MinecraftServer server) {
         NavigationScheduler scheduler;
         synchronized (SERVICES) {
+            CLOSED.add(server);
             scheduler = SERVICES.remove(server);
         }
         if (scheduler != null) {
@@ -109,16 +120,19 @@ public final class NavigationScheduler {
 
     public boolean cancel(ResourceKey<Level> dimension, UUID owner) {
         requireServerThread();
+        try (TimeAccount ignored = account()) {
         QueuedSearch<?> request = pending.remove(new RequestKey(dimension, owner));
         if (request == null) {
             return false;
         }
         cancelQueued(request);
         return true;
+        }
     }
 
     public boolean promote(ResourceKey<Level> dimension, UUID owner, Priority priority) {
         requireServerThread();
+        try (TimeAccount ignored = account()) {
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(priority, "priority");
@@ -127,15 +141,18 @@ public final class NavigationScheduler {
             return false;
         }
         return reprioritize(request, priority);
+        }
     }
 
     public boolean reprioritize(ResourceKey<Level> dimension, UUID owner, Priority priority) {
         requireServerThread();
+        try (TimeAccount ignored = account()) {
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(priority, "priority");
         QueuedSearch<?> request = pending.get(new RequestKey(dimension, owner));
         return request != null && request.priority != priority && reprioritize(request, priority);
+        }
     }
 
     private boolean reprioritize(QueuedSearch<?> request, Priority priority) {
@@ -156,6 +173,7 @@ public final class NavigationScheduler {
                                               ResumableSearch<R> search,
                                              long startThresholdNanos) {
         requireServerThread();
+        try (TimeAccount ignored = account()) {
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(priority, "priority");
@@ -186,43 +204,46 @@ public final class NavigationScheduler {
                 search,
                 startThresholdNanos,
                 new CompletableFuture<>(),
-                System.nanoTime()
+                clock.getAsLong()
         );
         pending.put(key, request);
         enqueue(request);
         return request.future;
+        }
     }
 
     private void beginTick() {
         requireServerThread();
-        tickStartedNanos = System.nanoTime();
+        tickStartedNanos = clock.getAsLong();
         tokensNanos = Math.min(TOKEN_CAP_NANOS, tokensNanos + TICK_REFILL_NANOS);
     }
 
     private void endTick(boolean haveTime) {
         requireServerThread();
+        try (TimeAccount ignored = account()) {
         if (!haveTime || pending.isEmpty() || tickStartedNanos == 0L) {
             tickStartedNanos = 0L;
             return;
         }
 
         long tickDeadlineNanos = tickStartedNanos + TICK_HEADROOM_DEADLINE_NANOS;
-        long elapsedTickNanos = System.nanoTime() - tickStartedNanos;
+        long elapsedTickNanos = clock.getAsLong() - tickStartedNanos;
         long headroomNanos = TICK_HEADROOM_DEADLINE_NANOS - elapsedTickNanos;
-        long budgetNanos = Math.min(Math.max(0L, tokensNanos), headroomNanos);
+        long budgetNanos = Math.min(Math.max(0L, availableTokens()), headroomNanos);
         if (budgetNanos < MIN_SLICE_NANOS) {
             tickStartedNanos = 0L;
             return;
         }
 
         long schedulerDeadline = Math.min(
-                System.nanoTime() + budgetNanos,
+                clock.getAsLong() + budgetNanos,
                 tickDeadlineNanos
         );
         try {
             drain(schedulerDeadline, Integer.MAX_VALUE);
         } finally {
             tickStartedNanos = 0L;
+        }
         }
     }
 
@@ -235,12 +256,12 @@ public final class NavigationScheduler {
             int slices = 0;
             int requestsWithoutProgress = 0;
             while (!pending.isEmpty() && requestsWithoutProgress < pending.size()) {
-                long remaining = schedulerDeadline - System.nanoTime();
+                long remaining = Math.min(schedulerDeadline - clock.getAsLong(), availableTokens());
                 if (remaining < MIN_SLICE_NANOS || slices >= maxSlices) {
                     break;
                 }
 
-                QueuedSearch<?> request = takeNext(System.nanoTime());
+                QueuedSearch<?> request = takeNext(clock.getAsLong());
                 if (request == null) {
                     break;
                 }
@@ -259,7 +280,7 @@ public final class NavigationScheduler {
                 }
 
                 long allowance = Math.min(MAX_SLICE_NANOS, remaining);
-                long sliceStarted = System.nanoTime();
+                long sliceStarted = clock.getAsLong();
                 ResumableSearch.Status status;
                 try {
                     status = Objects.requireNonNull(
@@ -271,7 +292,7 @@ public final class NavigationScheduler {
                     );
                 } catch (Throwable failure) {
                     rethrowFatal(failure);
-                    long used = chargeSlice(sliceStarted);
+                    long used = Math.max(0L, clock.getAsLong() - sliceStarted);
                     pending.remove(request.key, request);
                     cancelSafely(request.search);
                     request.future.completeExceptionally(failure);
@@ -286,7 +307,6 @@ public final class NavigationScheduler {
                     continue;
                 }
 
-                chargeSlice(sliceStarted);
                 requestsWithoutProgress = 0;
                 slices++;
                 if (status == ResumableSearch.Status.RUNNING) {
@@ -314,7 +334,14 @@ public final class NavigationScheduler {
                 }
 
                 pending.remove(request.key, request);
-                completeRequest(request, status);
+                try {
+                    completeRequest(request, status);
+                } catch (Throwable failure) {
+                    rethrowFatal(failure);
+                    cancelSafely(request.search);
+                    request.future.completeExceptionally(failure);
+                    AcceleratedNavigation.LOGGER.error("Navigation result publication for {} failed", request.key.owner, failure);
+                }
             }
         } finally {
             draining = false;
@@ -331,26 +358,7 @@ public final class NavigationScheduler {
             return;
         }
         request.parked = false;
-        enqueue(request);
-        continueAfterWake();
-    }
-
-    /**
-     * Reuses the current tick's remaining budget for one bounded continuation.
-     * Wake callbacks never mint tokens or recursively drain the scheduler.
-     */
-    private void continueAfterWake() {
-        if (draining || tickStartedNanos == 0L || pending.isEmpty()) {
-            return;
-        }
-        long now = System.nanoTime();
-        long remainingHeadroom = tickStartedNanos + TICK_HEADROOM_DEADLINE_NANOS - now;
-        long budgetNanos = Math.min(tokensNanos, remainingHeadroom);
-        if (budgetNanos < MIN_SLICE_NANOS) {
-            return;
-        }
-        drain(Math.min(now + Math.min(MAX_SLICE_NANOS, budgetNanos),
-                tickStartedNanos + TICK_HEADROOM_DEADLINE_NANOS), 1);
+        try (TimeAccount ignored = account()) { enqueue(request); }
     }
 
     private void enqueue(QueuedSearch<?> request) {
@@ -365,10 +373,34 @@ public final class NavigationScheduler {
         queues.get(request.priority).add(request);
     }
 
-    private long chargeSlice(long sliceStarted) {
-        long used = Math.max(1L, System.nanoTime() - sliceStarted);
-        tokensNanos -= used;
-        return used;
+    public TimeAccount account() {
+        requireServerThread();
+        if (accountingDepth++ == 0) accountingStarted = clock.getAsLong();
+        return new TimeAccount();
+    }
+
+    public final class TimeAccount implements AutoCloseable {
+        private boolean closed;
+        @Override public void close() {
+            if (closed) throw new IllegalStateException("duplicate accounting close");
+            closed = true;
+            if (--accountingDepth == 0) {
+                long used = Math.max(0L, clock.getAsLong() - accountingStarted);
+                tokensNanos -= used;
+                chargedNanos += used;
+            }
+        }
+    }
+
+    private long availableTokens() {
+        return tokensNanos - (accountingDepth == 0 ? 0L : Math.max(0L, clock.getAsLong() - accountingStarted));
+    }
+
+    public record Metrics(long chargedNanos, long availableNanos, int pendingRequests) {}
+
+    public Metrics metrics() {
+        requireServerThread();
+        return new Metrics(chargedNanos, availableTokens(), pending.size());
     }
 
     private static <R> void completeRequest(QueuedSearch<R> request,
@@ -428,12 +460,14 @@ public final class NavigationScheduler {
     }
 
     private void cancelAll() {
+        try (TimeAccount ignored = account()) {
         for (QueuedSearch<?> request : new ArrayList<>(pending.values())) {
             cancelSafely(request.search);
             request.future.cancel(false);
         }
         pending.clear();
         queues.values().forEach(BandQueue::clear);
+        }
     }
 
     private static void cancelSafely(ResumableSearch<?> search) {

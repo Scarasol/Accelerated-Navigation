@@ -11,7 +11,20 @@
     "ChunkSerializerTopologyMixin",
     "LevelChunkTopologyMixin",
     "LevelChunkSectionTopologyMixin",
-    "ProtoChunkTopologyMixin"
+    "ProtoChunkTopologyMixin",
+    "NavigationAccess",
+    "AutomaticNavigationMixin",
+    "GroundNavigationMixin",
+    "FlyingNavigationMixin",
+    "NavigationGoalMixin",
+    "NavigationMeleeMixin",
+    "NavigationBehaviorMixin",
+    "NavigationSinkMixin",
+    "NavigationPoiMixin",
+    "WallNavigationAccess",
+    "WallNavigationMixin",
+    "NativeNavigationSearchMixin",
+    "NavigationRegionMixin"
   ],
   "client": []
 }
