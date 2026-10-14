@@ -1,0 +1,504 @@
+{
+  "schema": "PINNED_TICK_ENVELOPE_AND_PAUSE_SOURCE",
+  "version": "Minecraft 1.20.1 / Forge 47.3.0",
+  "sourceJarSha256": "5905C044CBF9D4CD0208F8878BFD7B586782C44366C277D6FBD70E4B075C0EB2",
+  "excerpts": [
+    {
+      "path": "net/minecraft/client/server/IntegratedServer.java",
+      "first": 70,
+      "last": 104,
+      "lines": [
+        {
+          "number": 70,
+          "text": "   public void tickServer(BooleanSupplier p_120049_) {"
+        },
+        {
+          "number": 71,
+          "text": "      boolean flag = this.paused;"
+        },
+        {
+          "number": 72,
+          "text": "      this.paused = Minecraft.getInstance().isPaused();"
+        },
+        {
+          "number": 73,
+          "text": "      ProfilerFiller profilerfiller = this.getProfiler();"
+        },
+        {
+          "number": 74,
+          "text": "      if (!flag && this.paused) {"
+        },
+        {
+          "number": 75,
+          "text": "         profilerfiller.push(\"autoSave\");"
+        },
+        {
+          "number": 76,
+          "text": "         LOGGER.info(\"Saving and pausing game...\");"
+        },
+        {
+          "number": 77,
+          "text": "         this.saveEverything(false, false, false);"
+        },
+        {
+          "number": 78,
+          "text": "         profilerfiller.pop();"
+        },
+        {
+          "number": 79,
+          "text": "      }"
+        },
+        {
+          "number": 80,
+          "text": ""
+        },
+        {
+          "number": 81,
+          "text": "      boolean flag1 = Minecraft.getInstance().getConnection() != null;"
+        },
+        {
+          "number": 82,
+          "text": "      if (flag1 && this.paused) {"
+        },
+        {
+          "number": 83,
+          "text": "         this.tickPaused();"
+        },
+        {
+          "number": 84,
+          "text": "      } else {"
+        },
+        {
+          "number": 85,
+          "text": "         if (flag && !this.paused) {"
+        },
+        {
+          "number": 86,
+          "text": "            this.forceTimeSynchronization();"
+        },
+        {
+          "number": 87,
+          "text": "         }"
+        },
+        {
+          "number": 88,
+          "text": ""
+        },
+        {
+          "number": 89,
+          "text": "         super.tickServer(p_120049_);"
+        },
+        {
+          "number": 90,
+          "text": "         int i = Math.max(2, this.minecraft.options.renderDistance().get());"
+        },
+        {
+          "number": 91,
+          "text": "         if (i != this.getPlayerList().getViewDistance()) {"
+        },
+        {
+          "number": 92,
+          "text": "            LOGGER.info(\"Changing view distance to {}, from {}\", i, this.getPlayerList().getViewDistance());"
+        },
+        {
+          "number": 93,
+          "text": "            this.getPlayerList().setViewDistance(i);"
+        },
+        {
+          "number": 94,
+          "text": "         }"
+        },
+        {
+          "number": 95,
+          "text": ""
+        },
+        {
+          "number": 96,
+          "text": "         int j = Math.max(2, this.minecraft.options.simulationDistance().get());"
+        },
+        {
+          "number": 97,
+          "text": "         if (j != this.previousSimulationDistance) {"
+        },
+        {
+          "number": 98,
+          "text": "            LOGGER.info(\"Changing simulation distance to {}, from {}\", j, this.previousSimulationDistance);"
+        },
+        {
+          "number": 99,
+          "text": "            this.getPlayerList().setSimulationDistance(j);"
+        },
+        {
+          "number": 100,
+          "text": "            this.previousSimulationDistance = j;"
+        },
+        {
+          "number": 101,
+          "text": "         }"
+        },
+        {
+          "number": 102,
+          "text": ""
+        },
+        {
+          "number": 103,
+          "text": "      }"
+        },
+        {
+          "number": 104,
+          "text": "   }"
+        }
+      ]
+    },
+    {
+      "path": "net/minecraft/server/MinecraftServer.java",
+      "first": 655,
+      "last": 669,
+      "lines": [
+        {
+          "number": 655,
+          "text": "               this.debugCommandProfiler = new MinecraftServer.TimeProfiler(Util.getNanos(), this.tickCount);"
+        },
+        {
+          "number": 656,
+          "text": "            }"
+        },
+        {
+          "number": 657,
+          "text": ""
+        },
+        {
+          "number": 658,
+          "text": "            this.nextTickTime += 50L;"
+        },
+        {
+          "number": 659,
+          "text": "            this.startMetricsRecordingTick();"
+        },
+        {
+          "number": 660,
+          "text": "            this.profiler.push(\"tick\");"
+        },
+        {
+          "number": 661,
+          "text": "            this.tickServer(this::haveTime);"
+        },
+        {
+          "number": 662,
+          "text": "            this.profiler.popPush(\"nextTickWait\");"
+        },
+        {
+          "number": 663,
+          "text": "            this.mayHaveDelayedTasks = true;"
+        },
+        {
+          "number": 664,
+          "text": "            this.delayedTasksMaxNextTickTime = Math.max(Util.getMillis() + 50L, this.nextTickTime);"
+        },
+        {
+          "number": 665,
+          "text": "            this.waitUntilNextTick();"
+        },
+        {
+          "number": 666,
+          "text": "            this.profiler.pop();"
+        },
+        {
+          "number": 667,
+          "text": "            this.endMetricsRecordingTick();"
+        },
+        {
+          "number": 668,
+          "text": "            this.isReady = true;"
+        },
+        {
+          "number": 669,
+          "text": "            JvmProfiler.INSTANCE.onServerTick(this.averageTickTime);"
+        }
+      ]
+    },
+    {
+      "path": "net/minecraft/server/MinecraftServer.java",
+      "first": 809,
+      "last": 877,
+      "lines": [
+        {
+          "number": 809,
+          "text": ""
+        },
+        {
+          "number": 810,
+          "text": "   public void tickServer(BooleanSupplier p_129871_) {"
+        },
+        {
+          "number": 811,
+          "text": "      long i = Util.getNanos();"
+        },
+        {
+          "number": 812,
+          "text": "      net.minecraftforge.event.ForgeEventFactory.onPreServerTick(p_129871_, this);"
+        },
+        {
+          "number": 813,
+          "text": "      ++this.tickCount;"
+        },
+        {
+          "number": 814,
+          "text": "      this.tickChildren(p_129871_);"
+        },
+        {
+          "number": 815,
+          "text": "      if (i - this.lastServerStatus >= 5000000000L) {"
+        },
+        {
+          "number": 816,
+          "text": "         this.lastServerStatus = i;"
+        },
+        {
+          "number": 817,
+          "text": "         this.status = this.buildServerStatus();"
+        },
+        {
+          "number": 818,
+          "text": "         resetStatusCache(status);"
+        },
+        {
+          "number": 819,
+          "text": "      }"
+        },
+        {
+          "number": 820,
+          "text": ""
+        },
+        {
+          "number": 821,
+          "text": "      if (this.tickCount % 6000 == 0) {"
+        },
+        {
+          "number": 822,
+          "text": "         LOGGER.debug(\"Autosave started\");"
+        },
+        {
+          "number": 823,
+          "text": "         this.profiler.push(\"save\");"
+        },
+        {
+          "number": 824,
+          "text": "         this.saveEverything(true, false, false);"
+        },
+        {
+          "number": 825,
+          "text": "         this.profiler.pop();"
+        },
+        {
+          "number": 826,
+          "text": "         LOGGER.debug(\"Autosave finished\");"
+        },
+        {
+          "number": 827,
+          "text": "      }"
+        },
+        {
+          "number": 828,
+          "text": ""
+        },
+        {
+          "number": 829,
+          "text": "      this.profiler.push(\"tallying\");"
+        },
+        {
+          "number": 830,
+          "text": "      long j = this.tickTimes[this.tickCount % 100] = Util.getNanos() - i;"
+        },
+        {
+          "number": 831,
+          "text": "      this.averageTickTime = this.averageTickTime * 0.8F + (float)j / 1000000.0F * 0.19999999F;"
+        },
+        {
+          "number": 832,
+          "text": "      long k = Util.getNanos();"
+        },
+        {
+          "number": 833,
+          "text": "      this.frameTimer.logFrameDuration(k - i);"
+        },
+        {
+          "number": 834,
+          "text": "      this.profiler.pop();"
+        },
+        {
+          "number": 835,
+          "text": "      net.minecraftforge.event.ForgeEventFactory.onPostServerTick(p_129871_, this);"
+        },
+        {
+          "number": 836,
+          "text": "   }"
+        },
+        {
+          "number": 837,
+          "text": ""
+        },
+        {
+          "number": 838,
+          "text": "   private static final com.google.gson.Gson GSON = new com.google.gson.Gson();"
+        },
+        {
+          "number": 839,
+          "text": "   private String cachedServerStatus; // FORGE: cache the server status json in case a client spams requests"
+        },
+        {
+          "number": 840,
+          "text": "   private void resetStatusCache(ServerStatus status) {"
+        },
+        {
+          "number": 841,
+          "text": "      this.cachedServerStatus = GSON.toJson(ServerStatus.CODEC.encodeStart(com.mojang.serialization.JsonOps.INSTANCE, status)"
+        },
+        {
+          "number": 842,
+          "text": "              .result().orElseThrow());"
+        },
+        {
+          "number": 843,
+          "text": "   }"
+        },
+        {
+          "number": 844,
+          "text": "   public String getStatusJson() {"
+        },
+        {
+          "number": 845,
+          "text": "      return cachedServerStatus;"
+        },
+        {
+          "number": 846,
+          "text": "   }"
+        },
+        {
+          "number": 847,
+          "text": ""
+        },
+        {
+          "number": 848,
+          "text": "   private ServerStatus buildServerStatus() {"
+        },
+        {
+          "number": 849,
+          "text": "      ServerStatus.Players serverstatus$players = this.buildPlayerStatus();"
+        },
+        {
+          "number": 850,
+          "text": "      return new ServerStatus(Component.nullToEmpty(this.motd), Optional.of(serverstatus$players), Optional.of(ServerStatus.Version.current()), Optional.ofNullable(this.statusIcon), this.enforceSecureProfile(), Optional.of(new net.minecraftforge.network.ServerStatusPing()));"
+        },
+        {
+          "number": 851,
+          "text": "   }"
+        },
+        {
+          "number": 852,
+          "text": ""
+        },
+        {
+          "number": 853,
+          "text": "   private ServerStatus.Players buildPlayerStatus() {"
+        },
+        {
+          "number": 854,
+          "text": "      List<ServerPlayer> list = this.playerList.getPlayers();"
+        },
+        {
+          "number": 855,
+          "text": "      int i = this.getMaxPlayers();"
+        },
+        {
+          "number": 856,
+          "text": "      if (this.hidesOnlinePlayers()) {"
+        },
+        {
+          "number": 857,
+          "text": "         return new ServerStatus.Players(i, list.size(), List.of());"
+        },
+        {
+          "number": 858,
+          "text": "      } else {"
+        },
+        {
+          "number": 859,
+          "text": "         int j = Math.min(list.size(), 12);"
+        },
+        {
+          "number": 860,
+          "text": "         ObjectArrayList<GameProfile> objectarraylist = new ObjectArrayList<>(j);"
+        },
+        {
+          "number": 861,
+          "text": "         int k = Mth.nextInt(this.random, 0, list.size() - j);"
+        },
+        {
+          "number": 862,
+          "text": ""
+        },
+        {
+          "number": 863,
+          "text": "         for(int l = 0; l < j; ++l) {"
+        },
+        {
+          "number": 864,
+          "text": "            ServerPlayer serverplayer = list.get(k + l);"
+        },
+        {
+          "number": 865,
+          "text": "            objectarraylist.add(serverplayer.allowsListing() ? serverplayer.getGameProfile() : ANONYMOUS_PLAYER_PROFILE);"
+        },
+        {
+          "number": 866,
+          "text": "         }"
+        },
+        {
+          "number": 867,
+          "text": ""
+        },
+        {
+          "number": 868,
+          "text": "         Util.shuffle(objectarraylist, this.random);"
+        },
+        {
+          "number": 869,
+          "text": "         return new ServerStatus.Players(i, list.size(), objectarraylist);"
+        },
+        {
+          "number": 870,
+          "text": "      }"
+        },
+        {
+          "number": 871,
+          "text": "   }"
+        },
+        {
+          "number": 872,
+          "text": ""
+        },
+        {
+          "number": 873,
+          "text": "   public void tickChildren(BooleanSupplier p_129954_) {"
+        },
+        {
+          "number": 874,
+          "text": "      this.profiler.push(\"commandFunctions\");"
+        },
+        {
+          "number": 875,
+          "text": "      this.getFunctions().tick();"
+        },
+        {
+          "number": 876,
+          "text": "      this.profiler.popPush(\"levels\");"
+        },
+        {
+          "number": 877,
+          "text": ""
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "round": "dynamic-budget-production-plan-20261014",
+  "provider": "deepseek",
+  "model": "deepseek-v4.1-flash",
+  "exitCode": 0,
+  "signal": null,
+  "timedOut": false,
+  "elapsedSeconds": 109.363,
+  "processExited": true,
+  "contractSha256": "09A52D68F404AC25EA24E278AD2006E863C32DF7CD631C680121AD82E08FE49A",
+  "promptSha256": "6A8E2DE4114946EAFF31378B7F9ECF02257044FD96C8A542636AD50E4D6EED43",
+  "settingsModified": false,
+  "obsoleteDesignIncluded": false,
+  "priorReviewIncluded": false
+}

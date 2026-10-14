@@ -1,0 +1,42 @@
+[
+  {
+    "path": "docs/designs/2026-10-13-native-detail-navigation-contract-zh.md",
+    "sha256": "09A52D68F404AC25EA24E278AD2006E863C32DF7CD631C680121AD82E08FE49A",
+    "role": "ONLY_NORMATIVE_DESIGN"
+  },
+  {
+    "path": "docs/designs/2026-10-14-dynamic-budget-production-integration-plan-zh.md",
+    "sha256": "1CE4F1DA16E8C0D230EA2BCC91CC53496542F202ADA9BDB491747A941C8476DB",
+    "role": "CURRENT_SOURCE_OR_EVIDENCE"
+  },
+  {
+    "path": "src/main/java/com/scarasol/acceleratednavigation/scheduler/NavigationScheduler.java",
+    "sha256": "5B3FACE3B7E246B4A91C73478F705343CAF0861171FCCB00A08786AF06CA1736",
+    "role": "CURRENT_SOURCE_OR_EVIDENCE"
+  },
+  {
+    "path": "src/main/java/com/scarasol/acceleratednavigation/AcceleratedNavigation.java",
+    "sha256": "E9E0099727557C288C333EB7F3947F0F94F699E2DE44243AA9B493DC57CAC998",
+    "role": "CURRENT_SOURCE_OR_EVIDENCE"
+  },
+  {
+    "path": "src/main/java/com/scarasol/acceleratednavigation/navigation/SegmentedNavigationService.java",
+    "sha256": "5240C8D7EE67D050EF95E762371F3D550D8DF015962C3C9887B4C507EA6BCB1D",
+    "role": "CURRENT_SOURCE_OR_EVIDENCE"
+  },
+  {
+    "path": "src/test/java/an/production/ProductionBudgetChecks.java",
+    "sha256": "C451EDD259976631B1A5064762E6D5BDB6F5E471A5094F25AF01BD71F685FF4E",
+    "role": "CURRENT_SOURCE_OR_EVIDENCE"
+  },
+  {
+    "path": "src/test/java/an/production/HandoffBoundaryProbe.java",
+    "sha256": "5256478CA150558FBB5E91361E95027F41E6E9FF0E24F624CAB32C648186F2C8",
+    "role": "CURRENT_SOURCE_OR_EVIDENCE"
+  },
+  {
+    "path": "tools/benchmark/budget-prototype/java/an/budget/HandoffTiming.java",
+    "sha256": "6BA0658616129E3C5894EFBB2BA37E2EB7B66ECB341FAEB45F09C1DBFB2FD1FF",
+    "role": "CURRENT_SOURCE_OR_EVIDENCE"
+  }
+]

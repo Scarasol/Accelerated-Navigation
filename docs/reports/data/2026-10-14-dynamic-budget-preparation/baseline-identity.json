@@ -1,0 +1,17 @@
+{
+  "schema": "PRE_DYNAMIC_BUDGET_PRODUCTION_BASELINE",
+  "date": "2026-10-14",
+  "commit": "fead3a154f7e9a1d8e5470fb331a013661a35007",
+  "branch": "1.20.1",
+  "remote": "origin/1.20.1",
+  "gitTree": "ec3ac8143c601df9aebd41382b5be2759e334b36",
+  "sourceChanges": [],
+  "build": "gradlew --offline jarJar; reobfJarJar completed",
+  "jar": "accelerated_navigation-0.1.0-all.jar",
+  "sha256": "3AE2573E5F1E9407F36EE8BED143B4D721799EDDF066707144B80F80C0C6451A",
+  "minecraft": "1.20.1",
+  "forge": "47.3.0",
+  "java": "17.0.18",
+  "productionImplementation": "fixed approximately 4ms; no dynamic budget or grace2 integration",
+  "deploymentPerformed": false
+}

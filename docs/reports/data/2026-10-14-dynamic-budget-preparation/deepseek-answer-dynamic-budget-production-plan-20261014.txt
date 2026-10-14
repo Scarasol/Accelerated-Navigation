@@ -1,0 +1,28 @@
+## 判定：NEEDS_REVISION
+
+方案分层、无开关、整版回退与"准备≠上线"的区分符合用户意图，0..12ms 与两 tick 仅作候选、批准后才写入契约也正确。但以下未决细节会直接导致错误实现，须在实施前定死。
+
+## 必须修改项
+
+1. **封套状态与样本资格**：现行 `tickStartedNanos==0` 兼作"未在 tick 中"哨兵，方案虽自述"不得用零值代替封套状态"，却未给替代规则。必须增加显式 `inEnvelope/startSeen/endSeen/excepted` 布尔，并定义"有效 tick"=同封套内正常 START+正常返回+未暂停；否则暂停或异常返回会污染 EWMA/P95 并错误补额。
+
+2. **跨封套 account 边界**：方案只列了"快照或禁止"两个选项，等于未决。必须二选一写定：封套关闭时若 `accountingDepth>0`，将未闭合区间按累计计费快照结转至下一有效 tick，或直接断言/拒绝未闭合区间。否则 `TimeAccount` 的 depth 归零时刻会把整段时长记到错误 tick，导致漏计或重复计费，并使 nonNavigation 估计失真。另须明确 tick 外导航消耗同一余额但不计入任何 tick 的非导航样本。
+
+3. **尾部预留口径**：`tailReserve` 缺 warmup 与 P95 索引定义（非导航有 8 tick，尾部无）。须明确前 8 个有效 tick 的兜底、尾部样本只来自 END 派发后至封套返回、且不重复扣导航区间。同时须声明：`target=45ms` 与 `maximumGrant=12ms` 下，长原子调用可超过 50ms MSPT；以真实 `haveTime` 与封套 deadline 双门槛为准、超支记负债，不得表述为硬保证。
+
+4. **交接等待谓词**：`"没有有效目的组件经过记录"` 必须定义为 `segmentEntry==null` 或该 entry 与 `request/publication/nativeProof/windowRevision/destinationComponent` 任一不符。且该谓词须在 **settle 执行时**（而非 enqueue 前）重查 valid、未取消/替换、navigation 身份、TTL；否则会把已取消任务的清理延迟最长两 tick，或对失效输入错误放行。
+
+5. **测试适配（可预见缺陷）**：
+   - `ProductionBudgetChecks` 第 41/44/47 行 `==4000000/-1700000/2300000` 依赖 `beginServerTick` 直接补额与固定 4ms。新规则补额发生在正常 START、额度动态，这些等值断言必然失败。须改为区间/不变量（grant≤max、负债保持、无 haveTime 不派发），并由新封套入口驱动；`finally` 必须重置新增的 history/tail/EWMA/负债，否则同 JVM 重复运行不确定。
+   - `HandoffBoundaryProbe` 第 212 行 `Thread.sleep(10)` 在 12ms 额度内不再耗尽预算，探针前提失效。须按当前 grant 注入（>`grant`，至少 >12ms），并固定其事件优先级严格早于导航 END 派发，否则 10ms 落入尾部桶、不影响本 tick 决策，测不到目标分支。
+   - 第 43 行"原子超支即停派发"须分别在 warmup 内与 12ms 稳态重算。
+
+6. **汇总有界性**：累计计数器须饱和或滚动，"生产额外状态不随时长增长"才成立；补 P95 在样本 <32 时的取值定义。`pendingRequests` 分类正确。
+
+## 建议明确的实现边界
+
+单一 per-server 动态控制器，无开关、无模式选择，失败整版回退 `fead3a1` jar；不改持久化格式、宏观算法、真实 PathFinder 参数、accuracy、节点限额与恢复上限；不新增前置语义过滤，仅复用既有 window/proof/segmentEntry 生命周期数据；EXHAUSTED 不得改写。只动计时、额度、交接时机及测试/探针。
+
+## 生产发布仍需满足的门槛
+
+先按门槛通过后将 0..12ms 与两 tick **写入现行契约**，消除双规范。新候选源码与**发行重混淆 jar** 独立终审；完整生命周期、速度 II/IV、体型/能力、楼梯跳落错位墙、四条原参数长路线（含 city-backward 真实归因）、final partial 固定输入重放并保留真实失败。性能≥5 次乱序重复，且每个改动范围都要带**新仪表的同口径 4ms 对照**——不得直接拿历史 4ms 数当对照组（仪表变更本身改变开销）；报告 API 提交、提交到首 Path、到达、完整任务计费、调用/恢复、分配/峰值、TPS、>50ms tick，到达时间用配对共同成功请求。另需持续请求、冷热拓扑、10/30/40/48ms 附加负载、长原子、未知 END 尾部、tick 间任务、暂停/恢复，以及关闭后零记录/零待办/迟到拒绝。
