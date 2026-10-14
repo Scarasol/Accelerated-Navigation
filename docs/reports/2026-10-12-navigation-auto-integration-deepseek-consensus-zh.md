@@ -1,5 +1,7 @@
 # Navigation自动接入方案DeepSeek联合共识
 
+> 已失效的设计共识：本报告基于已经废弃的旧设计，不具备当前架构验收效力。原始讨论仅保留为历史事实；当前实现必须独立按 [2026-10-13 原版详细寻路接入契约](../designs/2026-10-13-native-detail-navigation-contract-zh.md)送审，禁止继承本文的通过结论。
+
 日期：2026-10-12。目标工程：`D:\Workspace\AcceleratedNavigation-forge-1.20.1`。
 
 结论：Codex与DeepSeek已对[完整接入规格](../designs/2026-10-12-navigation-auto-integration-plan-zh.md)达成设计共识，无未解决的实质设计分歧。共识支持进入第0项接线核对和四个定点原型，不代表实现、运行、性能或实体覆盖已经通过。

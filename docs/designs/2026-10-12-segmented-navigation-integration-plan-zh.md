@@ -1,5 +1,7 @@
 # 分段同步详细寻路接入方案
 
+> 已废弃：本文仅保留历史记录，不能作为当前实现或审查规范。现行唯一契约为 [2026-10-13 原版详细寻路接入契约](2026-10-13-native-detail-navigation-contract-zh.md)。不得把本文与新方案并列、折中或作为低优先级依据。
+
 日期：2026-10-12。工程：`D:\Workspace\AcceleratedNavigation-forge-1.20.1`。
 
 状态：历史接入方案，已由[原版Navigation自动接入与分段Path方案](2026-10-12-navigation-auto-integration-plan-zh.md)替代。用户明确要求自动兼容原版moveTo；下面的显式requestMove首轮范围、仅接受脚部格的契约和控制权约定不再是当前实施目标，正文保留为修订记录。架构方向仍为分段同步与共享预算，尚未生产实现。

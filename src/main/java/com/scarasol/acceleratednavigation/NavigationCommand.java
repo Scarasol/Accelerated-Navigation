@@ -7,7 +7,7 @@ import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import com.scarasol.acceleratednavigation.topology.BaseClusterTopology;
 import com.scarasol.acceleratednavigation.topology.MacroSearch;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
-import com.scarasol.acceleratednavigation.navigation.NavigationPreview;
+import com.scarasol.acceleratednavigation.navigation.AutomaticNavigationBridge;
 import com.scarasol.acceleratednavigation.navigation.NavigationRequestPath;
 import com.scarasol.acceleratednavigation.navigation.SegmentedNavigationService;
 import net.minecraft.commands.CommandSourceStack;
@@ -36,7 +36,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
-/** A player-facing view of the existing macro query; the particles are corridor sketches. */
+/** Macro corridor sketches and session-owned, physically executed detailed navigation. */
 final class NavigationCommand {
     private static final int MAX_POINTS = 4096;
     private static final int MAX_PARTICLES_PER_REFRESH = 256;
@@ -44,12 +44,13 @@ final class NavigationCommand {
     private static final long DISPLAY_NANOS = TimeUnit.MINUTES.toNanos(1);
     private static final double VISIBLE_DISTANCE_SQUARED = 30.0D * 30.0D;
 
-    // This map belongs to the server thread. A player has at most one query or display.
+    // This map belongs to the server thread. A player has at most one query, actor or display.
     private final Map<UUID, Session> sessions = new HashMap<>();
 
     void register(RegisterCommandsEvent event) {
         event.getDispatcher().register(Commands.literal("navigation")
                 .requires(source -> source.hasPermission(2) && source.getEntity() instanceof ServerPlayer)
+                .then(Commands.literal("cancel").executes(this::executeCancel))
                 .then(Commands.literal("graph")
                         .then(Commands.argument("distance", IntegerArgumentType.integer(
                                         1, TopologyService.MAX_GRAPH_CAPTURE_DISTANCE))
@@ -123,7 +124,7 @@ final class NavigationCommand {
         CommandSourceStack source = context.getSource();
         ServerPlayer player = source.getPlayer();
         if (player == null) return 0;
-        boolean detailed=BoolArgumentType.getBool(context,"detailed");
+        boolean detailed = BoolArgumentType.getBool(context, "detailed");
 
         ServerLevel level = source.getLevel();
         BlockPos start = BlockPosArgument.getBlockPos(context, "start");
@@ -132,37 +133,40 @@ final class NavigationCommand {
             source.sendFailure(Component.literal("起点或终点超出世界边界。"));
             return 0;
         }
+        if (detailed && (!level.hasChunkAt(start) || !level.hasChunkAt(goal)
+                || !level.isPositionEntityTicking(start))) {
+            source.sendFailure(Component.literal("详细寻路未启动：起终点区块必须已加载，起点必须处于实体运行范围。"));
+            return 0;
+        }
 
         UUID owner = player.getUUID();
         Session old = sessions.remove(owner);
-        if (old != null && old.request != null) {
-            old.request.cancel();
+        if (old != null && (old.request != null || old.actor != null)) {
+            cancel(old);
             report(level.getServer(), old, "CANCELLED_REPLACED", null,
                     System.nanoTime() - old.startedNanos);
         }
-        if(old!=null&&old.preview!=null)old.preview.cancel();
-        Session session = new Session(owner, level.dimension(), start, goal, canOpenDoors, System.nanoTime());
+        Session session = new Session(owner, level.dimension(), start, goal, canOpenDoors, detailed,
+                System.nanoTime());
         sessions.put(owner, session);
         try {
-            if(detailed) {
-                session.detailed=true;
-                List<Vec3> points=new ArrayList<>();
-                session.preview=SegmentedNavigationService.forServer(level.getServer()).preview(level,owner,start,goal,
-                        canOpenDoors,nodes-> {
-                            for(Vec3 node:nodes)if(points.size()<MAX_POINTS)points.add(node);
-                        });
-                player.sendSystemMessage(Component.literal("详细预览已提交，按段执行原版节点查询。"));
-                session.preview.future.whenComplete((state,failure)-> {
-                    if(sessions.get(owner)!=session)return;
-                    session.preview=null;
-                    String result=failure!=null?"ERROR":state==NavigationRequestPath.State.SUCCEEDED?"SUCCESS":"FAILED_"+state;
-                    report(level.getServer(),session,result,failure,System.nanoTime()-session.startedNanos);
-                    if(state!=NavigationRequestPath.State.SUCCEEDED) { sessions.remove(owner,session);return; }
-                    session.points=List.copyOf(points);
-                    session.displayUntilNanos=System.nanoTime()+DISPLAY_NANOS;
-                    session.nextRefreshTick=level.getServer().getTickCount();
-                    player.sendSystemMessage(Component.literal("粒子展示按段查询的真实节点预览（最多4096点），不代表实体执行认证。"));
-                });
+            if (detailed) {
+                NavigationTestMob actor = new NavigationTestMob(level, canOpenDoors);
+                session.actor = actor;
+                actor.setPos(start.getX() + 0.5D, start.getY(), start.getZ() + 0.5D);
+                if (!AutomaticNavigationBridge.enabled(actor.getNavigation())) {
+                    cancel(session);
+                    sessions.remove(owner, session);
+                    source.sendFailure(Component.literal("详细寻路未启动：自动导航已关闭或尸壳被配置为绕过接入。"));
+                    return 0;
+                }
+                if (!level.addFreshEntity(actor)) throw new IllegalStateException("无法生成寻路生物");
+                boolean accepted = AutomaticNavigationBridge.delegate(session, 0, "START",
+                        () -> actor.getNavigation().moveTo(goal.getX(), goal.getY(), goal.getZ(), 1.0D));
+                session.movement = SegmentedNavigationService.forServer(level.getServer())
+                        .active(actor.getNavigation());
+                if (!accepted || session.movement == null) throw new IllegalStateException("实体导航未接受请求");
+                player.sendSystemMessage(Component.literal("详细寻路已启动：永久发光、速度 V 的成年尸壳从 A 点行走至 B 点，到达后移除。"));
                 return 1;
             }
             TopologyService.MacroRequest request = TopologyService.forServer(level.getServer())
@@ -182,10 +186,38 @@ final class NavigationCommand {
             return 1;
         } catch (RuntimeException failure) {
             sessions.remove(owner, session);
-            if (session.request != null) session.request.cancel();
+            cancel(session);
             report(level.getServer(), session, "ERROR", failure,
                     System.nanoTime() - session.startedNanos);
             return 0;
+        }
+    }
+
+    private int executeCancel(CommandContext<CommandSourceStack> context) {
+        ServerPlayer player = context.getSource().getPlayer();
+        if (player == null) return 0;
+        Session session = sessions.remove(player.getUUID());
+        if (session == null) {
+            context.getSource().sendFailure(Component.literal("没有正在运行的寻路或展示。"));
+            return 0;
+        }
+        cancel(session);
+        report(context.getSource().getServer(), session, "CANCELLED", null,
+                System.nanoTime() - session.startedNanos);
+        return 1;
+    }
+
+    private static void cancel(Session session) {
+        if (session.request != null) {
+            session.request.cancel();
+            session.request = null;
+        }
+        if (session.actor != null) {
+            SegmentedNavigationService.stopControllerOnCurrentThread(session, 0);
+            session.actor.getNavigation().stop();
+            session.actor.discard();
+            session.actor = null;
+            session.movement = null;
         }
     }
 
@@ -231,12 +263,29 @@ final class NavigationCommand {
             ServerPlayer player = server.getPlayerList().getPlayer(session.owner);
             if (player == null || player.level().dimension() != session.dimension) {
                 iterator.remove();
-                if (session.request != null) {
-                    session.request.cancel();
+                if (session.request != null || session.actor != null) {
+                    cancel(session);
                     report(server, session, "CANCELLED_PLAYER_LEFT", null, now - session.startedNanos);
                 }
-                if(session.preview!=null)session.preview.cancel();
-            } else if (session.request == null&&session.preview==null) {
+            } else if (session.actor != null) {
+                String result = null;
+                ServerLevel level = server.getLevel(session.dimension);
+                if (session.actor.isRemoved() || !session.actor.isAlive()
+                        || session.actor.level() != level) {
+                    result = "FAILED_ENTITY_REMOVED";
+                } else if (level == null || !level.isPositionEntityTicking(session.actor.blockPosition())) {
+                    result = "FAILED_UNAVAILABLE_CHUNK";
+                } else if (session.movement.terminal()) {
+                    result = session.movement.state == NavigationRequestPath.State.SUCCEEDED
+                            ? "SUCCESS" : session.movement.state == NavigationRequestPath.State.CANCELLED
+                            ? "CANCELLED" : "FAILED_" + session.movement.state;
+                }
+                if (result != null) {
+                    iterator.remove();
+                    cancel(session);
+                    report(server, session, result, null, now - session.startedNanos);
+                }
+            } else if (session.request == null) {
                 if (now >= session.displayUntilNanos) {
                     iterator.remove();
                 } else if (server.getTickCount() >= session.nextRefreshTick) {
@@ -252,27 +301,28 @@ final class NavigationCommand {
         List<Session> ending = List.copyOf(sessions.values());
         sessions.clear();
         for (Session session : ending) {
-            if (session.request != null) {
-                session.request.cancel();
+            if (session.request != null || session.actor != null) {
+                cancel(session);
                 report(server, session, "CANCELLED_SERVER_STOPPING", null,
                         System.nanoTime() - session.startedNanos);
             }
-            if(session.preview!=null)session.preview.cancel();
         }
     }
 
     private static void report(MinecraftServer server, Session session, String result,
                                Throwable failure, long elapsedNanos) {
         long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(Math.max(0L, elapsedNanos));
-        AcceleratedNavigation.LOGGER.info("Navigation macro query owner={} dimension={} start={} goal={} canOpenDoors={} result={} elapsedMs={}",
-                session.owner, session.dimension.location(), session.start, session.goal, session.canOpenDoors, result, elapsedMillis);
+        AcceleratedNavigation.LOGGER.info("Navigation {} owner={} dimension={} start={} goal={} canOpenDoors={} result={} elapsedMs={}",
+                session.detailed ? "entity execution" : "macro query", session.owner, session.dimension.location(),
+                session.start, session.goal, session.canOpenDoors, result, elapsedMillis);
         if (failure != null && !(failure instanceof CancellationException)) {
-            AcceleratedNavigation.LOGGER.warn("Navigation macro query failed for {}", session.owner, failure);
+            AcceleratedNavigation.LOGGER.warn("Navigation command failed for {}", session.owner, failure);
         }
         ServerPlayer player = server.getPlayerList().getPlayer(session.owner);
         if (player != null && player.level().dimension() == session.dimension) {
-            player.sendSystemMessage(Component.literal((session.detailed?"详细预览":"宏观寻路") + resultText(result)
-                    + "；耗时 " + elapsedMillis + " ms（提交到查询终态，不含粒子展示）。"));
+            player.sendSystemMessage(Component.literal((session.detailed ? "详细寻路" : "宏观寻路") + resultText(result)
+                    + "；耗时 " + elapsedMillis + (session.detailed
+                    ? " ms（提交到实体执行终态，生物已移除）。" : " ms（提交到查询终态，不含粒子展示）。")));
         }
     }
 
@@ -287,6 +337,11 @@ final class NavigationCommand {
             case "FAILED_NO_STRUCTURAL_ROUTE" -> "失败（无宏观结构路线）";
             case "FAILED_SEARCH_LIMIT_REACHED" -> "失败（达到搜索上限）";
             case "FAILED_UNAVAILABLE_CHUNK" -> "失败（所需区块未加载）";
+            case "FAILED_ENTITY_REMOVED" -> "失败（生物被移除、死亡或离开当前维度）";
+            case "FAILED_EXHAUSTED" -> "失败（原版部分路径已走完，未实际到达终点）";
+            case "FAILED_UNAVAILABLE" -> "失败（路线、区块或导航输入不可用）";
+            case "FAILED_UNREACHABLE" -> "失败（原版详细搜索无路径）";
+            case "FAILED_FAILED" -> "失败（实体执行或有限恢复未完成）";
             case "FAILED_FACTS_RECOVERY_FAILED" -> "失败（地形事实恢复失败）";
             case "FAILED_FACTS_PERSISTENCE_UNAVAILABLE" -> "失败（地形事实存储不可用）";
             case "FAILED_STALE_WORLD" -> "失败（世界已变化）";
@@ -375,20 +430,22 @@ final class NavigationCommand {
         private final BlockPos goal;
         private final boolean canOpenDoors;
         private TopologyService.MacroRequest request;
-        private NavigationPreview preview;
-        private boolean detailed;
+        private NavigationTestMob actor;
+        private NavigationRequestPath movement;
+        private final boolean detailed;
         private List<Vec3> points = List.of();
         private long displayUntilNanos;
         private int nextRefreshTick;
 
         private Session(UUID owner, ResourceKey<Level> dimension, BlockPos start, BlockPos goal,
-                        boolean canOpenDoors, long startedNanos) {
+                        boolean canOpenDoors, boolean detailed, long startedNanos) {
             this.owner = owner;
             this.dimension = dimension;
             this.start = start.immutable();
             this.goal = goal.immutable();
             this.startedNanos = startedNanos;
             this.canOpenDoors = canOpenDoors;
+            this.detailed = detailed;
         }
     }
 }

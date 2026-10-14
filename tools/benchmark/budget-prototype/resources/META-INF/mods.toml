@@ -1,0 +1,8 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+[[mods]]
+modId="an_budget_prototype"
+version="1"
+displayName="Isolated dynamic navigation budget prototype"
+description="Research driver. Do not install on production servers."

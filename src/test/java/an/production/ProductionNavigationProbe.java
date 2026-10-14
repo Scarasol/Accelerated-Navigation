@@ -73,12 +73,23 @@ public final class ProductionNavigationProbe {
     private int targetMoves;
     private int recomputations;
     private int semanticChanges;
+    private int semanticSearches;
+    private long searchBeforeChange=-1,wholeBeforePartial;
+    private long deferredNativeBefore,deferredDecisionBefore,deferredWholeBefore,deferredSegmentsBefore;
+    private boolean sawSegmentPartial;
+    private BlockPos selectedDecisionTarget;
     private boolean poiPending;
     private long tickStarted,chargedBefore,poiLegacy;
     private int peakActive;
     private String lastSegment="";
     private Throwable failure;
-    public ProductionNavigationProbe() { MinecraftForge.EVENT_BUS.register(this); }
+    public ProductionNavigationProbe() {
+        MinecraftForge.EVENT_BUS.register(Boolean.getBoolean("an.production.performanceComparison")
+                ? new PerformanceComparisonProbe() : Boolean.getBoolean("an.production.handoffBoundaries")
+                ? new HandoffBoundaryProbe() : Boolean.getBoolean("an.production.speedDiagnosis")
+                ? new SpeedHandoffProbe() : Boolean.getBoolean("an.production.commandOnly")
+                ? new NavigationCommandProbe() : this);
+    }
     public static final class TestPig extends Pig {
         public TestPig(ServerLevel level) { super(EntityType.PIG,level);setPersistenceRequired();setInvulnerable(true); }
         @Override protected void registerGoals() {}
@@ -133,6 +144,8 @@ public final class ProductionNavigationProbe {
                 level.setBlock(new BlockPos(x,80,z),Blocks.STONE.defaultBlockState(),2);
                 for(int y=81;y<=84;y++)level.setBlock(new BlockPos(x,y,z),Blocks.AIR.defaultBlockState(),2);
             }
+            level.setBlock(new BlockPos(14,80,4),Blocks.MAGMA_BLOCK.defaultBlockState(),2);
+            level.setBlock(new BlockPos(14,81,5),Blocks.RAIL.defaultBlockState(),2);
             pig=spawn(new TestZombie(level),new BlockPos(3,81,3));
             target=spawn(new TestPig(level),new BlockPos(26,81,3));
             nativeTypes.add(spawn(new TestBee(level),new BlockPos(40,81,2)));
@@ -222,6 +235,17 @@ public final class ProductionNavigationProbe {
             check("real-native-segment",request.getEndNode()!=null
                     &&(request.nativeBackend||request.canReach()),
                     request.state+" macro="+NavigationCapabilities.capture(pig).macroSupported()+" "+request.getNodeCount());
+            check("semantic-neighborhood-enters-real-segment-search",!request.nativeBackend
+                    &&service.metrics().segmentCalls()>0&&service.metrics().nativeWholeCalls()==0,
+                    "magma and rail near the candidate are decided by the native evaluator");
+            int retainedNodes=request.getNodeCount(),retainedNext=request.getNextNodeIndex();
+            long retainedCalls=service.metrics().nativeCalls();
+            check("repeated-request-path-move-keeps-current-segment",pig.getNavigation().moveTo(request,.9)
+                    &&request.state==NavigationRequestPath.State.REACHABLE
+                    &&request.getNodeCount()==retainedNodes&&request.getNextNodeIndex()==retainedNext
+                    &&service.metrics().nativeCalls()==retainedCalls
+                    &&pig.getNavigation().getPath()==request&&service.executionReady(pig.getNavigation()),
+                    "only speed changes");
             net.minecraft.network.FriendlyByteBuf wire=new net.minecraft.network.FriendlyByteBuf(io.netty.buffer.Unpooled.buffer());
             try {
                 request.writeToStream(wire);
@@ -276,14 +300,22 @@ public final class ProductionNavigationProbe {
             check("new-target-replaces",pig.getNavigation().moveTo(28,81,6,1)&&request.state==NavigationRequestPath.State.CANCELLED,"replaced");
             request=service.active(pig.getNavigation());phase(2);
         } else if(phase==2) {
+            if(searchBeforeChange>=0&&service.metrics().segmentCalls()>searchBeforeChange
+                    &&service.executionReady(pig.getNavigation())) {
+                check("native-input-change-runs-new-pathfinder-"+semanticSearches,
+                        !request.nativeBackend&&service.metrics().nativeWholeCalls()==0,
+                        "real segment searches "+searchBeforeChange+" -> "+service.metrics().segmentCalls());
+                semanticSearches++;searchBeforeChange=-1;
+            }
             if(!request.terminal()&&request.getNodeCount()>0&&semanticChanges<2
                     &&tick-phaseTick>=80+semanticChanges*25) {
+                searchBeforeChange=service.metrics().segmentCalls();
                 level.setBlock(new BlockPos(17,80,1),
                         (semanticChanges==0?Blocks.ANDESITE:Blocks.STONE).defaultBlockState(),2);
-                check("changed-semantic-proof-pauses-local-execution-"+semanticChanges,
+                check("changed-native-input-pauses-local-execution-"+semanticChanges,
                         !request.nativeBackend&&!service.executionReady(pig.getNavigation())
                                 &&AutomaticNavigationBridge.localDone(pig.getNavigation(),()->false)
-                                &&!pig.getNavigation().isDone(),"current window awaits END qualification");
+                                &&!pig.getNavigation().isDone(),"actual native read input awaits END search");
                 semanticChanges++;
             }
             if(!request.terminal()&&recomputations<3&&tick-phaseTick>=20+recomputations*25) {
@@ -301,6 +333,7 @@ public final class ProductionNavigationProbe {
                         &&pig.blockPosition().distManhattan(new BlockPos(28,81,6))<=1,request.state+" "+pig.blockPosition());
                 check("three-normal-recomputations-complete",recomputations==3,recomputations);
                 check("two-safe-semantic-changes-complete",semanticChanges==2,semanticChanges);
+                check("two-native-input-researches-complete",semanticSearches==2,semanticSearches);
                 melee=spawn(new TestZombie(level),new BlockPos(3,81,10));melee.setTarget(target);phase(3);
             }
         } else if(phase==3) {
@@ -444,6 +477,87 @@ public final class ProductionNavigationProbe {
                     "unconsumed query older than 200 ticks");
             check("zero-business-records",service.metrics().records()==0&&service.metrics().active()==0,service.metrics());
             check("zero-pending-scheduler",scheduler.metrics().pendingRequests()==0,scheduler.metrics());
+            for(int x=13;x<=15;x++)for(int z=39;z<=41;z++)
+                if(x!=14||z!=40)for(int y=81;y<=82;y++)
+                    level.setBlock(new BlockPos(x,y,z),Blocks.POWDER_SNOW.defaultBlockState(),2);
+            pig.getAttribute(net.minecraft.world.entity.ai.attributes.Attributes.FOLLOW_RANGE).setBaseValue(35);
+            selectedDecisionTarget=new BlockPos(20,81,44);
+            request=service.prepare(pig.getNavigation(),AutomaticNavigationBridge.intent(pig.getNavigation(),
+                    java.util.Set.of(new BlockPos(14,81,40),selectedDecisionTarget),null,false,8,false,0,35),
+                    pig.getNavigation(),0);
+            check("ready-multi-target-query-enters-native-decision",request!=null,"closer native-blocked target");
+            phase(12);
+        } else if(phase==12&&request.state==NavigationRequestPath.State.REACHABLE) {
+            check("ready-query-selects-actual-reachable-target",request.canReach()&&request.nativeBackend
+                    &&request.getTarget().equals(selectedDecisionTarget)&&service.active(pig.getNavigation())==null,
+                    request.getTarget());
+            check("ready-ground-query-adoption-restarts-segmented-execution",pig.getNavigation().moveTo(request,1)
+                    &&request.state==NavigationRequestPath.State.PENDING&&!request.nativeBackend
+                    &&request.getNodeCount()==0&&!pig.getNavigation().isDone(),"same request, selected target");
+            phase(13);
+        } else if(phase==13&&request.terminal()) {
+            check("adopted-query-keeps-selected-final-target",request.state==NavigationRequestPath.State.SUCCEEDED
+                    &&request.getTarget().equals(selectedDecisionTarget)&&pig.blockPosition().equals(selectedDecisionTarget),
+                    request.state+" "+pig.blockPosition()+" target="+request.getTarget());
+            for(int x=43;x<=47;x++)for(int z=44;z<=48;z++)
+                if(x!=45||z!=46)for(int y=81;y<=82;y++)
+                    level.setBlock(new BlockPos(x,y,z),Blocks.POWDER_SNOW.defaultBlockState(),2);
+            pig.setPos(40.5,81,46.5);
+            wholeBeforePartial=service.metrics().nativeWholeCalls();
+            check("segmented-final-partial-entry",pig.getNavigation().moveTo(45,81,46,1),"native powder snow rule");
+            request=service.active(pig.getNavigation());phase(14);
+        } else if(phase==14) {
+            if(!request.terminal()&&request.getNodeCount()>0&&!request.canReach()&&!sawSegmentPartial) {
+                check("segmented-native-partial-is-executed",!request.nativeBackend
+                        &&pig.getNavigation().getPath()==request&&!pig.getNavigation().isDone(),
+                        request.getEndNode().asBlockPos());
+                sawSegmentPartial=true;
+            }
+            if(request.terminal()) {
+                check("segmented-final-partial-exhausts-without-whole-fallback",sawSegmentPartial
+                        &&request.state==NavigationRequestPath.State.EXHAUSTED&&!request.nativeBackend
+                        &&pig.blockPosition().distManhattan(request.getTarget())>request.intent.accuracy()
+                        &&service.metrics().nativeWholeCalls()==wholeBeforePartial,
+                        request.state+" "+pig.blockPosition()+" target="+request.getTarget());
+                check("partial-finish-cleans-records",service.metrics().records()==0
+                        &&scheduler.metrics().pendingRequests()==0,service.metrics());
+                pig.discard();
+                for(int y=85;y<=112;y++)
+                    level.setBlock(new BlockPos(6,y,32),Blocks.AIR.defaultBlockState(),2);
+                pig=spawn(new TestPig(level),new BlockPos(6,111,32));
+                deferredNativeBefore=service.metrics().nativeCalls();
+                deferredDecisionBefore=service.metrics().nativeDecisionCalls();
+                deferredWholeBefore=service.metrics().nativeWholeCalls();
+                deferredSegmentsBefore=service.metrics().segmentCalls();
+                request=service.prepare(pig.getNavigation(),AutomaticNavigationBridge.intent(pig.getNavigation(),
+                        java.util.Set.of(new BlockPos(16,81,32)),null,false,8,false,1,24),
+                        pig.getNavigation(),0);
+                check("airborne-query-prepared",request!=null&&!pig.onGround(),"natural fall before native search");
+                phase(15);
+            }
+        } else if(phase==15&&tick-phaseTick>=2&&scheduler.metrics().pendingRequests()==0) {
+            check("airborne-query-awaits-native-update",request.state==NavigationRequestPath.State.PENDING
+                    &&!((NavigationAccess)pig.getNavigation()).acceleratedNavigation$canUpdate()
+                    &&service.active(pig.getNavigation())==null&&service.metrics().nativeCalls()==deferredNativeBefore,
+                    "query is waiting for the actual navigation to allow search");
+            check("airborne-pending-query-adopted",pig.getNavigation().moveTo(request,1)
+                    &&service.active(pig.getNavigation())==request&&!pig.getNavigation().isDone(),
+                    "same pending handle adopted before landing");
+            phase(16);
+        } else if(phase==16&&request.terminal()) {
+            check("adopted-deferred-query-produces-segment",false,request.state+" "+pig.blockPosition()
+                    +" captured="+request.intent.capabilities()+" actual="+NavigationCapabilities.capture(pig));
+        } else if(phase==16&&request.getNodeCount()>0) {
+            check("adopted-deferred-query-enters-segmented-search",!request.nativeBackend
+                    &&service.metrics().segmentCalls()>deferredSegmentsBefore
+                    &&service.metrics().nativeDecisionCalls()==deferredDecisionBefore
+                    &&service.metrics().nativeWholeCalls()==deferredWholeBefore,
+                    service.metrics());
+            phase(17);
+        } else if(phase==17&&request.terminal()) {
+            check("adopted-deferred-query-naturally-arrives",request.state==NavigationRequestPath.State.SUCCEEDED
+                    &&!request.nativeBackend&&pig.blockPosition().distManhattan(request.getTarget())<=1,
+                    request.state+" "+pig.blockPosition()+" target="+request.getTarget());
             finish();
         }
     }

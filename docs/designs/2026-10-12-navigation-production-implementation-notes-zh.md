@@ -1,5 +1,7 @@
 # 自动Navigation生产实施记录
 
+> 历史记录：本文对应已废弃设计下的旧实现，其中资格过滤、能力 proof 及旧 DeepSeek 验收结论不能作为当前规范或通过依据。现行唯一契约为 [2026-10-13 原版详细寻路接入契约](2026-10-13-native-detail-navigation-contract-zh.md)；修正记录见 [本轮修复验证](../reports/2026-10-13-native-detail-navigation-fix-validation-zh.md)。
+
 授权：检查现有生产区与Git/远端一致性，必要时推送；按设计及验证实施，说明修改；完成后通过WSL dsh的deepseek/deepseek-v4.1-flash验收。
 
 实现基线：99b619a9c07bdb93644a4b37e9bbb729b291b2d9，已推送origin/1.20.1，开始实施前工作树干净。依据冻结自动接入方案、四接入原型和最新落点/全程恢复验证。原共识规格不覆写。

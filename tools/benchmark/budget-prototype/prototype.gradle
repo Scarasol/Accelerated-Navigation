@@ -1,0 +1,31 @@
+allprojects {
+    afterEvaluate {
+        sourceSets {
+            budgetPrototype {
+                java.srcDir rootProject.file('tools/benchmark/budget-prototype/java')
+                resources.srcDir rootProject.file('tools/benchmark/budget-prototype/resources')
+                compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+                runtimeClasspath += output + compileClasspath
+            }
+        }
+        tasks.named('compileBudgetPrototypeJava').configure {
+            options.compilerArgs += ['-proc:none']
+        }
+        tasks.register('budgetPrototypeHierarchyJar', Jar) {
+            from(sourceSets.main.output)
+            archiveFileName = 'hierarchy.jar'
+            destinationDirectory = rootProject.file('.tmp/navigation-dynamic-budget-20261013/build')
+        }
+        tasks.register('budgetPrototypeJar', Jar) {
+            from(sourceSets.budgetPrototype.output)
+            manifest { attributes('MixinConfigs': 'an_budget_prototype.mixins.json') }
+            archiveFileName = 'budget-prototype.jar'
+            destinationDirectory = rootProject.file('.tmp/navigation-dynamic-budget-20261013/build')
+        }
+        reobf { budgetPrototypeJar {} }
+        tasks.named('reobfBudgetPrototypeJar').configure {
+            libraries.from(tasks.named('budgetPrototypeHierarchyJar').flatMap { it.archiveFile })
+            dependsOn tasks.named('budgetPrototypeHierarchyJar')
+        }
+    }
+}

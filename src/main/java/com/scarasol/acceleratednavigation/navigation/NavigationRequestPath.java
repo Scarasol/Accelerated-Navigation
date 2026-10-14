@@ -68,7 +68,7 @@ public final class NavigationRequestPath extends Path {
     public void clearNodes() { nodes.clear(); setNextNodeIndex(0); }
     @Override public BlockPos getTarget() { return target; }
     @Override public boolean canReach() {
-        return (state == State.REACHABLE || state == State.SUCCEEDED) && (!nativeBackend || nativeReachable);
+        return state == State.SUCCEEDED || state == State.REACHABLE && nativeReachable;
     }
     @Override public float getDistToTarget() {
         return getEndNode() == null ? Float.MAX_VALUE : getEndNode().distanceManhattan(target);

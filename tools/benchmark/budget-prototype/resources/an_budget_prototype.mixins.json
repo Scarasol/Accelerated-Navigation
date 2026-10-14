@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "an.budget.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": ["BudgetTickMixin", "BudgetSchedulerMixin", "BudgetPathTraceMixin", "BudgetHandoffTraceMixin", "BudgetHandoffTimingMixin"],
+  "injectors": {"defaultRequire": 1}
+}

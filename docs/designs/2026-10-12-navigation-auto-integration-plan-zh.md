@@ -1,5 +1,7 @@
 # 原版Navigation自动接入与分段Path方案
 
+> 已废弃：本文及基于本文的旧 DeepSeek 共识不具备当前架构验收效力。本文仅保留历史记录；现行唯一契约为 [2026-10-13 原版详细寻路接入契约](2026-10-13-native-detail-navigation-contract-zh.md)。不得把本文作为冻结规范、并列方案或低优先级依据送审。
+
 日期：2026-10-12。工程：`D:\Workspace\AcceleratedNavigation-forge-1.20.1`。
 
 状态：依据当前Forge源码修订的接入规格，联合文本评审结论见[审查记录](../reports/2026-10-12-navigation-auto-integration-deepseek-consensus-zh.md)，尚未实现或取得运行资格。本方案替代[上一版显式业务入口方案](2026-10-12-segmented-navigation-integration-plan-zh.md)的接入范围、Path契约及控制权约定；分段同步、服务器共享约4ms软预算的[架构方向](2026-10-12-segmented-navigation-shared-budget-zh.md)保持。

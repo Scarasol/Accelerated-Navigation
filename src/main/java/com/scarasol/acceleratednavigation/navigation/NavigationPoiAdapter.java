@@ -52,7 +52,6 @@ public final class NavigationPoiAdapter {
         if(old!=null&&old.resume)return false;
         if(candidates.isEmpty()||!AutomaticNavigationBridge.enabled(mob.getNavigation()))return false;
         var navigation=mob.getNavigation();
-        if(!NavigationCapabilities.capture(mob).macroSupported())return false;
         var service=AutomaticNavigationBridge.service(navigation);
         int accuracy=candidates.stream().mapToInt(pair->pair.getFirst().value().validRange()).max().orElse(1);
         var intent=AutomaticNavigationBridge.intent(navigation,
