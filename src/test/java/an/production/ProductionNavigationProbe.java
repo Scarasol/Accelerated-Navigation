@@ -84,7 +84,11 @@ public final class ProductionNavigationProbe {
     private String lastSegment="";
     private Throwable failure;
     public ProductionNavigationProbe() {
-        MinecraftForge.EVENT_BUS.register(Boolean.getBoolean("an.production.performanceComparison")
+        PerformanceTickTelemetry.register();
+        MinecraftForge.EVENT_BUS.register(Boolean.getBoolean("an.production.tickBoundaryLoad")
+                ? new TickBoundaryLoadProbe() : Boolean.getBoolean("an.production.partialReplay")
+                ? new PartialReplayProbe() : Boolean.getBoolean("an.production.waitBoundaries")
+                ? new HandoffWaitBoundaryProbe() : Boolean.getBoolean("an.production.performanceComparison")
                 ? new PerformanceComparisonProbe() : Boolean.getBoolean("an.production.handoffBoundaries")
                 ? new HandoffBoundaryProbe() : Boolean.getBoolean("an.production.speedDiagnosis")
                 ? new SpeedHandoffProbe() : Boolean.getBoolean("an.production.commandOnly")

@@ -1,6 +1,7 @@
 package an.production.mixin;
 
 import an.production.PerformanceSearchTelemetry;
+import an.production.HandoffDiagnostics;
 import java.util.Set;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Mob;
@@ -21,12 +22,14 @@ public abstract class PerformancePathFinderMixin {
     private void begin(PathNavigationRegion region, Mob mob, Set<BlockPos> targets,
             float range, int accuracy, float multiplier, CallbackInfoReturnable<Path> callback) {
         anPerformanceSpan = PerformanceSearchTelemetry.begin(mob);
+        HandoffDiagnostics.nativeBegin(mob, targets, range, accuracy, multiplier);
     }
     @Inject(method = "m_77427_(Lnet/minecraft/world/level/PathNavigationRegion;Lnet/minecraft/world/entity/Mob;Ljava/util/Set;FIF)Lnet/minecraft/world/level/pathfinder/Path;",
             at = @At("RETURN"), remap = false, require = 1)
     private void end(PathNavigationRegion region, Mob mob, Set<BlockPos> targets,
             float range, int accuracy, float multiplier, CallbackInfoReturnable<Path> callback) {
         PerformanceSearchTelemetry.end(anPerformanceSpan, callback.getReturnValue());
+        HandoffDiagnostics.nativeEnd(mob);
         anPerformanceSpan = null;
     }
 }

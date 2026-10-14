@@ -43,6 +43,7 @@ public final class PerformanceComparisonProbe {
     private static final class Actor {
         final BenchmarkHusk mob;
         final Route route;
+        final Vec3 initialPosition;
         final PerformanceSearchTelemetry.Stats search = new PerformanceSearchTelemetry.Stats();
         long submitStart, submitEnd, ready, firstMove, physicalArrival, finish;
         int maxNodes;
@@ -50,7 +51,9 @@ public final class PerformanceComparisonProbe {
         boolean accepted, success, reachedNativeEnd, evaluated;
         String state = "PENDING";
         NavigationRequestPath request;
-        Actor(BenchmarkHusk mob, Route route) { this.mob = mob; this.route = route; }
+        Actor(BenchmarkHusk mob, Route route) {
+            this.mob = mob; this.route = route; this.initialPosition = mob.position();
+        }
     }
     public static final class BenchmarkHusk extends Husk {
         public BenchmarkHusk(ServerLevel level) {
@@ -60,7 +63,8 @@ public final class PerformanceComparisonProbe {
             setInvulnerable(true);
             setCanPickUpLoot(false);
             addEffect(new MobEffectInstance(MobEffects.GLOWING, MobEffectInstance.INFINITE_DURATION, 0, false, false));
-            addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SPEED, MobEffectInstance.INFINITE_DURATION, 1, false, false));
+            addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SPEED, MobEffectInstance.INFINITE_DURATION,
+                    Integer.getInteger("an.production.performanceSpeedAmplifier", 1), false, false));
         }
         @Override protected void registerGoals() {}
         @Override protected boolean shouldDespawnInPeaceful() { return false; }
@@ -89,19 +93,32 @@ public final class PerformanceComparisonProbe {
     private SegmentedNavigationService service;
     private NavigationScheduler scheduler;
     private Method topologyMetrics;
-    private int tick, index = -1, nextTrial = 180, submitTick, peakActive, peakPending, peakNodes;
+    private int tick, index = -1, nextTrial = Integer.getInteger("an.production.performanceStartupTicks", 180),
+            submitTick, peakActive, peakPending, peakNodes, nextActor;
     private long tickStart, previousStart, currentInterval, batchStart, batchEnd, heapStart, peakHeap;
     private long gcCountStart, gcTimeStart, allocationStart, chargedStart;
     private long nativeStart, segmentStart, wholeStart, failureStart, recoveriesStart;
     private long submissionWork, submissionAllocated;
+    private JsonObject topologyStart;
     private boolean submitted, closing, timedOut;
     private Throwable failure;
+    private final long addedLoadNanos = Long.getLong("an.production.performanceAddedLoadNanos", 0L);
+    private final int submissionSpanTicks = Integer.getInteger("an.production.performanceSubmissionSpanTicks", 1);
+
+    @SubscribeEvent(priority = EventPriority.HIGHEST)
+    public void load(TickEvent.ServerTickEvent event) {
+        if (event.getServer() != server || event.phase != TickEvent.Phase.START || addedLoadNanos <= 0 || tick < 150) return;
+        long deadline = System.nanoTime() + addedLoadNanos;
+        while (System.nanoTime() < deadline) Thread.onSpinWait();
+    }
 
     public PerformanceComparisonProbe() {
         int[] distances = ints(System.getProperty("an.production.performanceDistances", "8,18,28"));
         int[] concurrencies = ints(System.getProperty("an.production.performanceConcurrency", "128,256,512"));
-        scenarios.add(new Scenario(8, 64, -2, true));
-        scenarios.add(new Scenario(28, 64, -1, true));
+        if (Boolean.parseBoolean(System.getProperty("an.production.performanceWarmup", "true"))) {
+            scenarios.add(new Scenario(8, 64, -2, true));
+            scenarios.add(new Scenario(28, 64, -1, true));
+        }
         for (int r = 0; r < repeats; r++) {
             for (int di = 0; di < distances.length; di++)
                 for (int ci = 0; ci < concurrencies.length; ci++) {
@@ -140,20 +157,23 @@ public final class PerformanceComparisonProbe {
             level.getGameRules().getRule(GameRules.RULE_DAYLIGHT).set(false, server);
             level.getGameRules().getRule(GameRules.RULE_WEATHER_CYCLE).set(false, server);
             level.setDayTime(6000);
-            // Search regions extend beyond each 40-block tile; keep the whole arena and its margin loaded.
-            for (int cx = -12; cx <= 11; cx++) for (int cz = -12; cz <= 11; cz++) {
-                level.setChunkForced(cx, cz, true);
-                level.getChunk(cx, cz);
-            }
-            for (int x = -160; x < 160; x++) for (int z = -160; z < 160; z++)
-                level.setBlock(new BlockPos(x, 80, z), Blocks.STONE.defaultBlockState(), 2);
-            for (int tile = 0; tile < 64; tile++) buildTile(tile);
+            prepareArena(server, level);
             service = SegmentedNavigationService.forServer(server);
             scheduler = NavigationScheduler.forServer(server);
             topologyMetrics = TopologyService.class.getDeclaredMethod("metrics");
             topologyMetrics.setAccessible(true);
             System.out.println("PERF_READY v2 variant=" + variant() + " scenarios=" + scenarios.size());
         } catch (Throwable problem) { abort(problem); }
+    }
+    static void prepareArena(MinecraftServer server, ServerLevel level) {
+        // Search regions extend beyond each tile; load the arena and its margin.
+        for (int cx = -12; cx <= 11; cx++) for (int cz = -12; cz <= 11; cz++) {
+            level.setChunkForced(cx, cz, true);
+            level.getChunk(cx, cz);
+        }
+        for (int x = -160; x < 160; x++) for (int z = -160; z < 160; z++)
+            level.setBlock(new BlockPos(x, 80, z), Blocks.STONE.defaultBlockState(), 2);
+        for (int tile = 0; tile < 64; tile++) buildTile(level, tile);
     }
     private String variant() { return vanilla ? "vanilla-same-runtime" : "accelerated"; }
     private static BlockPos point(int tile, int x, int y, int z) {
@@ -164,31 +184,31 @@ public final class PerformanceComparisonProbe {
         else if (rotation == 3) { rx = z; rz = 39 - x; }
         return new BlockPos(-160 + (tile % 8) * 40 + rx, y, -160 + (tile / 8) * 40 + rz);
     }
-    private void obstacle(int tile, int x, int z, int height) {
+    private static void obstacle(ServerLevel level, int tile, int x, int z, int height) {
         for (int y = 81; y < 81 + height; y++)
             level.setBlock(point(tile, x, y, z), Blocks.STONE.defaultBlockState(), 2);
     }
-    private void buildTile(int tile) {
+    private static void buildTile(ServerLevel level, int tile) {
         switch (tile % 8) {
-            case 2 -> { for (int z = 16; z <= 22; z++) obstacle(tile, 11, z, 3); }
+            case 2 -> { for (int z = 16; z <= 22; z++) obstacle(level, tile, 11, z, 3); }
             case 3 -> {
-                for (int z = 14; z <= 20; z++) obstacle(tile, 11, z, 3);
-                for (int z = 19; z <= 25; z++) obstacle(tile, 21, z, 3);
+                for (int z = 14; z <= 20; z++) obstacle(level, tile, 11, z, 3);
+                for (int z = 19; z <= 25; z++) obstacle(level, tile, 21, z, 3);
             }
             case 4 -> {
                 for (int x = 10; x <= 18; x++) for (int z = 6; z <= 32; z++)
-                    obstacle(tile, x, z, rampHeight(x));
+                    obstacle(level, tile, x, z, rampHeight(x));
             }
             case 5 -> {
                 for (int x : new int[] {10, 14, 18, 26, 30}) for (int z = 12; z <= 26; z += 4)
-                    obstacle(tile, x, z, 3);
+                    obstacle(level, tile, x, z, 3);
             }
             case 6 -> {
-                for (int z = 10; z <= 28; z++) if (z < 18 || z > 19) obstacle(tile, 11, z, 3);
+                for (int z = 10; z <= 28; z++) if (z < 18 || z > 19) obstacle(level, tile, 11, z, 3);
             }
             case 7 -> {
-                for (int z = 16; z <= 22; z++) obstacle(tile, 11, z, 3);
-                for (int x = 11; x <= 15; x++) obstacle(tile, x, 22, 3);
+                for (int z = 16; z <= 22; z++) obstacle(level, tile, 11, z, 3);
+                for (int x = 11; x <= 15; x++) obstacle(level, tile, x, 22, 3);
             }
             default -> { }
         }
@@ -218,7 +238,7 @@ public final class PerformanceComparisonProbe {
         currentInterval = previousStart == 0 ? 0 : tickStart - previousStart;
         if (submitted && previousStart != 0) intervals.add(currentInterval);
         previousStart = tickStart;
-        try { if (!actors.isEmpty() && !submitted && tick >= submitTick) submit(); }
+        try { if (!actors.isEmpty() && nextActor < actors.size() && tick >= submitTick) submit(); }
         catch (Throwable problem) { abort(problem); }
     }
     private void beginTrial() {
@@ -229,6 +249,7 @@ public final class PerformanceComparisonProbe {
         work.clear();
         intervals.clear();
         submitted = false;
+        nextActor = 0;
         timedOut = false;
         submissionWork = 0;
         peakActive = peakPending = peakNodes = 0;
@@ -236,7 +257,9 @@ public final class PerformanceComparisonProbe {
         for (int i = 0; i < scenario.concurrency(); i++) {
             Route route = route(scenario.distance(), i);
             BenchmarkHusk mob = new BenchmarkHusk(level);
-            mob.setPos(route.start().getX() + .5, route.start().getY() + .01, route.start().getZ() + .5);
+            double offset = i == Integer.getInteger("an.production.performancePositionOffsetActor", -1)
+                    ? Double.parseDouble(System.getProperty("an.production.performancePositionOffsetZ", "0")) : 0;
+            mob.setPos(route.start().getX() + .5, route.start().getY() + .01, route.start().getZ() + .5 + offset);
             if (!level.addFreshEntity(mob)) throw new IllegalStateException("benchmark actor insertion rejected");
             Actor actor = new Actor(mob, route);
             actors.add(actor);
@@ -246,34 +269,43 @@ public final class PerformanceComparisonProbe {
                 + " concurrency=" + scenario.concurrency() + " repeat=" + scenario.repeat());
     }
     private void submit() throws Exception {
-        for (Actor a : actors) {
-            if (!a.mob.onGround() || a.mob.blockPosition().distManhattan(a.route.start()) > 0)
-                throw new IllegalStateException("actor has not settled at route start: " + a.route);
-            if (AutomaticNavigationBridge.enabled(a.mob.getNavigation()) == vanilla)
-                throw new IllegalStateException("navigation backend does not match benchmark variant");
+        if (!submitted) {
+            for (Actor a : actors) {
+                if (!a.mob.onGround() || a.mob.blockPosition().distManhattan(a.route.start()) > 0)
+                    throw new IllegalStateException("actor has not settled at route start: " + a.route);
+                if (AutomaticNavigationBridge.enabled(a.mob.getNavigation()) == vanilla)
+                    throw new IllegalStateException("navigation backend does not match benchmark variant");
+            }
+            heapStart = heap();
+            peakHeap = heapStart;
+            allocationStart = PerformanceSearchTelemetry.allocated();
+            gcCountStart = gcCount(); gcTimeStart = gcTime();
+            chargedStart = scheduler.metrics().chargedNanos();
+            topologyStart = topology();
+            var m = service.metrics();
+            nativeStart = m.nativeCalls(); segmentStart = m.segmentCalls(); wholeStart = m.nativeWholeCalls();
+            failureStart = m.failures(); recoveriesStart = m.recoveries();
+            submitted = true;
+            submissionAllocated = 0;
+            batchStart = System.nanoTime();
         }
-        heapStart = heap();
-        peakHeap = heapStart;
-        allocationStart = PerformanceSearchTelemetry.allocated();
-        gcCountStart = gcCount(); gcTimeStart = gcTime();
-        chargedStart = scheduler.metrics().chargedNanos();
-        var m = service.metrics();
-        nativeStart = m.nativeCalls(); segmentStart = m.segmentCalls(); wholeStart = m.nativeWholeCalls();
-        failureStart = m.failures(); recoveriesStart = m.recoveries();
-        submitted = true;
-        batchStart = System.nanoTime();
-        for (Actor a : actors) {
+        long allocatedBefore = PerformanceSearchTelemetry.allocated();
+        int limit = Math.min(actors.size(), nextActor + (actors.size() + submissionSpanTicks - 1) / submissionSpanTicks);
+        while (nextActor < limit) {
+            Actor a = actors.get(nextActor++);
             a.submitStart = System.nanoTime();
             a.accepted = a.mob.getNavigation().moveTo(a.route.goal().getX() + .5,
                     a.route.goal().getY(), a.route.goal().getZ() + .5, 1.0);
             a.submitEnd = System.nanoTime();
             a.request = service.active(a.mob.getNavigation());
+            HandoffDiagnostics.register(a.mob, nextActor - 1, scenarios.get(index).distance(),
+                    scenarios.get(index).repeat(), a.request);
             Path path = a.mob.getNavigation().getPath();
             if (path != null && path.getNodeCount() > 0) a.ready = a.submitEnd;
             if (!a.accepted) { a.state = "REJECTED"; a.finish = a.submitEnd; a.evaluated = true; }
         }
         batchEnd = System.nanoTime();
-        submissionAllocated = PerformanceSearchTelemetry.allocated() - allocationStart;
+        submissionAllocated += PerformanceSearchTelemetry.allocated() - allocatedBefore;
     }
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void end(TickEvent.ServerTickEvent event) {
@@ -398,6 +430,7 @@ public final class PerformanceComparisonProbe {
         row.addProperty("serviceFailuresDelta", m.failures() - failureStart);
         row.addProperty("recoveriesDelta", m.recoveries() - recoveriesStart);
         row.addProperty("chargedNanosDelta", scheduler.metrics().chargedNanos() - chargedStart);
+        row.add("topologyStart", topologyStart);
         row.add("topologyEnd", topology());
         JsonArray actorRows = new JsonArray();
         for (Actor a : actors) {
@@ -407,6 +440,8 @@ public final class PerformanceComparisonProbe {
             item.addProperty("slot", a.route.slot());
             item.addProperty("rotation", a.route.rotation());
             item.add("start", gson.toJsonTree(List.of(a.route.start().getX(), a.route.start().getY(), a.route.start().getZ())));
+            item.add("initialPosition", gson.toJsonTree(List.of(a.initialPosition.x, a.initialPosition.y, a.initialPosition.z)));
+            item.addProperty("queryId", a.request == null ? null : a.request.queryId.toString());
             item.add("goal", gson.toJsonTree(List.of(a.route.goal().getX(), a.route.goal().getY(), a.route.goal().getZ())));
             item.add("finalPosition", gson.toJsonTree(List.of(a.mob.getX(), a.mob.getY(), a.mob.getZ())));
             item.addProperty("straightDistance", Math.sqrt(a.route.start().distSqr(a.route.goal())));
@@ -431,6 +466,7 @@ public final class PerformanceComparisonProbe {
         for (Actor a : actors) {
             a.mob.getNavigation().stop(); a.mob.discard();
             PerformanceSearchTelemetry.ACTORS.remove(a.mob);
+            HandoffDiagnostics.forget(a.mob);
         }
         actors.clear();
         nextTrial = tick + 20;
@@ -452,7 +488,10 @@ public final class PerformanceComparisonProbe {
         root.addProperty("repeats", repeats);
         root.addProperty("timeoutTicks", timeout);
         root.addProperty("postTerminalObservationTicks", 10);
-        root.addProperty("entity", "adult husk; speed II; glowing; no autonomous goals; entity pushing disabled");
+        root.addProperty("speedAmplifier", Integer.getInteger("an.production.performanceSpeedAmplifier", 1));
+        root.addProperty("addedLoadNanos", addedLoadNanos);
+        root.addProperty("submissionSpanTicks", submissionSpanTicks);
+        root.addProperty("entity", "adult husk; infinite speed and glowing; no autonomous goals; entity pushing disabled");
         root.addProperty("seed", 20261013);
         root.add("routeKinds", gson.toJsonTree(KINDS));
         root.add("trials", trials);
@@ -472,6 +511,13 @@ public final class PerformanceComparisonProbe {
     @SubscribeEvent public void stopped(ServerStoppedEvent event) {
         try {
             if (!closing) { failure = new IllegalStateException("server stopped before completing benchmark"); writeResult(); }
+            JsonObject shutdown = new JsonObject();
+            shutdown.addProperty("passed", failure == null && closing && service.metrics().records() == 0
+                    && service.metrics().active() == 0 && scheduler.metrics().pendingRequests() == 0);
+            shutdown.add("navigation", gson.toJsonTree(service.metrics()));
+            shutdown.add("scheduler", gson.toJsonTree(scheduler.metrics()));
+            Files.writeString(output.resolve("shutdown.json"), gson.toJson(shutdown));
+            HandoffDiagnostics.write();
         } catch (Throwable problem) { problem.printStackTrace(); }
     }
 }

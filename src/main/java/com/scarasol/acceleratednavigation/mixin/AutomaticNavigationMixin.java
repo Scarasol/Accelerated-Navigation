@@ -101,10 +101,15 @@ public abstract class AutomaticNavigationMixin {
         PathNavigation navigation=(PathNavigation)(Object)this;
         if(AutomaticNavigationBridge.enabled(navigation))AutomaticNavigationBridge.service(navigation).speed(navigation,value);
     }
-    @WrapOperation(method={"tick()V","followThePath()V"},at=@At(value="INVOKE",
-            target="Lnet/minecraft/world/level/pathfinder/Path;advance()V"),require=2,expect=2,allow=2)
-    private void advance(Path path,Operation<Void> original) {
-        if(!AutomaticNavigationBridge.deferAdvance((PathNavigation)(Object)this,path))original.call(path);
+    @WrapOperation(method="followThePath()V",at=@At(value="INVOKE",
+            target="Lnet/minecraft/world/level/pathfinder/Path;advance()V"),require=1,expect=1,allow=1)
+    private void advanceFollowing(Path path,Operation<Void> original) {
+        if(!AutomaticNavigationBridge.deferAdvance((PathNavigation)(Object)this,path,true))original.call(path);
+    }
+    @WrapOperation(method="tick()V",at=@At(value="INVOKE",
+            target="Lnet/minecraft/world/level/pathfinder/Path;advance()V"),require=1,expect=1,allow=1)
+    private void advanceFalling(Path path,Operation<Void> original) {
+        if(!AutomaticNavigationBridge.deferAdvance((PathNavigation)(Object)this,path,false))original.call(path);
     }
     @WrapOperation(method="createPath(Ljava/util/Set;IZIF)Lnet/minecraft/world/level/pathfinder/Path;",
             at=@At(value="INVOKE",target="Lnet/minecraft/util/profiling/ProfilerFiller;push(Ljava/lang/String;)V"),

@@ -1,0 +1,8 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+[[mods]]
+modId="an_navigation_verification"
+version="1"
+displayName="Production navigation verification"
+description="Isolated driver using actual production classes."

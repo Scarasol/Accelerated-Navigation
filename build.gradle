@@ -160,6 +160,7 @@ dependencies {
 	annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
     implementation fg.deobf("curse.maven:the-lost-cities-269024:8862717")
     compileOnly(annotationProcessor("io.github.llamalad7:mixinextras-common:0.3.6"))
+    testCompileOnly "io.github.llamalad7:mixinextras-common:0.3.6"
     runtimeOnly fg.deobf("curse.maven:spark-361579:4738952")
     implementation(jarJar("io.github.llamalad7:mixinextras-forge:0.3.6")) {
         jarJar.ranged(it, "[0.3.6,)")

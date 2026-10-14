@@ -57,8 +57,8 @@ final class TopologyWorkerRuntime {
     private static final long SECTION_CHANGE_METADATA_BYTES = 32L;
     private static final long SIMPLE_EVENT_METADATA_BYTES = 48L;
     private static final long FLAG_EVENT_METADATA_BYTES = 8L;
-    private static final BaseClusterTopology.GeometryKey DEFAULT_GEOMETRY =
-            BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.geometry(
+    private static final BaseClusterTopology.GeometryKey PREWARM_GEOMETRY =
+            new BaseClusterTopology.TraversalProfile(1.0F, 2.0F, 1, 0, 3, false, true).geometry(
                     BaseClusterTopology.Channel.GROUND);
     private static final int MAX_COMPLETED_CORRIDORS = 1_024;
     private static final long MAX_COMPLETED_CORRIDOR_BYTES = 16L * 1024L * 1024L;
@@ -3341,12 +3341,12 @@ final class TopologyWorkerRuntime {
             candidate.advance();
             if (candidate.hasNext()) prewarmCandidates.put(candidate.key, candidate);
             if (cluster.factState == FactState.UNLOADED) continue;
-            ViewEntry existing = cluster.views.get(DEFAULT_GEOMETRY);
+            ViewEntry existing = cluster.views.get(PREWARM_GEOMETRY);
             if (existing != null && (existing.topology != null || existing.demand != null)) continue;
             prewarmAdmitted++;
             highestPrewarmAdmitted = Math.max(
                     highestPrewarmAdmitted, prewarmAdmitted);
-            if (!requestClusterDependency(candidate.key.dimension, section, DEFAULT_GEOMETRY,
+            if (!requestClusterDependency(candidate.key.dimension, section, PREWARM_GEOMETRY,
                     NavigationScheduler.Priority.BACKGROUND, true, null)) {
                 prewarmAdmitted--;
             }

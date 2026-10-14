@@ -1,0 +1,22 @@
+allprojects {
+    afterEvaluate {
+        tasks.register('productionProbeHierarchyJar', Jar) {
+            from(sourceSets.main.output)
+            archiveFileName = 'production-probe-hierarchy.jar'
+            destinationDirectory = rootProject.file('build/navigation-verification')
+        }
+        tasks.register('productionProbeJar', Jar) {
+            from(sourceSets.test.output) {
+                include 'an/**', 'META-INF/mods.toml', 'an_performance.mixins.json'
+            }
+            manifest { attributes('MixinConfigs': 'an_performance.mixins.json') }
+            archiveFileName = 'production-probe.jar'
+            destinationDirectory = rootProject.file('build/navigation-verification')
+        }
+        reobf { productionProbeJar {} }
+        tasks.named('reobfProductionProbeJar').configure {
+            libraries.from(tasks.named('productionProbeHierarchyJar').flatMap { it.archiveFile })
+            dependsOn tasks.named('productionProbeHierarchyJar')
+        }
+    }
+}

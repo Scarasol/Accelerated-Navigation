@@ -1,0 +1,42 @@
+{
+  "schema": "DYNAMIC_BUDGET_ACTUAL_ENTRY_SUMMARY_V1",
+  "candidateSha256": "53F48B1551414115B15EE086F8F7EE79DF75787CDC99BA76B45AF2B256C34636",
+  "formal": {
+    "modes": ["legacy4-samepath", "dynamic20", "vanilla-backend-bypass"],
+    "requestsPerMode": 2688,
+    "distanceGroups": [8, 18, 28],
+    "concurrency": [128, 256, 512],
+    "routeKinds": 8,
+    "isolatedJvms": 3,
+    "repetitionsPerCell": 1,
+    "at512": {
+      "dynamicVsFixed4": [
+        {"distance": 8, "successPoints": 0, "readyP95Percent": -87.8, "fullP95Percent": 93.4, "arrivalP50Percent": -44.3, "nativeWallPercent": 4.0},
+        {"distance": 18, "successPoints": 0, "readyP95Percent": -89.4, "fullP95Percent": 51.7, "arrivalP50Percent": -37.4, "nativeWallPercent": 8.1},
+        {"distance": 28, "successPoints": 0.781, "readyP95Percent": -93.1, "fullP95Percent": 70.9, "arrivalP50Percent": -42.3, "nativeWallPercent": 2.6}
+      ],
+      "dynamicVsVanilla": [
+        {"distance": 8, "successPoints": -3.125, "submitPercent": -80.2, "readyP95Percent": 515.4, "fullP95Percent": 170.9, "arrivalP50Percent": 19.4},
+        {"distance": 18, "successPoints": -4.492, "submitPercent": -95.6, "readyP95Percent": 305.0, "fullP95Percent": 139.8, "arrivalP50Percent": 8.2},
+        {"distance": 28, "successPoints": 17.578, "submitPercent": -98.6, "readyP95Percent": 157.7, "fullP95Percent": 162.6, "arrivalP50Percent": 8.3}
+      ]
+    }
+  },
+  "cold512": {
+    "dynamicVsFixed4ReadyP95Percent": [-51.6, -86.7, -92.0],
+    "dynamicVsFixed4FullP95Percent": [140.0, 49.9, 54.1],
+    "dynamicOver50msTicks": {"distance8": 1, "distance18": 0, "distance28": 0}
+  },
+  "tickLoad": {
+    "checks": 106,
+    "passed": true,
+    "grantRangeMs": [0, 20],
+    "maxFullTickMs": 65.175001,
+    "negativeBalanceSamples": 108,
+    "actualIntegratedPauseTested": false
+  },
+  "invalidRuns": [
+    "stream comparison excluded because baseline JVM was already running before launch"
+  ],
+  "conclusion": "Raw evidence supports mechanism evaluation, but DeepSeek requires budget contract alignment before continuing integration validation; it does not approve production release."
+}

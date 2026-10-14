@@ -209,7 +209,13 @@ public final class HandoffBoundaryProbe {
             if (request.isDone() && (int) field(work, "stable") >= 2
                     && !(boolean) field(work, "queued") && !(boolean) field(work, "preparing")) {
                 // One measured delay leaves the real settle queued across an input change.
-                try (var ignored = scheduler.account()) { Thread.sleep(10); }
+                long balance = scheduler.metrics().availableNanos();
+                try (var ignored = scheduler.account()) {
+                    long deadline = System.nanoTime() + Math.max(20_000_000L, balance + 1_000_000L);
+                    while (System.nanoTime() < deadline) Thread.onSpinWait();
+                }
+                check("hold-exhausts-current-dynamic-budget", scheduler.metrics().availableNanos() < 500_000L,
+                        scheduler.metrics().availableNanos());
                 heldSettleBudget = true;
             }
         } catch (Throwable problem) { abort(problem); }

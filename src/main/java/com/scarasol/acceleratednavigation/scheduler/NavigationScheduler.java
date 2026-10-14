@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.function.LongSupplier;
+import java.util.function.BooleanSupplier;
 
 /**
  * Main-thread cooperative scheduler shared by all navigation backends on one
@@ -29,9 +30,6 @@ import java.util.function.LongSupplier;
  */
 public final class NavigationScheduler {
 
-    private static final long TICK_REFILL_NANOS = 4_000_000L;
-    private static final long TOKEN_CAP_NANOS = 4_000_000L;
-    private static final long TICK_HEADROOM_DEADLINE_NANOS = 45_000_000L;
     private static final long MIN_SLICE_NANOS = 500_000L;
     private static final long MAX_SLICE_NANOS = 1_000_000L;
     private static final long AGING_INTERVAL_NANOS = 250_000_000L;
@@ -55,6 +53,26 @@ public final class NavigationScheduler {
     private long accountingStarted;
     private LongSupplier clock = System::nanoTime;
     private long chargedNanos;
+    private NavigationBudgetController controller = new NavigationBudgetController();
+    private NavigationBudgetController.Choice tickChoice;
+    private BooleanSupplier haveTime;
+    private boolean inEnvelope;
+    private boolean startSeen;
+    private boolean endSeen;
+    private boolean closed;
+    private long chargeAtStart;
+    private long chargeAtDrainEnd;
+    private long previousChargeAtEnd;
+    private long drainEndedNanos;
+    private long balanceAfterRefill;
+    private long balanceBeforeDrain;
+    private long outsideNavigationNanos;
+    private long validTicks;
+    private long skippedTicks;
+    private int pendingBeforeDrain;
+    private StopReason stopReason = StopReason.NO_END;
+    private final long[] stopCounts = new long[StopReason.values().length];
+    private TickSample lastTick;
 
     private NavigationScheduler(MinecraftServer server) {
         this.server = server;
@@ -75,6 +93,12 @@ public final class NavigationScheduler {
         forServer(server).beginTick();
     }
 
+    public static NavigationScheduler beginTickEnvelope(MinecraftServer server, BooleanSupplier haveTime) {
+        NavigationScheduler scheduler = forServer(server);
+        scheduler.beginEnvelope(haveTime);
+        return scheduler;
+    }
+
     public static void endServerTick(MinecraftServer server, boolean haveTime) {
         forServer(server).endTick(haveTime);
     }
@@ -86,6 +110,7 @@ public final class NavigationScheduler {
             scheduler = SERVICES.remove(server);
         }
         if (scheduler != null) {
+            scheduler.closed = true;
             scheduler.cancelAll();
         }
     }
@@ -132,6 +157,7 @@ public final class NavigationScheduler {
 
     public boolean promote(ResourceKey<Level> dimension, UUID owner, Priority priority) {
         requireServerThread();
+        requireOpen();
         try (TimeAccount ignored = account()) {
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(owner, "owner");
@@ -173,6 +199,7 @@ public final class NavigationScheduler {
                                               ResumableSearch<R> search,
                                              long startThresholdNanos) {
         requireServerThread();
+        requireOpen();
         try (TimeAccount ignored = account()) {
         Objects.requireNonNull(dimension, "dimension");
         Objects.requireNonNull(owner, "owner");
@@ -212,38 +239,82 @@ public final class NavigationScheduler {
         }
     }
 
+    private void beginEnvelope(BooleanSupplier haveTime) {
+        requireServerThread();
+        requireOpen();
+        if (inEnvelope) throw new IllegalStateException("nested navigation tick envelope");
+        this.haveTime = Objects.requireNonNull(haveTime, "haveTime");
+        tickStartedNanos = clock.getAsLong();
+        chargeAtStart = totalAccounted(tickStartedNanos);
+        outsideNavigationNanos = Math.max(0L, chargeAtStart - previousChargeAtEnd);
+        tickChoice = controller.choose();
+        inEnvelope = true;
+        startSeen = endSeen = false;
+        drainEndedNanos = 0L;
+        stopReason = StopReason.NO_END;
+    }
+
     private void beginTick() {
         requireServerThread();
-        tickStartedNanos = clock.getAsLong();
-        tokensNanos = Math.min(TOKEN_CAP_NANOS, tokensNanos + TICK_REFILL_NANOS);
+        requireOpen();
+        if (!inEnvelope || startSeen) throw new IllegalStateException("missing envelope or duplicate navigation START");
+        startSeen = true;
+        controller.commit(tickChoice);
+        long now = clock.getAsLong();
+        long active = activeElapsed(now);
+        long grant = tickChoice.grantNanos();
+        balanceAfterRefill = Math.min(grant, tokensNanos - active + grant);
+        tokensNanos = balanceAfterRefill + active;
+    }
+
+    public void finishTickEnvelope(boolean completedNormally) {
+        requireServerThread();
+        if (!inEnvelope) throw new IllegalStateException("missing navigation tick envelope");
+        long now = clock.getAsLong();
+        long chargeAtEnd = totalAccounted(now);
+        try {
+            if (completedNormally && startSeen && endSeen && !closed) {
+                long full = Math.max(0L, now - tickStartedNanos);
+                long navigation = Math.max(0L, chargeAtEnd - chargeAtStart);
+                long tail = Math.max(0L, now - drainEndedNanos - (chargeAtEnd - chargeAtDrainEnd));
+                controller.record(full, navigation, tail);
+                validTicks = increment(validTicks);
+                stopCounts[stopReason.ordinal()] = increment(stopCounts[stopReason.ordinal()]);
+                lastTick = new TickSample(validTicks, full, navigation, outsideNavigationNanos,
+                        tickChoice.grantNanos(), tickChoice.baseEstimateNanos(), tickChoice.tailReserveNanos(),
+                        tail, balanceAfterRefill, balanceBeforeDrain, availableTokens(now),
+                        pendingBeforeDrain, pending.size(), stopReason);
+            } else skippedTicks = increment(skippedTicks);
+        } finally {
+            previousChargeAtEnd = chargeAtEnd;
+            inEnvelope = startSeen = endSeen = false;
+            haveTime = null;
+            tickChoice = null;
+            tickStartedNanos = 0L;
+        }
     }
 
     private void endTick(boolean haveTime) {
         requireServerThread();
+        requireOpen();
+        if (!inEnvelope || !startSeen || endSeen)
+            throw new IllegalStateException("missing START or duplicate navigation END");
+        endSeen = true;
+        pendingBeforeDrain = pending.size();
+        balanceBeforeDrain = availableTokens();
         try (TimeAccount ignored = account()) {
-        if (!haveTime || pending.isEmpty() || tickStartedNanos == 0L) {
-            tickStartedNanos = 0L;
-            return;
-        }
-
-        long tickDeadlineNanos = tickStartedNanos + TICK_HEADROOM_DEADLINE_NANOS;
-        long elapsedTickNanos = clock.getAsLong() - tickStartedNanos;
-        long headroomNanos = TICK_HEADROOM_DEADLINE_NANOS - elapsedTickNanos;
-        long budgetNanos = Math.min(Math.max(0L, availableTokens()), headroomNanos);
-        if (budgetNanos < MIN_SLICE_NANOS) {
-            tickStartedNanos = 0L;
-            return;
-        }
-
-        long schedulerDeadline = Math.min(
-                clock.getAsLong() + budgetNanos,
-                tickDeadlineNanos
-        );
-        try {
-            drain(schedulerDeadline, Integer.MAX_VALUE);
+            long now = clock.getAsLong();
+            long tickDeadline = tickStartedNanos + NavigationBudgetController.TARGET_NANOS
+                    - tickChoice.tailReserveNanos();
+            long budget = Math.min(Math.max(0L, availableTokens(now)), tickDeadline - now);
+            if (!haveTime || !this.haveTime.getAsBoolean()) stopReason = StopReason.SERVER_NO_TIME;
+            else if (pending.isEmpty()) stopReason = StopReason.EMPTY;
+            else if (availableTokens(now) < MIN_SLICE_NANOS) stopReason = StopReason.BALANCE;
+            else if (budget < MIN_SLICE_NANOS) stopReason = StopReason.HEADROOM;
+            else drain(Math.min(now + budget, tickDeadline), Integer.MAX_VALUE);
         } finally {
-            tickStartedNanos = 0L;
-        }
+            drainEndedNanos = clock.getAsLong();
+            chargeAtDrainEnd = totalAccounted(drainEndedNanos);
         }
     }
 
@@ -255,15 +326,21 @@ public final class NavigationScheduler {
         try {
             int slices = 0;
             int requestsWithoutProgress = 0;
-            while (!pending.isEmpty() && requestsWithoutProgress < pending.size()) {
+            while (!closed && !pending.isEmpty() && requestsWithoutProgress < pending.size()) {
+                if (!haveTime.getAsBoolean()) {
+                    stopReason = StopReason.SERVER_NO_TIME;
+                    return;
+                }
                 long remaining = Math.min(schedulerDeadline - clock.getAsLong(), availableTokens());
                 if (remaining < MIN_SLICE_NANOS || slices >= maxSlices) {
-                    break;
+                    stopReason = availableTokens() < MIN_SLICE_NANOS ? StopReason.BALANCE : StopReason.HEADROOM;
+                    return;
                 }
 
                 QueuedSearch<?> request = takeNext(clock.getAsLong());
                 if (request == null) {
-                    break;
+                    stopReason = StopReason.DEPENDENCY;
+                    return;
                 }
                 request.queued = false;
                 if (request.future.isDone() || pending.get(request.key) != request) {
@@ -273,12 +350,24 @@ public final class NavigationScheduler {
                     continue;
                 }
 
+                remaining = Math.min(schedulerDeadline - clock.getAsLong(), availableTokens());
                 if (remaining < request.startThresholdNanos) {
                     enqueue(request);
                     requestsWithoutProgress++;
                     continue;
                 }
 
+                if (!haveTime.getAsBoolean()) {
+                    enqueue(request);
+                    stopReason = StopReason.SERVER_NO_TIME;
+                    return;
+                }
+                remaining = Math.min(schedulerDeadline - clock.getAsLong(), availableTokens());
+                if (remaining < request.startThresholdNanos) {
+                    enqueue(request);
+                    requestsWithoutProgress++;
+                    continue;
+                }
                 long allowance = Math.min(MAX_SLICE_NANOS, remaining);
                 long sliceStarted = clock.getAsLong();
                 ResumableSearch.Status status;
@@ -343,6 +432,7 @@ public final class NavigationScheduler {
                     AcceleratedNavigation.LOGGER.error("Navigation result publication for {} failed", request.key.owner, failure);
                 }
             }
+            stopReason = pending.isEmpty() ? StopReason.EMPTY : StopReason.START_THRESHOLD;
         } finally {
             draining = false;
         }
@@ -353,7 +443,7 @@ public final class NavigationScheduler {
             server.execute(() -> wake(request));
             return;
         }
-        if (!request.parked || request.future.isDone()
+        if (closed || !request.parked || request.future.isDone()
                 || pending.get(request.key) != request) {
             return;
         }
@@ -382,6 +472,7 @@ public final class NavigationScheduler {
     public final class TimeAccount implements AutoCloseable {
         private boolean closed;
         @Override public void close() {
+            requireServerThread();
             if (closed) throw new IllegalStateException("duplicate accounting close");
             closed = true;
             if (--accountingDepth == 0) {
@@ -393,14 +484,49 @@ public final class NavigationScheduler {
     }
 
     private long availableTokens() {
-        return tokensNanos - (accountingDepth == 0 ? 0L : Math.max(0L, clock.getAsLong() - accountingStarted));
+        return availableTokens(clock.getAsLong());
     }
+
+    private long activeElapsed(long now) {
+        return accountingDepth == 0 ? 0L : Math.max(0L, now - accountingStarted);
+    }
+
+    private long availableTokens(long now) { return tokensNanos - activeElapsed(now); }
+    private long totalAccounted(long now) { return chargedNanos + activeElapsed(now); }
+    private static long increment(long value) { return value == Long.MAX_VALUE ? value : value + 1; }
 
     public record Metrics(long chargedNanos, long availableNanos, int pendingRequests) {}
 
     public Metrics metrics() {
         requireServerThread();
-        return new Metrics(chargedNanos, availableTokens(), pending.size());
+        long now = clock.getAsLong();
+        return new Metrics(totalAccounted(now), availableTokens(now), pending.size());
+    }
+
+    public enum StopReason { NO_END, EMPTY, BALANCE, HEADROOM, SERVER_NO_TIME, DEPENDENCY, START_THRESHOLD }
+
+    public record TickSample(long sequence, long fullNanos, long navigationNanos, long outsideNavigationNanos,
+            long grantNanos, long baseEstimateNanos, long tailReserveNanos, long measuredTailNanos,
+            long balanceAfterRefillNanos, long balanceBeforeDrainNanos, long finalBalanceNanos,
+            int pendingBeforeDrain, int pendingAfterDrain, StopReason stopReason) {}
+
+    public record BudgetMetrics(long validTicks, long skippedTicks, int historySamples, int runnableRequests,
+            int parkedRequests, TickSample lastTick, long emptyStops, long balanceStops, long headroomStops,
+            long serverNoTimeStops, long dependencyStops, long thresholdStops) {}
+
+    public BudgetMetrics budgetMetrics() {
+        requireServerThread();
+        int runnable = 0;
+        for (BandQueue queue : queues.values()) runnable += queue.size;
+        return new BudgetMetrics(validTicks, skippedTicks, controller.sampleCount(), runnable,
+                Math.max(0, pending.size() - runnable), lastTick, stopCounts[StopReason.EMPTY.ordinal()],
+                stopCounts[StopReason.BALANCE.ordinal()], stopCounts[StopReason.HEADROOM.ordinal()],
+                stopCounts[StopReason.SERVER_NO_TIME.ordinal()], stopCounts[StopReason.DEPENDENCY.ordinal()],
+                stopCounts[StopReason.START_THRESHOLD.ordinal()]);
+    }
+
+    private void requireOpen() {
+        if (closed) throw new RejectedExecutionException("scheduler is stopped");
     }
 
     private static <R> void completeRequest(QueuedSearch<R> request,

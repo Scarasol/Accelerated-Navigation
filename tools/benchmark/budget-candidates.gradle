@@ -1,0 +1,55 @@
+// Load alongside production-probe.gradle as a separate initialization script.
+allprojects {
+    afterEvaluate {
+        def variant = (rootProject.findProperty('budgetCandidate') ?: 'dynamic12').toString()
+        if (!(variant in ['fixed4', 'dynamic12', 'dynamic16', 'dynamic20']))
+            throw new GradleException('Unknown isolated budget candidate')
+        def maximum = variant == 'fixed4' ? 4 : Integer.parseInt(variant.substring(7))
+        def generated = rootProject.file("build/budget-candidate/${variant}/source")
+        sourceSets {
+            budgetCandidate {
+                java.srcDir generated
+                compileClasspath += sourceSets.main.compileClasspath
+            }
+        }
+        tasks.register('prepareBudgetCandidate') {
+            inputs.file(rootProject.file('src/main/java/com/scarasol/acceleratednavigation/scheduler/NavigationBudgetController.java'))
+            inputs.property('variant', variant)
+            outputs.dir(generated)
+            doLast {
+                def source = rootProject.file('src/main/java/com/scarasol/acceleratednavigation/scheduler/NavigationBudgetController.java').getText('UTF-8')
+                def constants = ['12', '16', '20'].collect { "public static final long MAX_GRANT_NANOS = ${it}_000_000L;" }
+                def constant = constants.find { source.contains(it) }
+                if (constant == null) throw new GradleException('Unexpected production maximum; freeze a new candidate recipe')
+                source = source.replace(constant, "public static final long MAX_GRANT_NANOS = ${maximum}_000_000L;")
+                if (variant == 'fixed4') {
+                    def selection = 'return new Choice(grant, estimate, tail);'
+                    if (!source.contains(selection)) throw new GradleException('Unexpected controller selection')
+                    source = source.replace(selection, 'return new Choice(INITIAL_GRANT_NANOS, estimate, tail);')
+                }
+                def destination = new File(generated, 'com/scarasol/acceleratednavigation/scheduler/NavigationBudgetController.java')
+                destination.parentFile.mkdirs()
+                destination.setText(source, 'UTF-8')
+            }
+        }
+        tasks.named('compileBudgetCandidateJava').configure {
+            dependsOn tasks.named('prepareBudgetCandidate')
+            options.compilerArgs += ['-proc:none']
+        }
+        tasks.register('budgetCandidateJar', Jar) {
+            dependsOn tasks.named('jarJar'), tasks.named('reobfJarJar'), tasks.named('budgetCandidateClasses')
+            from({ zipTree(tasks.named('jarJar').get().archiveFile.get().asFile) }) {
+                exclude 'META-INF/MANIFEST.MF'
+                exclude 'com/scarasol/acceleratednavigation/scheduler/NavigationBudgetController*.class'
+            }
+            from(sourceSets.budgetCandidate.output)
+            manifest {
+                attributes('MixinConfigs': 'accelerated_navigation.mixins.json',
+                        'Navigation-Budget-Candidate': variant,
+                        'Navigation-Budget-Research-Only': 'true')
+            }
+            archiveFileName = "${variant}.jar"
+            destinationDirectory = rootProject.file('build/navigation-verification/candidates')
+        }
+    }
+}
