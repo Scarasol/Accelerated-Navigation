@@ -2,7 +2,6 @@ package an.production;
 
 import com.google.gson.GsonBuilder;
 import com.scarasol.acceleratednavigation.api.ResumableSearch;
-import com.scarasol.acceleratednavigation.scheduler.NavigationBudgetController;
 import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -22,7 +21,7 @@ import java.util.function.BooleanSupplier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.Level;
 
-/** Actual scheduler controls, repeated in one JVM before the real tick loop. */
+/** Actual scheduler controls, isolated and restored after the real 30-second gate. */
 final class ProductionBudgetChecks {
     private static final List<String> checks = new ArrayList<>();
     private static Field field(String name) throws Exception {
@@ -46,11 +45,10 @@ final class ProductionBudgetChecks {
         for (int i = 0; i < count; i++) { begin(server, () -> true); end(server, true); }
     }
     private static long grant(NavigationScheduler scheduler) throws Exception {
-        return ((NavigationBudgetController.Choice) field("tickChoice").get(scheduler)).grantNanos();
+        return NavigationScheduler.TICK_BUDGET_NANOS;
     }
     private static void reset(NavigationScheduler scheduler, AtomicLong clock) throws Exception {
         require(scheduler.metrics().pendingRequests() == 0, "reset has no pending work");
-        field("controller").set(scheduler, new NavigationBudgetController());
         for (String name : List.of("tokensNanos", "chargedNanos", "previousChargeAtEnd", "validTicks", "skippedTicks"))
             field(name).setLong(scheduler, 0);
         field("lastTick").set(scheduler, null);
@@ -84,6 +82,10 @@ final class ProductionBudgetChecks {
         AtomicLong clock = new AtomicLong();
         int firstCheck = checks.size();
         try {
+            field("inEnvelope").setBoolean(scheduler, false);
+            field("startSeen").setBoolean(scheduler, false);
+            field("endSeen").setBoolean(scheduler, false);
+            field("accountingDepth").setInt(scheduler, 0);
             field("clock").set(scheduler, (java.util.function.LongSupplier) clock::get);
             for (int pass = 0; pass < 2; pass++) controls(server, scheduler, clock);
             Files.writeString(Path.of(System.getProperty("an.production.output"), "budget-controls.json"),
@@ -105,7 +107,7 @@ final class ProductionBudgetChecks {
         AtomicInteger calls = new AtomicInteger();
         var first = scheduler.submitSoft(Level.OVERWORLD, UUID.randomUUID(), NavigationScheduler.Priority.ACTIVE,
                 500_000, () -> {
-                    calls.incrementAndGet(); clock.addAndGet(4_700_000);
+                    calls.incrementAndGet(); clock.addAndGet(20_700_000);
                     try (var ignored = scheduler.account()) { clock.addAndGet(200_000); }
                     return 7;
                 });
@@ -114,13 +116,13 @@ final class ProductionBudgetChecks {
         begin(server, () -> true); end(server, false);
         require(calls.get() == 0, "END haveTime prevents dispatch");
         begin(server, () -> true);
-        require(scheduler.metrics().availableNanos() == 4_000_000, "cold cap does not accumulate");
+        require(scheduler.metrics().availableNanos() == 20_000_000, "fixed allowance does not accumulate");
         end(server, true);
         require(first.join() == 7 && calls.get() == 1 && !second.isDone(), "cold overshoot stops next task");
-        require(scheduler.metrics().availableNanos() == -1_700_000, "search and callback debt retained");
-        require(scheduler.metrics().chargedNanos() == 5_700_000, "nested account union counted once");
+        require(scheduler.metrics().availableNanos() == -1_700_000, "search and callback overshoot recorded");
+        require(scheduler.metrics().chargedNanos() == 21_700_000, "nested account union counted once");
         begin(server, () -> true);
-        require(scheduler.metrics().availableNanos() == 2_300_000, "cold refill repays debt");
+        require(scheduler.metrics().availableNanos() == 20_000_000, "next tick starts without previous overshoot");
         end(server, true);
         require(second.isDone() && calls.get() == 2, "other dimension progresses");
         require(scheduler.budgetMetrics().lastTick().fullNanos() == 0, "zero clock is valid");
@@ -142,17 +144,18 @@ final class ProductionBudgetChecks {
         require(parked.join() == 9 && search.steps == 2, "wake runs at later END");
 
         idle(server, 45);
-        require(scheduler.budgetMetrics().historySamples() == 32, "history bounded");
-        long maximum = NavigationBudgetController.MAX_GRANT_NANOS;
-        require(scheduler.budgetMetrics().lastTick().grantNanos() == maximum, "low load reaches candidate maximum");
+        long maximum = NavigationScheduler.TICK_BUDGET_NANOS;
+        require(scheduler.budgetMetrics().lastTick().grantNanos() == maximum, "allowance remains fixed");
         calls.set(0);
         first = task(scheduler, clock, calls, maximum + 1_000_000, false);
         second = task(scheduler, clock, calls, 0, true);
         begin(server, () -> true); end(server, true);
         require(first.isDone() && !second.isDone() && calls.get() == 1, "steady maximum overshoot halts");
-        require(scheduler.metrics().availableNanos() == -1_000_000, "steady debt retained");
-        begin(server, () -> true); end(server, true);
-        require(second.isDone(), "steady debt recovery progresses");
+        require(scheduler.metrics().availableNanos() == -1_000_000, "steady overshoot recorded");
+        begin(server, () -> true);
+        require(scheduler.metrics().availableNanos() == grant(scheduler), "steady tick starts with fresh grant");
+        end(server, true);
+        require(second.isDone(), "steady next tick progresses");
 
         calls.set(0);
         first = task(scheduler, clock, calls, 100_000, false);
@@ -181,9 +184,10 @@ final class ProductionBudgetChecks {
         begin(server, () -> true); end(server, true);
         require(first.isDone() && scheduler.budgetMetrics().lastTick().fullNanos() == 60_000_000,
                 "long atom measured without hard preemption");
-        require(scheduler.metrics().availableNanos() == -56_000_000, "long atom debt not clipped");
+        require(scheduler.metrics().availableNanos() == -40_000_000, "long atom actual overshoot not clipped");
         begin(server, () -> true);
-        require(grant(scheduler) == 2_000_000, "long tick halves next grant");
+        require(grant(scheduler) == 20_000_000, "long tick does not change next grant");
+        require(scheduler.metrics().availableNanos() == 20_000_000, "long atom overshoot does not reduce next balance");
         end(server, true);
 
         reset(scheduler, clock);
@@ -192,11 +196,11 @@ final class ProductionBudgetChecks {
         owner = UUID.randomUUID();
         var blocked = scheduler.submitSoft(Level.OVERWORLD, owner, NavigationScheduler.Priority.ACTIVE, 500_000, () -> 1);
         begin(server, () -> true);
-        require(grant(scheduler) == 0, "overload chooses zero");
-        require(scheduler.metrics().availableNanos() == -2_000_000, "zero grant preserves outside debt");
+        require(grant(scheduler) == 20_000_000, "previous overload does not change grant");
+        require(scheduler.metrics().availableNanos() == 20_000_000, "outside work does not carry into new balance");
+        require(scheduler.metrics().chargedNanos() == 6_000_000, "outside work remains fully accounted");
         end(server, true);
-        require(!blocked.isDone(), "zero grant does not force work");
-        scheduler.cancel(Level.OVERWORLD, owner);
+        require(blocked.isDone(), "light tick progresses after earlier overload");
 
         reset(scheduler, clock);
         idle(server, 8);
@@ -205,32 +209,53 @@ final class ProductionBudgetChecks {
             NavigationScheduler.beginTickEnvelope(server, () -> true);
             clock.addAndGet(100_000); scheduler.finishTickEnvelope(true);
         }
-        require(scheduler.budgetMetrics().historySamples() == 8 && scheduler.budgetMetrics().skippedTicks() == 20,
-                "pause excludes samples");
+        require(scheduler.budgetMetrics().validTicks() == 8 && scheduler.budgetMetrics().skippedTicks() == 20,
+                "pause excludes normal tick samples");
         require(scheduler.metrics().availableNanos() == balance, "pause does not refill");
         begin(server, () -> true);
-        require(grant(scheduler) == 5_000_000, "pause does not accumulate growth");
+        require(grant(scheduler) == 20_000_000, "pause does not change allowance");
         end(server, true);
-        int history = scheduler.budgetMetrics().historySamples();
+        long valid = scheduler.budgetMetrics().validTicks();
         begin(server, () -> true); clock.addAndGet(1_000); scheduler.finishTickEnvelope(false);
-        require(scheduler.budgetMetrics().historySamples() == history && !(boolean) field("inEnvelope").get(scheduler),
-                "exception excludes history and clears state");
+        require(scheduler.budgetMetrics().validTicks() == valid && !(boolean) field("inEnvelope").get(scheduler),
+                "exception excludes sample and clears state");
 
         reset(scheduler, clock);
         try (var outer = scheduler.account()) {
             clock.addAndGet(1_000_000); begin(server, () -> true);
-            require(scheduler.metrics().availableNanos() == 3_000_000, "open account reduces START credit");
+            require(scheduler.metrics().availableNanos() == 20_000_000, "open account excludes work before tick");
             clock.addAndGet(2_000_000); end(server, true);
             require(scheduler.budgetMetrics().lastTick().navigationNanos() == 2_000_000
                     && scheduler.budgetMetrics().lastTick().outsideNavigationNanos() == 1_000_000, "first boundary attribution");
             clock.addAndGet(1_000_000); begin(server, () -> true);
-            require(scheduler.metrics().availableNanos() == 4_000_000, "active refill caps effective balance");
+            require(scheduler.metrics().availableNanos() == 20_000_000, "active refill caps effective balance");
             clock.addAndGet(1_000_000); end(server, true);
             require(scheduler.budgetMetrics().lastTick().navigationNanos() == 1_000_000
                     && scheduler.budgetMetrics().lastTick().outsideNavigationNanos() == 1_000_000, "second boundary attribution");
         }
-        require(scheduler.metrics().chargedNanos() == 5_000_000 && scheduler.metrics().availableNanos() == 3_000_000,
+        require(scheduler.metrics().chargedNanos() == 5_000_000 && scheduler.metrics().availableNanos() == 19_000_000,
                 "open account close conserves charges");
+
+        reset(scheduler, clock);
+        try (var outer = scheduler.account()) {
+            clock.addAndGet(2_000_000);
+            NavigationScheduler.beginTickEnvelope(server, () -> true);
+            clock.addAndGet(1_000_000);
+            NavigationScheduler.beginServerTick(server);
+            require(scheduler.metrics().availableNanos() == 19_000_000, "START retains current tick open-account work");
+            clock.addAndGet(500_000);
+            end(server, true);
+        }
+        require(scheduler.metrics().chargedNanos() == 3_500_000
+                && scheduler.metrics().availableNanos() == 18_500_000,
+                "open account closes without recharging earlier tick work");
+
+        reset(scheduler, clock);
+        NavigationScheduler.beginTickEnvelope(server, () -> true);
+        try (var ignored = scheduler.account()) { clock.addAndGet(1_000_000); }
+        NavigationScheduler.beginServerTick(server);
+        require(scheduler.metrics().availableNanos() == 19_000_000, "START retains current tick closed-account work");
+        end(server, true);
 
         reset(scheduler, clock);
         begin(server, () -> true); clock.addAndGet(2_000_000);

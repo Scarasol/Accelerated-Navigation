@@ -30,6 +30,9 @@ import java.util.function.BooleanSupplier;
  */
 public final class NavigationScheduler {
 
+    public static final long TICK_BUDGET_NANOS = 20_000_000L;
+    public static final long TARGET_NANOS = 45_000_000L;
+    public static final long TAIL_RESERVE_NANOS = 2_000_000L;
     private static final long MIN_SLICE_NANOS = 500_000L;
     private static final long MAX_SLICE_NANOS = 1_000_000L;
     private static final long AGING_INTERVAL_NANOS = 250_000_000L;
@@ -53,8 +56,6 @@ public final class NavigationScheduler {
     private long accountingStarted;
     private LongSupplier clock = System::nanoTime;
     private long chargedNanos;
-    private NavigationBudgetController controller = new NavigationBudgetController();
-    private NavigationBudgetController.Choice tickChoice;
     private BooleanSupplier haveTime;
     private boolean inEnvelope;
     private boolean startSeen;
@@ -124,8 +125,8 @@ public final class NavigationScheduler {
 
     /**
      * Schedules an unmodified synchronous backend as one atomic call. The
-     * scheduler controls when it starts and charges its actual runtime as
-     * budget debt, but cannot preempt it after invocation.
+     * scheduler controls when it starts and charges its actual runtime to the
+     * current tick, but cannot preempt it after invocation.
      */
     public <R> CompletableFuture<R> submitSoft(ResourceKey<Level> dimension,
                                                 UUID owner,
@@ -247,7 +248,6 @@ public final class NavigationScheduler {
         tickStartedNanos = clock.getAsLong();
         chargeAtStart = totalAccounted(tickStartedNanos);
         outsideNavigationNanos = Math.max(0L, chargeAtStart - previousChargeAtEnd);
-        tickChoice = controller.choose();
         inEnvelope = true;
         startSeen = endSeen = false;
         drainEndedNanos = 0L;
@@ -259,11 +259,10 @@ public final class NavigationScheduler {
         requireOpen();
         if (!inEnvelope || startSeen) throw new IllegalStateException("missing envelope or duplicate navigation START");
         startSeen = true;
-        controller.commit(tickChoice);
         long now = clock.getAsLong();
         long active = activeElapsed(now);
-        long grant = tickChoice.grantNanos();
-        balanceAfterRefill = Math.min(grant, tokensNanos - active + grant);
+        // Start a fresh allowance while retaining work already charged inside this tick.
+        balanceAfterRefill = TICK_BUDGET_NANOS - Math.max(0L, totalAccounted(now) - chargeAtStart);
         tokensNanos = balanceAfterRefill + active;
     }
 
@@ -277,11 +276,10 @@ public final class NavigationScheduler {
                 long full = Math.max(0L, now - tickStartedNanos);
                 long navigation = Math.max(0L, chargeAtEnd - chargeAtStart);
                 long tail = Math.max(0L, now - drainEndedNanos - (chargeAtEnd - chargeAtDrainEnd));
-                controller.record(full, navigation, tail);
                 validTicks = increment(validTicks);
                 stopCounts[stopReason.ordinal()] = increment(stopCounts[stopReason.ordinal()]);
                 lastTick = new TickSample(validTicks, full, navigation, outsideNavigationNanos,
-                        tickChoice.grantNanos(), tickChoice.baseEstimateNanos(), tickChoice.tailReserveNanos(),
+                        TICK_BUDGET_NANOS, TAIL_RESERVE_NANOS,
                         tail, balanceAfterRefill, balanceBeforeDrain, availableTokens(now),
                         pendingBeforeDrain, pending.size(), stopReason);
             } else skippedTicks = increment(skippedTicks);
@@ -289,7 +287,6 @@ public final class NavigationScheduler {
             previousChargeAtEnd = chargeAtEnd;
             inEnvelope = startSeen = endSeen = false;
             haveTime = null;
-            tickChoice = null;
             tickStartedNanos = 0L;
         }
     }
@@ -304,8 +301,7 @@ public final class NavigationScheduler {
         balanceBeforeDrain = availableTokens();
         try (TimeAccount ignored = account()) {
             long now = clock.getAsLong();
-            long tickDeadline = tickStartedNanos + NavigationBudgetController.TARGET_NANOS
-                    - tickChoice.tailReserveNanos();
+            long tickDeadline = tickStartedNanos + TARGET_NANOS - TAIL_RESERVE_NANOS;
             long budget = Math.min(Math.max(0L, availableTokens(now)), tickDeadline - now);
             if (!haveTime || !this.haveTime.getAsBoolean()) stopReason = StopReason.SERVER_NO_TIME;
             else if (pending.isEmpty()) stopReason = StopReason.EMPTY;
@@ -506,11 +502,11 @@ public final class NavigationScheduler {
     public enum StopReason { NO_END, EMPTY, BALANCE, HEADROOM, SERVER_NO_TIME, DEPENDENCY, START_THRESHOLD }
 
     public record TickSample(long sequence, long fullNanos, long navigationNanos, long outsideNavigationNanos,
-            long grantNanos, long baseEstimateNanos, long tailReserveNanos, long measuredTailNanos,
+            long grantNanos, long tailReserveNanos, long measuredTailNanos,
             long balanceAfterRefillNanos, long balanceBeforeDrainNanos, long finalBalanceNanos,
             int pendingBeforeDrain, int pendingAfterDrain, StopReason stopReason) {}
 
-    public record BudgetMetrics(long validTicks, long skippedTicks, int historySamples, int runnableRequests,
+    public record BudgetMetrics(long validTicks, long skippedTicks, int runnableRequests,
             int parkedRequests, TickSample lastTick, long emptyStops, long balanceStops, long headroomStops,
             long serverNoTimeStops, long dependencyStops, long thresholdStops) {}
 
@@ -518,7 +514,7 @@ public final class NavigationScheduler {
         requireServerThread();
         int runnable = 0;
         for (BandQueue queue : queues.values()) runnable += queue.size;
-        return new BudgetMetrics(validTicks, skippedTicks, controller.sampleCount(), runnable,
+        return new BudgetMetrics(validTicks, skippedTicks, runnable,
                 Math.max(0, pending.size() - runnable), lastTick, stopCounts[StopReason.EMPTY.ordinal()],
                 stopCounts[StopReason.BALANCE.ordinal()], stopCounts[StopReason.HEADROOM.ordinal()],
                 stopCounts[StopReason.SERVER_NO_TIME.ordinal()], stopCounts[StopReason.DEPENDENCY.ordinal()],

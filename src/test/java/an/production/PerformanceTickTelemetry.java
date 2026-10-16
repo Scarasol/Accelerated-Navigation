@@ -31,7 +31,7 @@ public final class PerformanceTickTelemetry {
         final NavigationScheduler scheduler;
         final long start, charge, outside;
         boolean startSeen, endSeen;
-        long grant = 4_000_000, estimate = -1, reserve = -1;
+        long grant = 4_000_000, reserve = -1;
         long nativeTime;
         Span(NavigationScheduler scheduler, long start, long charge, long outside) {
             this.scheduler = scheduler;
@@ -49,9 +49,6 @@ public final class PerformanceTickTelemetry {
         if (state.current != null) throw new IllegalStateException("nested telemetry envelope");
         return state.current = new Span(scheduler, start, charged, Math.max(0L, charged - state.previousChargeAtEnd));
     }
-    private static long value(Object choice, String method) throws ReflectiveOperationException {
-        return (long) choice.getClass().getMethod(method).invoke(choice);
-    }
     @SubscribeEvent(priority = EventPriority.HIGHEST)
     public void tick(TickEvent.ServerTickEvent event) {
         State state = STATES.get(event.getServer());
@@ -60,14 +57,8 @@ public final class PerformanceTickTelemetry {
         if (event.phase == TickEvent.Phase.START) {
             span.startSeen = true;
             try {
-                Field field = NavigationScheduler.class.getDeclaredField("tickChoice");
-                field.setAccessible(true);
-                Object choice = field.get(span.scheduler);
-                if (choice != null) {
-                    span.grant = value(choice, "grantNanos");
-                    span.estimate = value(choice, "baseEstimateNanos");
-                    span.reserve = value(choice, "tailReserveNanos");
-                }
+                span.grant = NavigationScheduler.class.getField("TICK_BUDGET_NANOS").getLong(null);
+                span.reserve = NavigationScheduler.class.getField("TAIL_RESERVE_NANOS").getLong(null);
             } catch (NoSuchFieldException archivedBaseline) {
                 // The original 4ms scheduler has no controller fields.
             } catch (ReflectiveOperationException failure) { throw new IllegalStateException(failure); }
@@ -94,7 +85,6 @@ public final class PerformanceTickTelemetry {
         sample.addProperty("outsideNavigationNanos", span.outside);
         sample.addProperty("nativeReportedNanos", span.nativeTime);
         sample.addProperty("grantNanos", span.grant);
-        sample.addProperty("baseEstimateNanos", span.estimate);
         sample.addProperty("tailReserveNanos", span.reserve);
         sample.addProperty("finalBalanceNanos", span.scheduler.metrics().availableNanos());
         sample.addProperty("pending", span.scheduler.metrics().pendingRequests());

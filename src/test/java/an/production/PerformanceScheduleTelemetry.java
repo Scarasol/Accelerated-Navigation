@@ -12,7 +12,8 @@ import net.minecraft.server.MinecraftServer;
 
 /** Bounded test-only dispatch and wake timings, without changing scheduler decisions. */
 public final class PerformanceScheduleTelemetry {
-    private static final boolean ENABLED = Boolean.getBoolean("an.production.performanceComparison");
+    private static final boolean ENABLED = Boolean.getBoolean("an.production.performanceComparison")
+            || Boolean.getBoolean("an.production.coldTopology");
     private static final int LIMIT = 100_000;
     private static final Map<String, Field> FIELDS = new HashMap<>();
     private static final Map<Long, Long> WAKES = new HashMap<>();

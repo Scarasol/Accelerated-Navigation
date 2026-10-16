@@ -39,6 +39,32 @@ import java.util.function.Supplier;
 /** Owns worker-side derived topology, searches, and immutable publication state. */
 final class TopologyWorkerRuntime {
 
+    final RuntimeSharedTopology shared = new RuntimeSharedTopology(this);
+
+    void sharedTiming(boolean enabled) {
+        sharedTransition(() -> {
+            shared.timingEnabled = enabled;
+            taskExecutor.timingEnabled = enabled;
+            return null;
+        });
+    }
+    TopologyTaskExecutor.TaskTiming sharedTaskTiming() { return taskExecutor.currentTiming(); }
+    QueryScratch sharedQueryScratch() { return taskExecutor.currentQueryScratch(); }
+    Map<String, Long> sharedScratchMetrics() { return taskExecutor.scratchMetrics(); }
+    boolean sharedQueryMonitorHeld() { return taskExecutor.queryMonitorHeld(); }
+    <T> T sharedTransition(Supplier<T> command) { return runtimeTransition(false, command); }
+    boolean sharedStopping() { requireRuntimeLock(); return closed || stopRequested; }
+    void sharedAfter(Runnable work) { afterRuntimeLock(work); }
+    boolean sharedLockHeld() { return Thread.holdsLock(runtimeLock); }
+    <T> void sharedComplete(CompletableFuture<T> future, T value, Throwable failure) {
+        finishFuture(future, value, failure);
+    }
+    void submitSharedWork(Runnable work, Consumer<TopologyTaskExecutor.TaskHandle> accepted,
+                          Consumer<Throwable> rejected) {
+        submitOutsideRuntimeLock(() -> taskExecutor.submitSearch(NavigationScheduler.Priority.ACTIVE,
+                TopologyTaskExecutor.WorkKind.QUICK_SEARCH, work), accepted, rejected);
+    }
+
     private static final Direction[] DIRECTIONS = Direction.values();
     // One expansion can expose fourteen parent-boundary slots plus its two graph
     // dependencies.  This is a per-search live-wait limit, not a build quota.
@@ -2861,6 +2887,7 @@ final class TopologyWorkerRuntime {
         synchronized (runtimeLock) {
             if (closed || stopRequested) return;
             stopRequested = true;
+            shared.ownerOpen.set(false);
             stopEventPending = true;
             recordPendingEvent();
             schedule = !eventTaskOutstanding;
@@ -2881,6 +2908,7 @@ final class TopologyWorkerRuntime {
             return;
         }
         closed = true;
+        shared.close();
         stopEventPending = false;
         IllegalStateException stopped = new IllegalStateException("topology service stopped");
         for (MacroRequest request : List.copyOf(macroRequests)) {

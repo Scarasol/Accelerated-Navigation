@@ -29,6 +29,8 @@ public final class TickBoundaryLoadProbe {
     private SegmentedNavigationService service;
     private Field envelope;
     private int tick;
+    private long readyNanos;
+    private boolean controlsDone;
     private boolean closing;
     private Throwable failure;
     private CompletableFuture<Integer> atom;
@@ -45,16 +47,18 @@ public final class TickBoundaryLoadProbe {
     @SubscribeEvent public void started(ServerStartedEvent event) {
         server = event.getServer();
         try {
-            ProductionBudgetChecks.run(server);
             scheduler = NavigationScheduler.forServer(server);
             service = SegmentedNavigationService.forServer(server);
             envelope = NavigationScheduler.class.getDeclaredField("inEnvelope"); envelope.setAccessible(true);
+            readyNanos = System.nanoTime();
         } catch (Throwable problem) { abort(problem); }
     }
     @SubscribeEvent(priority = EventPriority.HIGHEST)
     public void start(TickEvent.ServerTickEvent event) {
         if (event.getServer() != server || event.phase != TickEvent.Phase.START || closing) return;
+        if (System.nanoTime() - readyNanos < 30_000_000_000L) return;
         try {
+            if (!controlsDone) { ProductionBudgetChecks.run(server); controlsDone = true; }
             tick++;
             var previous = scheduler.budgetMetrics().lastTick();
             if (previous != null) {
@@ -76,6 +80,7 @@ public final class TickBoundaryLoadProbe {
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void end(TickEvent.ServerTickEvent event) {
         if (event.getServer() != server || event.phase != TickEvent.Phase.END || closing) return;
+        if (!controlsDone) return;
         try {
             int stage = stage(tick);
             if (stage == 5) busy(12_000_000);
@@ -102,18 +107,18 @@ public final class TickBoundaryLoadProbe {
             }
             if (tick >= 530) {
                 check("real-long-atomic-call-completes", atom != null && atom.isDone() && atom.join() == 1, "60ms atomic call");
-                boolean zero = false, tail = false, debt = false;
+                boolean fixedGrant = true, fixedTail = true, overshoot = false;
                 long outside = 0;
                 for (var row : samples) {
                     var sample = row.getAsJsonObject();
-                    if (sample.get("stage").getAsInt() == 4 && sample.get("grantNanos").getAsLong() == 0) zero = true;
-                    if (sample.get("stage").getAsInt() == 5 && sample.get("tailReserveNanos").getAsLong() >= 12_000_000) tail = true;
-                    if (sample.get("finalBalanceNanos").getAsLong() < 0) debt = true;
+                    fixedGrant &= sample.get("grantNanos").getAsLong() == NavigationScheduler.TICK_BUDGET_NANOS;
+                    fixedTail &= sample.get("tailReserveNanos").getAsLong() == NavigationScheduler.TAIL_RESERVE_NANOS;
+                    if (sample.get("finalBalanceNanos").getAsLong() < 0) overshoot = true;
                     outside += sample.get("outsideNavigationNanos").getAsLong();
                 }
-                check("48ms-base-load-selects-zero", zero, "no forced minimum");
-                check("unknown-end-tail-is-learned", tail, "measured >=12ms tail");
-                check("atomic-overrun-keeps-debt", debt, "actual negative balances");
+                check("tick-grant-remains-fixed", fixedGrant, NavigationScheduler.TICK_BUDGET_NANOS);
+                check("tail-reserve-remains-fixed", fixedTail, NavigationScheduler.TAIL_RESERVE_NANOS);
+                check("atomic-overrun-records-overshoot", overshoot, "actual negative balances within each tick");
                 Set<Integer> outsideStages = new HashSet<>();
                 for (var row : tasks) if (!row.getAsJsonObject().get("inEnvelope").getAsBoolean())
                     outsideStages.add(row.getAsJsonObject().get("stage").getAsInt());

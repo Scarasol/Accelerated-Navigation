@@ -8,6 +8,7 @@ import java.util.Objects;
 import java.util.TreeMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
@@ -22,7 +23,39 @@ final class TopologyTaskExecutor {
     private final NavigableMap<TaskKey, Task> foreground = new TreeMap<>();
     private final NavigableMap<Long, Task> prewarm = new TreeMap<>();
     private final ThreadLocal<Task> currentTask = new ThreadLocal<>();
+    private final ThreadLocal<QueryScratch> queryScratch = new ThreadLocal<>();
+    private final AtomicLong scratchCreated = new AtomicLong(), scratchCleared = new AtomicLong();
     private final Thread[] workers = new Thread[WORKER_COUNT];
+    volatile boolean timingEnabled;
+    record TaskTiming(long sequence, long enqueuedNs, long selectedNs,
+                      long queueAtEnqueue, long queueAtSelection) {}
+
+    QueryScratch currentQueryScratch() {
+        if (currentTask.get() == null)
+            throw new IllegalStateException("query scratch requires an actual worker task");
+        var scratch = queryScratch.get();
+        if (scratch == null) {
+            scratch = new QueryScratch();
+            queryScratch.set(scratch);
+            scratchCreated.incrementAndGet();
+        }
+        return scratch;
+    }
+
+    Map<String, Long> scratchMetrics() {
+        long created = scratchCreated.get(), cleared = scratchCleared.get();
+        long alive = java.util.Arrays.stream(workers).filter(Thread::isAlive).count();
+        return Map.of("created", created, "cleared", cleared, "live", created - cleared, "aliveWorkers", alive);
+    }
+
+    boolean queryMonitorHeld() { return Thread.holdsLock(monitor); }
+
+    TaskTiming currentTiming() {
+        Task task = currentTask.get();
+        return !timingEnabled || task == null ? null
+                : new TaskTiming(task.sequence, task.enqueuedNanos, task.selectedNs,
+                        task.queueAtEnqueue, task.queueAtSelection);
+    }
 
     private boolean accepting = true;
     private boolean buildRunning;
@@ -190,6 +223,16 @@ final class TopologyTaskExecutor {
     }
 
     private void run() {
+        try {
+            runTasks();
+        } finally {
+            var scratch = queryScratch.get();
+            queryScratch.remove();
+            if (scratch != null) scratchCleared.incrementAndGet();
+        }
+    }
+
+    private void runTasks() {
         while (true) {
             Task task;
             synchronized (monitor) {
@@ -327,6 +370,10 @@ final class TopologyTaskExecutor {
             }
             buildRunning = true;
         }
+        if (timingEnabled) {
+            selected.selectedNs = System.nanoTime();
+            selected.queueAtSelection = queuedByKind[kind];
+        }
         return selected;
     }
 
@@ -392,6 +439,7 @@ final class TopologyTaskExecutor {
         int kind = task.kind.ordinal();
         queuedByKind[kind]++;
         highestQueuedByKind[kind] = Math.max(highestQueuedByKind[kind], queuedByKind[kind]);
+        if (timingEnabled) task.queueAtEnqueue = queuedByKind[kind];
     }
 
     private void queue(Task task) {
@@ -501,6 +549,7 @@ final class TopologyTaskExecutor {
         private NavigationScheduler.Priority nextPriority;
         private WorkKind nextKind;
         private long enqueuedNanos;
+        private long selectedNs, queueAtEnqueue, queueAtSelection;
         private NavigationScheduler.Priority priority;
         private WorkKind kind;
         private TaskState state = TaskState.QUEUED;

@@ -69,7 +69,8 @@ public final class ProductionNavigationProbe {
     private NavigationRequestPath request;
     private JsonArray routeInputs;
     private int tick,phase,phaseTick,routeIndex=Integer.getInteger("an.production.routeStart",0);
-    private boolean closing;
+    private boolean closing, controlsDone;
+    private long readyNanos;
     private int targetMoves;
     private int recomputations;
     private int semanticChanges;
@@ -85,14 +86,18 @@ public final class ProductionNavigationProbe {
     private Throwable failure;
     public ProductionNavigationProbe() {
         PerformanceTickTelemetry.register();
-        MinecraftForge.EVENT_BUS.register(Boolean.getBoolean("an.production.tickBoundaryLoad")
+        Object probe=Boolean.getBoolean("an.production.coldTopology")
+                ? new ColdTopologyProbe() : Boolean.getBoolean("an.production.sharedTopology")
+                ? new SharedTopologyProductionProbe() : Boolean.getBoolean("an.production.tickBoundaryLoad")
                 ? new TickBoundaryLoadProbe() : Boolean.getBoolean("an.production.partialReplay")
                 ? new PartialReplayProbe() : Boolean.getBoolean("an.production.waitBoundaries")
                 ? new HandoffWaitBoundaryProbe() : Boolean.getBoolean("an.production.performanceComparison")
                 ? new PerformanceComparisonProbe() : Boolean.getBoolean("an.production.handoffBoundaries")
                 ? new HandoffBoundaryProbe() : Boolean.getBoolean("an.production.speedDiagnosis")
                 ? new SpeedHandoffProbe() : Boolean.getBoolean("an.production.commandOnly")
-                ? new NavigationCommandProbe() : this);
+                ? new NavigationCommandProbe() : this;
+        MinecraftForge.EVENT_BUS.register(probe == this || probe instanceof ColdTopologyProbe
+                || probe instanceof TickBoundaryLoadProbe ? probe : new ProductionProbeStartGate(probe));
     }
     public static final class TestPig extends Pig {
         public TestPig(ServerLevel level) { super(EntityType.PIG,level);setPersistenceRequired();setInvulnerable(true); }
@@ -136,7 +141,6 @@ public final class ProductionNavigationProbe {
     @SubscribeEvent public void start(ServerStartedEvent event) {
         server=event.getServer();level=server.overworld();
         try {
-            ProductionBudgetChecks.run(server);
             level.getGameRules().getRule(GameRules.RULE_DOMOBSPAWNING).set(false,server);
             level.getGameRules().getRule(GameRules.RULE_RANDOMTICKING).set(0,server);
             level.getGameRules().getRule(GameRules.RULE_DAYLIGHT).set(false,server);level.setDayTime(18000);
@@ -158,17 +162,23 @@ public final class ProductionNavigationProbe {
             nativeTypes.add(spawn(new TestSpider(level),new BlockPos(40,81,26)));
             service=SegmentedNavigationService.forServer(server);
             scheduler=NavigationScheduler.forServer(server);
-            check("production-main-loaded",Class.forName("com.scarasol.acceleratednavigation.AcceleratedNavigation")
-                    .getDeclaredConstructors().length==1,"real main");
-            check("actual-mixin-access",pig.getNavigation() instanceof NavigationAccess,pig.getNavigation().getClass().getName());
-            check("automatic-ground-qualified",AutomaticNavigationBridge.enabled(pig.getNavigation()),"stock GroundPathNavigation");
-            System.out.println("PRODUCTION_CAPABILITIES "+NavigationCapabilities.capture(pig));
+            readyNanos=System.nanoTime();
         } catch(Throwable problem) { abort(problem); }
     }
     @SubscribeEvent(priority=EventPriority.LOWEST) public void end(TickEvent.ServerTickEvent event) {
         if(event.getServer()!=server||event.phase!=TickEvent.Phase.END||closing)return;
+        if(System.nanoTime()-readyNanos<30_000_000_000L)return;
         tick++;
         try {
+            if(!controlsDone) {
+                ProductionBudgetChecks.run(server);
+                check("production-main-loaded",Class.forName("com.scarasol.acceleratednavigation.AcceleratedNavigation")
+                        .getDeclaredConstructors().length==1,"real main");
+                check("actual-mixin-access",pig.getNavigation() instanceof NavigationAccess,pig.getNavigation().getClass().getName());
+                check("automatic-ground-qualified",AutomaticNavigationBridge.enabled(pig.getNavigation()),"stock GroundPathNavigation");
+                controlsDone=true;
+                System.out.println("PRODUCTION_CAPABILITIES "+NavigationCapabilities.capture(pig));
+            }
             JsonObject sample=new JsonObject();sample.addProperty("tick",tick);sample.addProperty("phase",phase);
             sample.addProperty("tickNanos",System.nanoTime()-tickStarted);
             var budget=NavigationScheduler.forServer(server).metrics();

@@ -1,0 +1,64 @@
+allprojects {
+    afterEvaluate {
+        def evidence = rootProject.file(project.findProperty('sharedEvidence') ?: '.tmp/shared-topology-production-20261015/core-v1')
+        tasks.register('sharedSizeAgentJar', Jar) {
+            dependsOn tasks.named('testClasses')
+            from(sourceSets.test.output) {
+                include 'com/scarasol/acceleratednavigation/topology/SizeAgent.class'
+            }
+            manifest { attributes('Premain-Class': 'com.scarasol.acceleratednavigation.topology.SizeAgent') }
+            archiveFileName = 'shared-size-agent.jar'
+            destinationDirectory = rootProject.file('build/navigation-verification')
+        }
+        tasks.register('sharedOwnershipAgentJar', Jar) {
+            dependsOn tasks.named('testClasses')
+            from(sourceSets.test.output) {
+                include 'com/scarasol/acceleratednavigation/topology/SharedOwnershipAgent*.class'
+            }
+            from({
+                configurations.testRuntimeClasspath.findAll { it.name.startsWith('asm-') }
+                    .collect { zipTree(it) }
+            }) {
+                exclude 'module-info.class', 'META-INF/versions/**/module-info.class'
+            }
+            duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+            manifest { attributes('Premain-Class': 'com.scarasol.acceleratednavigation.topology.SharedOwnershipAgent') }
+            archiveFileName = 'shared-ownership-agent.jar'
+            destinationDirectory = rootProject.file('build/navigation-verification')
+        }
+        tasks.register('verifySharedSupplement', JavaExec) {
+            dependsOn tasks.named('testClasses'), tasks.named('sharedOwnershipAgentJar')
+            classpath = sourceSets.test.runtimeClasspath
+            mainClass = 'com.scarasol.acceleratednavigation.topology.SharedTopologySupplementProbe'
+            args new File(evidence,'supplement.json').absolutePath
+            jvmArgs '-Xms256m', '-Xmx1024m',
+                '--add-opens=java.base/java.util=ALL-UNNAMED',
+                '--add-opens=java.base/java.lang=ALL-UNNAMED',
+                '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED',
+                '--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED',
+                '--add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED',
+                '-javaagent:' + rootProject.file('build/navigation-verification/shared-ownership-agent.jar').absolutePath
+            doFirst {
+                evidence.mkdirs()
+                if (new File(evidence,'supplement.json').exists()) throw new GradleException('Preserve supplementary evidence')
+            }
+        }
+        [
+            ['verifySharedRuntime', 'SharedRuntimeProbe', 'runtime.json'],
+            ['verifySharedScratch', 'ScratchControls', 'scratch.json']
+        ].each { spec ->
+            tasks.register(spec[0], JavaExec) {
+                dependsOn tasks.named('testClasses'), tasks.named('sharedSizeAgentJar')
+                classpath = sourceSets.test.runtimeClasspath
+                mainClass = 'com.scarasol.acceleratednavigation.topology.' + spec[1]
+                args new File(evidence,spec[2]).absolutePath
+                jvmArgs '-Xms256m', '-Xmx1024m', '--add-opens=java.base/java.util=ALL-UNNAMED',
+                    '-javaagent:' + rootProject.file('build/navigation-verification/shared-size-agent.jar').absolutePath
+                doFirst {
+                    evidence.mkdirs()
+                    if (new File(evidence,spec[2]).exists()) throw new GradleException('Preserve existing shared evidence')
+                }
+            }
+        }
+    }
+}

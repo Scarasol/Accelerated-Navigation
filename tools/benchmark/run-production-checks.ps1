@@ -1,11 +1,13 @@
 param(
     [Parameter(Mandatory)][ValidatePattern('^[a-z0-9-]+$')][string]$Run,
-    [ValidateSet('lifecycle','speed','boundaries','wait','tick-load','replay')][string]$Probe = 'lifecycle',
+    [ValidateSet('lifecycle','speed','boundaries','wait','tick-load','replay','shared','cold')][string]$Probe = 'lifecycle',
     [string]$ProductionJar = 'build/libs/accelerated_navigation-0.1.0-all.jar',
     [string]$ProbeJar = 'build/reobfProductionProbeJar/output.jar',
     [string]$ReplaySource,
     [string]$ReplayControl,
-    [ValidatePattern('^\.tmp/[a-z0-9-]+$')][string]$EvidenceRoot = '.tmp/navigation-dynamic-budget-production-20261014'
+    [ValidatePattern('^\.tmp/[a-z0-9-]+$')][string]$EvidenceRoot = '.tmp/navigation-dynamic-budget-production-20261014',
+    [ValidateSet('same','base','super')][string]$ColdRoute = 'same',
+    [switch]$ColdStages
 )
 $ErrorActionPreference = 'Stop'
 $taskWorkspace = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../..')).Path
@@ -38,7 +40,9 @@ if ($Probe -in @('lifecycle','speed','boundaries')) {
     Copy-Item -LiteralPath (Join-Path $taskWorkspace '.tmp/segment-execution-validation-20261012/stages.json') -Destination (Join-Path $taskRunPath 'stages.json')
     Copy-Item -LiteralPath (Join-Path $taskWorkspace '.tmp/navigation-command-entity-20261013/server-speed/mods/lostcities.jar') -Destination (Join-Path $taskRunPath 'mods/lostcities.jar')
 }
-$taskProperties = if ($Probe -in @('lifecycle','speed','boundaries')) {
+$taskProperties = if ($Probe -in @('shared','cold')) {
+    'tools/benchmark/shared-server.properties'
+} elseif ($Probe -in @('lifecycle','speed','boundaries')) {
     '.tmp/segment-landing-fix-20261012/resources/server.properties'
 } else { 'tools/benchmark/performance-server.properties' }
 foreach ($taskPair in @(@('run/eula.txt','eula.txt'), @($taskProperties,'server.properties'),
@@ -49,7 +53,9 @@ foreach ($taskPair in @(@('run/eula.txt','eula.txt'), @($taskProperties,'server.
 $taskOptions = @{
     lifecycle='-Dan.production.routeStart=0'; speed='-Dan.production.speedDiagnosis=true';
     boundaries='-Dan.production.handoffBoundaries=true'; wait='-Dan.production.waitBoundaries=true';
-    'tick-load'='-Dan.production.tickBoundaryLoad=true'; replay='-Dan.production.partialReplay=true'
+    'tick-load'='-Dan.production.tickBoundaryLoad=true'; replay='-Dan.production.partialReplay=true';
+    shared='-Dan.production.sharedTopology=true'
+    cold='-Dan.production.coldTopology=true'
 }
 $env:MOD_CLASSES = $null
 $env:MCP_MAPPINGS = $null
@@ -62,11 +68,15 @@ if ($ReplaySource) {
     $taskJvmArgs += '-Dan.production.partialReplaySource=' + (Resolve-Path -LiteralPath $ReplaySource).Path
     $taskJvmArgs += '-Dan.production.partialReplayControl=' + (Resolve-Path -LiteralPath $ReplayControl).Path
 }
+if ($Probe -eq 'cold') {
+    $taskJvmArgs += '-Dan.production.coldRoute=' + $ColdRoute
+    if ($ColdStages) { $taskJvmArgs += '-Dan.production.coldStages=true' }
+}
 $taskArgsFile = Join-Path $taskRunPath 'jvm.args'
 [IO.File]::WriteAllLines($taskArgsFile,
     @($taskJvmArgs | ForEach-Object { '"' + $_.Replace('\','/').Replace('"','\"') + '"' }),
     [Text.UTF8Encoding]::new($false))
-@{schema='PRODUCTION_CHECKS_V1';probe=$Probe;productionJar=$ProductionJar;mods=@(
+@{schema='PRODUCTION_CHECKS_V1';probe=$Probe;productionJar=$ProductionJar;coldRoute=$ColdRoute;coldStages=[bool]$ColdStages;mods=@(
     Get-ChildItem -LiteralPath (Join-Path $taskRunPath 'mods') -File | ForEach-Object {
         @{name=$_.Name;sha256=(Get-FileHash -LiteralPath $_.FullName).Hash}
     })} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $taskRunPath 'launch-environment.json') -Encoding utf8
@@ -79,14 +89,14 @@ while (-not $taskProcess.WaitForExit(1000)) {
         $taskTimedOut=$true; Stop-Process -Id $taskProcess.Id; $taskProcess.WaitForExit(); break
     }
 }
-@{exitCode=$taskProcess.ExitCode;timedOut=$taskTimedOut;seconds=((Get-Date)-$taskStarted).TotalSeconds;pid=$taskProcess.Id} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $taskRunPath 'exit.json') -Encoding utf8
+@{exitCode=$taskProcess.ExitCode;timedOut=$taskTimedOut;seconds=((Get-Date)-$taskStarted).TotalSeconds;pid=$taskProcess.Id;startedAt=$taskStarted.ToUniversalTime().ToString('o');exitedAt=(Get-Date).ToUniversalTime().ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $taskRunPath 'exit.json') -Encoding utf8
 foreach ($taskInput in $taskInputs) {
     if ((Get-FileHash -LiteralPath $taskInput.source).Hash -ne $taskInput.sha256) { throw 'Source input changed' }
 }
 if ($taskTimedOut -or $taskProcess.ExitCode -ne 0) { throw 'Verification execution failed; evidence retained' }
 $taskResultName = switch ($Probe) {
     lifecycle {'result.json'}; wait {'wait-boundaries.json'}; 'tick-load' {'tick-boundary-load.json'}
-    replay {'partial-replay.json'}; default {'diagnosis.json'}
+    replay {'partial-replay.json'}; shared {'shared-production.json'}; cold {'cold-topology.json'}; default {'diagnosis.json'}
 }
 $taskResult = Get-Content -LiteralPath (Join-Path $taskRunPath $taskResultName) -Raw | ConvertFrom-Json
 if ($taskResult.failed) { throw ('Verification failed: ' + $taskResult.failure) }

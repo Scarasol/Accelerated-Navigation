@@ -2,6 +2,10 @@
 
 日期：2026-10-14。状态：**研究结论；未修改生产源码，未接入生产，未进行新的性能宣称。**
 
+2026-10-15 进度：[首次请求闭包与骨架前置报告](2026-10-15-navmesh-prerequisites-validation-zh.md)已完成60个独立JVM并取得DeepSeek READY_TO_VALIDATE。用户随后授权的[依赖闭包候选验证](2026-10-15-first-request-closure-validation-zh.md)已经实现并实际运行；先行正确性门通过，135轮交错矩阵于第104轮auto基线派发前失败后中止，103轮检查通过、1失败、31未跑。DeepSeek认可中止及未测值纠正，整体未取得性能资格，不能据此判候选算法失败。Portal骨架尚未实现且本轮不进入，本文后续方向不能视为已验证结论；重测须另列范围并新冻结。
+
+同日后续：[Portal/Boundary 源锚点骨架](2026-10-15-portal-boundary-skeleton-validation-zh.md)已按用户新授权独立实现和验证。当前“完整Base后提取源坐标mask”与旧bbox在现组件/邻槽规则下等价，不能新增依赖剪枝；稀疏枚举性能仅部分样本，新27矩阵在第12轮C/plain移动阶段失败后中止，11完成/1失败/15未跑，未取得性能资格。DeepSeek最终认可封存该依赖缩减候选、不接入及忠实中止报告，必改无；不外推其他骨架/目标边界几何或Base之前构法，不恢复预算等支线，也不把旧“未实现”快照当当前状态。
+
 本文承接 [NavMesh 冷图准备调查](2026-10-13-navmesh-cold-preparation-research-zh.md)、[派生拓扑懒惰升级研究方案](../designs/2026-10-14-derived-topology-lazy-upgrade-research-plan-zh.md) 及其验证记录。唯一生产规范仍是 [原版详细寻路接入现行契约](../designs/2026-10-13-native-detail-navigation-contract-zh.md)。旧设计、旧审核和已废弃的三 tick/四 tick方案不参与本研究。
 
 本文只回答一个问题：在另一会话已开展的“Base 派生持久化、有界异步恢复、热点预热、共享表示和局部升级”研究之外，是否还有办法减少冷启动等待。Base 编码原型已验证，异步原型仍有审核及 future 结算问题；共享局部差异尚未实现持久化，不能把这些方向合并称为已经验证通过。可以继续研究首次请求依赖范围，再根据阶段计时决定是否做格式或构图内核改造。NavMesh 只提供分块、边界和构建流水线方面的参考，不能替换 Minecraft 的真实 `PathFinder`。

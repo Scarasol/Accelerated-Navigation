@@ -3,6 +3,6 @@
   "minVersion": "0.8",
   "package": "an.production.mixin",
   "compatibilityLevel": "JAVA_17",
-  "mixins": ["PerformancePathFinderMixin", "PerformanceTickMixin", "PerformanceScheduleMixin", "HandoffWaitBoundaryMixin", "HandoffMoveControlMixin", "NativeReplayMixin"],
+  "mixins": ["PerformancePathFinderMixin", "PerformanceTickMixin", "PerformanceScheduleMixin", "HandoffWaitBoundaryMixin", "HandoffMoveControlMixin", "NativeReplayMixin", "SharedSubmissionRejectionMixin", "SharedUnavailableRejectionMixin"],
   "injectors": {"defaultRequire": 1}
 }

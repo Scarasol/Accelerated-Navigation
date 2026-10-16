@@ -13,8 +13,20 @@ allprojects {
             archiveFileName = 'production-probe.jar'
             destinationDirectory = rootProject.file('build/navigation-verification')
         }
-        reobf { productionProbeJar {} }
+        tasks.register('coldTopologyProbeJar', Jar) {
+            from(sourceSets.test.output) {
+                include 'an/**', 'META-INF/mods.toml', 'an_cold.mixins.json'
+            }
+            manifest { attributes('MixinConfigs': 'an_cold.mixins.json') }
+            archiveFileName = 'cold-topology-probe.jar'
+            destinationDirectory = rootProject.file('build/navigation-verification')
+        }
+        reobf { productionProbeJar {}; coldTopologyProbeJar {} }
         tasks.named('reobfProductionProbeJar').configure {
+            libraries.from(tasks.named('productionProbeHierarchyJar').flatMap { it.archiveFile })
+            dependsOn tasks.named('productionProbeHierarchyJar')
+        }
+        tasks.named('reobfColdTopologyProbeJar').configure {
             libraries.from(tasks.named('productionProbeHierarchyJar').flatMap { it.archiveFile })
             dependsOn tasks.named('productionProbeHierarchyJar')
         }

@@ -607,7 +607,7 @@ public final class BaseClusterTopology {
         return new PrimitiveEdges(offsets, targets, capabilities, lowerBounds);
     }
 
-    private static boolean movementEnvelopeOpen(int x,
+    static boolean movementEnvelopeOpen(int x,
                                                 int y,
                                                 int z,
                                                 Direction direction,
@@ -873,6 +873,16 @@ public final class BaseClusterTopology {
             for (PackedFacts fact : facts) consumer.accept(fact);
         }
 
+        BuildInput withFacts(PackedFacts replacementCenter, Map<Integer, PackedFacts> replacements) {
+            PackedFacts[] next = facts.clone();
+            long[] nextFingerprints = fingerprints.clone();
+            for (int index = 0; index < offsets.length; index++) {
+                next[index] = Objects.requireNonNull(replacements.get(Byte.toUnsignedInt(offsets[index])));
+                nextFingerprints[index] = next[index].fingerprint();
+            }
+            return new BuildInput(replacementCenter, offsets, next, revisions, nextFingerprints);
+        }
+
         int referenceBytes() {
             return 128 + offsets.length + facts.length * Long.BYTES
                     + (revisions.length + fingerprints.length) * Long.BYTES;
@@ -1123,6 +1133,10 @@ public final class BaseClusterTopology {
         final int[] parentStackEdges = new int[MAX_PARENT_NODES];
         final int[] parentComponents = new int[MAX_PARENT_NODES];
         final boolean[] parentVisited = new boolean[MAX_PARENT_NODES];
+
+        long[] localPrismMask() {
+            return prismMask;
+        }
 
         private void reset() {
             Arrays.fill(labels, (char) 0);
