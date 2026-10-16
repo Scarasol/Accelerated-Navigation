@@ -10,9 +10,12 @@ import net.minecraft.util.ZeroBitStorage;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.lang.ref.WeakReference;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
+import java.util.WeakHashMap;
 import java.util.function.Consumer;
 
 /** One immutable macro traversal view for a section generation and normalized geometry. */
@@ -334,32 +337,7 @@ public final class BaseClusterTopology {
     private static void deriveLegalAnchors(BuildInput input,
                                            GeometryKey geometry,
                                            BuildScratch scratch) {
-        int minimum = minimumFootprintOffset(geometry.widthCells(), 0);
-        int maximum = minimumFootprintOffset(geometry.widthCells(),
-                (geometry.widthCells() & 1) == 0 ? 1 : 0) + geometry.widthCells() - 1;
-        int maximumY = geometry.channel() == Channel.GROUND
-                ? SIDE + geometry.heightCells() - 1
-                : SIDE + geometry.heightCells() - 2;
-        for (int y = 0; y <= maximumY; y++) {
-            for (int z = minimum; z <= SIDE - 1 + maximum; z++) {
-                int volume = 0;
-                int ground = 0;
-                for (int x = minimum; x <= SIDE - 1 + maximum; x++) {
-                    int flags = input.flags(x, y, z, scratch);
-                    if ((geometry.acceptsFluid() || (flags & FLUID) == 0)
-                            && input.volumeOpen(x, y, z, geometry, scratch)) {
-                        volume |= 1 << (x - EXTENDED_MIN);
-                    }
-                    if (y < SIDE && (geometry.acceptsFluid() || (flags & FLUID) == 0)
-                            && input.groundOpen(x, y, z, flags, geometry, scratch)) {
-                        ground |= 1 << (x - EXTENDED_MIN);
-                    }
-                }
-                int row = z - EXTENDED_MIN;
-                scratch.volumeRows[y * EXTENDED_SIDE + row] = volume;
-                if (y < SIDE) scratch.groundRows[y * EXTENDED_SIDE + row] = ground;
-            }
-        }
+        scratch.rawRows.fill(input, geometry, scratch);
 
         int alignments = (geometry.widthCells() & 1) == 0 ? 4 : 1;
         for (int alignment = 0; alignment < alignments; alignment++) {
@@ -1115,6 +1093,7 @@ public final class BaseClusterTopology {
     /** Reused by the single topology worker; never retained by a published graph. */
     static final class BuildScratch {
         private static final int MAX_PARENT_NODES = CELL_COUNT * 8;
+        private final RawRows rawRows = new RawRows();
         private final char[] labels = new char[CELL_COUNT];
         private final int[] queue = new int[CELL_COUNT];
         private final long[] componentMetadata = new long[CELL_COUNT];
@@ -1149,6 +1128,10 @@ public final class BaseClusterTopology {
             edgeMap.clear();
         }
 
+        synchronized void clearCachedRows() {
+            rawRows.clear();
+        }
+
         int retainedBytes() {
             return labels.length * Character.BYTES + queue.length * Integer.BYTES
                     + componentMetadata.length * Long.BYTES
@@ -1157,7 +1140,136 @@ public final class BaseClusterTopology {
                     + fullCollisionRows.length) * Integer.BYTES
                     + haloUsed.length + (parentCounts.length + parentCursors.length
                     + parentOrder.length + parentStackNodes.length + parentStackEdges.length
-                    + parentComponents.length) * Integer.BYTES + parentVisited.length;
+                    + parentComponents.length) * Integer.BYTES + parentVisited.length
+                    + rawRows.retainedBytes();
+        }
+    }
+
+    /** Shared only by the serial build permit; entries contain no source or body references. */
+    private static final class RawRows {
+        private static final int MAX_SOURCES = 64;
+        // PackedFacts is final and inherits Object equality, so weak keys use source identity.
+        private final WeakHashMap<PackedFacts, Rows> rows = new WeakHashMap<>();
+        private final ArrayDeque<WeakReference<PackedFacts>> order = new ArrayDeque<>();
+
+        private static final class Rows {
+            private final long[] values = new long[SIDE * SIDE];
+            private final long[] ready = new long[SIDE * SIDE / Long.SIZE];
+        }
+
+        private void clear() {
+            rows.clear();
+            order.clear();
+        }
+
+        private int retainedBytes() {
+            return 1024 + rows.size() * 2304;
+        }
+
+        private static long compact(long word) {
+            long value = word & 0x1111111111111111L;
+            value = (value | value >>> 3) & 0x0303030303030303L;
+            value = (value | value >>> 6) & 0x000F000F000F000FL;
+            value = (value | value >>> 12) & 0x000000FF000000FFL;
+            return (value | value >>> 24) & 0xffffL;
+        }
+
+        private long row(PackedFacts source, int y, int z) {
+            Rows entry = rows.get(source);
+            if (entry == null) {
+                while (!order.isEmpty()
+                        && (order.peekFirst().get() == null || order.size() >= MAX_SOURCES)) {
+                    PackedFacts removed = order.removeFirst().get();
+                    if (removed != null) rows.remove(removed);
+                }
+                entry = new Rows();
+                rows.put(source, entry);
+                order.addLast(new WeakReference<>(source));
+            }
+            int index = (y << 4) | z;
+            if ((entry.ready[index >>> 6] & (1L << index)) == 0) {
+                long packed = source.packedRow(index);
+                entry.values[index] = compact(packed) | compact(packed >>> 1) << 16
+                        | compact(packed >>> 2) << 32 | compact(packed >>> 3) << 48;
+                entry.ready[index >>> 6] |= 1L << index;
+            }
+            return entry.values[index];
+        }
+
+        private void fill(BuildInput input, GeometryKey body, BuildScratch scratch) {
+            int width = body.widthCells();
+            int minimum = -(width >>> 1);
+            int maximum = minimum + ((width & 1) == 0 ? 1 : 0) + width - 1;
+            int maxY = SIDE + body.heightCells() - (body.channel() == Channel.GROUND ? 1 : 2);
+            boolean doorGround = input.hasDoors && body.canOpenDoors();
+            for (int y = 0; y <= maxY; y++) {
+                for (int z = minimum; z <= SIDE - 1 + maximum; z++) {
+                    int volume = 0;
+                    int ground = 0;
+                    int sy = Math.floorDiv(y, SIDE);
+                    int sz = Math.floorDiv(z, SIDE);
+                    for (int sx = Math.floorDiv(minimum, SIDE);
+                         sx <= Math.floorDiv(SIDE - 1 + maximum, SIDE); sx++) {
+                        int from = Math.max(minimum, sx * SIDE);
+                        int to = Math.min(SIDE - 1 + maximum, sx * SIDE + SIDE - 1);
+                        int localMask = ((1 << (to - from + 1)) - 1) << Math.floorMod(from, SIDE);
+                        PackedFacts source;
+                        if ((sx | sy | sz) == 0) {
+                            source = input.center;
+                        } else {
+                            int index = Arrays.binarySearch(input.offsets, (byte) haloIndex(sx, sy, sz));
+                            if (index < 0) {
+                                // groundOpen can still read an already loaded halo below a missing section.
+                                if (!doorGround || y >= SIDE) continue;
+                                source = null;
+                            } else {
+                                scratch.haloUsed[index] = true;
+                                source = input.facts[index];
+                            }
+                        }
+                        long raw = source == null ? 0 : row(source, y & 15, z & 15);
+                        int v = (int) raw & 0xffff;
+                        int g = (int) (raw >>> 16) & 0xffff;
+                        int fluid = (int) (raw >>> 32) & 0xffff;
+                        int exact = (int) (raw >>> 48) & 0xffff;
+                        // Match flags(): only center y=0 infers ground support from the lower halo.
+                        if ((sx | sy | sz) == 0 && y == 0 && (v & localMask) != 0) {
+                            int lower = Arrays.binarySearch(input.offsets, (byte) haloIndex(0, -1, 0));
+                            if (lower >= 0) {
+                                scratch.haloUsed[lower] = true;
+                                long below = row(input.facts[lower], SIDE - 1, z);
+                                g |= v & (~(int) below | (int) (below >>> 48));
+                            }
+                        }
+                        int accepted = localMask & (body.acceptsFluid() ? 0xffff : ~fluid);
+                        if (doorGround && y < SIDE) {
+                            int adjusted = 0;
+                            for (int pending = accepted; pending != 0; pending &= pending - 1) {
+                                int x = Integer.numberOfTrailingZeros(pending);
+                                int flags = ((v >>> x) & 1) * VOLUME_OPEN
+                                        | ((g >>> x) & 1) * GROUND_OPEN
+                                        | ((fluid >>> x) & 1) * FLUID
+                                        | ((exact >>> x) & 1) * EXACT_REQUIRED;
+                                if (input.groundOpen(sx * SIDE + x, y, z, flags, body, scratch)) {
+                                    adjusted |= 1 << x;
+                                }
+                            }
+                            g = adjusted;
+                        }
+                        v &= accepted;
+                        g &= accepted;
+                        for (int pending = v & exact; pending != 0; pending &= pending - 1) {
+                            int x = Integer.numberOfTrailingZeros(pending);
+                            if (!input.volumeOpen(sx * SIDE + x, y, z, body, scratch)) v &= ~(1 << x);
+                        }
+                        int shift = sx * SIDE - EXTENDED_MIN;
+                        volume |= shift >= 0 ? v << shift : v >>> -shift;
+                        ground |= shift >= 0 ? g << shift : g >>> -shift;
+                    }
+                    scratch.volumeRows[y * EXTENDED_SIDE + z - EXTENDED_MIN] = volume;
+                    if (y < SIDE) scratch.groundRows[y * EXTENDED_SIDE + z - EXTENDED_MIN] = ground;
+                }
+            }
         }
     }
 
@@ -1242,6 +1354,16 @@ public final class BaseClusterTopology {
             }
             long combined = fingerprint ^ Long.rotateLeft(geometry.fingerprint(), 17);
             return new PackedFacts(packed, -1, combined, geometry);
+        }
+
+        private long packedRow(int row) {
+            if (uniformFlags >= 0) return 0x1111111111111111L * uniformFlags;
+            int offset = row << 3;
+            long packed = 0L;
+            for (int index = 0; index < Long.BYTES; index++) {
+                packed |= (long) Byte.toUnsignedInt(data[offset + index]) << (index * Byte.SIZE);
+            }
+            return packed;
         }
 
         int flags(int cell) {

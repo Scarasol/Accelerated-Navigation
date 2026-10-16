@@ -2899,7 +2899,9 @@ final class TopologyWorkerRuntime {
     boolean awaitStopped(long timeout, TimeUnit unit) {
         beginStopping();
         finishFactClosing();
-        return taskExecutor.awaitTermination(timeout, unit);
+        boolean stopped = taskExecutor.awaitTermination(timeout, unit);
+        if (stopped) buildScratch.clearCachedRows();
+        return stopped;
     }
 
     private void closeState() {
