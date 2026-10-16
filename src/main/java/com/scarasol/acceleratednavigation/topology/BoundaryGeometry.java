@@ -5,14 +5,19 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
-import java.util.TreeSet;
 
 /** Build-local collision checks over the immutable facts owned by the two Base views. */
 final class BoundaryGeometry {
-    private record Rect(double minS, double minY, double maxS, double maxY) {}
+    private static final double[] NO_DOUBLES = new double[0];
+    private static final int[] NO_INTS = new int[0];
+    private static final boolean[] NO_BOOLEANS = new boolean[0];
+
+    private double[] rectangles = NO_DOUBLES;
+    private double[] xs = NO_DOUBLES, ys = NO_DOUBLES;
+    private boolean[] visited = NO_BOOLEANS;
+    private int[] queue = NO_INTS;
+    private int rectangleCoordinates;
 
     private final BaseClusterTopology source;
     private final BaseClusterTopology target;
@@ -38,6 +43,11 @@ final class BoundaryGeometry {
         }
         long key = SectionPos.asLong(sx, sy, sz);
         if (sections.containsKey(key)) return sections.get(key);
+        return resolveSection(key, sx, sy, sz);
+    }
+
+    @Nullable
+    private SectionGeometry resolveSection(long key, int sx, int sy, int sz) {
         int ax = sx - source.section().x(), ay = sy - source.section().y(), az = sz - source.section().z();
         int bx = sx - target.section().x(), by = sy - target.section().y(), bz = sz - target.section().z();
         BaseClusterTopology.PackedFacts a = source.boundaryFacts().atSection(ax, ay, az);
@@ -65,7 +75,7 @@ final class BoundaryGeometry {
         int minZ = (int) Math.floor(Math.min(z + .5, z + .5 + direction.getStepZ() * distance) - half);
         int maxZ = (int) Math.ceil(Math.max(z + .5, z + .5 + direction.getStepZ() * distance) + half) - 1;
         int minY = (int) Math.floor(y + lowY), maxY = (int) Math.ceil(y + highY + height) - 1;
-        List<Rect> obstacles = new ArrayList<>();
+        rectangleCoordinates = 0;
         for (int cy = minY; cy <= maxY; cy++) for (int cz = minZ; cz <= maxZ; cz++) {
             for (int cx = minX; cx <= maxX; cx++) {
                 SectionGeometry geometry = at(cx, cy, cz);
@@ -84,54 +94,68 @@ final class BoundaryGeometry {
                     double a = sign > 0 ? aS - originS - half : originS - bS - half;
                     double b = sign > 0 ? bS - originS + half : originS - aS + half;
                     if (a >= distance || b <= 0 || aY >= highY || bY <= lowY) continue;
-                    obstacles.add(new Rect(a, aY, b, bY));
+                    if (rectangleCoordinates + 4 > rectangles.length) {
+                        rectangles = Arrays.copyOf(rectangles, Math.max(32, rectangles.length * 2));
+                    }
+                    rectangles[rectangleCoordinates++] = a;
+                    rectangles[rectangleCoordinates++] = aY;
+                    rectangles[rectangleCoordinates++] = b;
+                    rectangles[rectangleCoordinates++] = bY;
                 }
             }
         }
-        if (!pointClear(0, 0, obstacles) || !pointClear(distance, dy, obstacles)) return false;
+        if (!pointClear(0, 0) || !pointClear(distance, dy)) return false;
         double up = Math.max(0, dy), down = Math.min(0, dy);
-        if (segmentClear(0, 0, 0, up, obstacles)
-                && segmentClear(0, up, distance, up, obstacles)
-                && segmentClear(distance, up, distance, dy, obstacles)) return true;
-        if (segmentClear(0, 0, 0, down, obstacles)
-                && segmentClear(0, down, distance, down, obstacles)
-                && segmentClear(distance, down, distance, dy, obstacles)) return true;
-        for (Rect r : obstacles) {
-            if (r.minY < lowY && r.maxY > highY && r.minS < distance && r.maxS > 0) return false;
+        if (segmentClear(0, 0, 0, up)
+                && segmentClear(0, up, distance, up)
+                && segmentClear(distance, up, distance, dy)) return true;
+        if (segmentClear(0, 0, 0, down)
+                && segmentClear(0, down, distance, down)
+                && segmentClear(distance, down, distance, dy)) return true;
+        for (int i = 0; i < rectangleCoordinates; i += 4) {
+            if (rectangles[i + 1] < lowY && rectangles[i + 3] > highY
+                    && rectangles[i] < distance && rectangles[i + 2] > 0) return false;
         }
-        if (blocksAtCut(obstacles, distance * .5, lowY, highY)) return false;
+        if (blocksAtCut(distance * .5, lowY, highY)) return false;
 
-        TreeSet<Double> scuts = new TreeSet<>(), ycuts = new TreeSet<>();
-        scuts.add(0.); scuts.add((double) distance);
-        ycuts.add(0.); ycuts.add((double) dy); ycuts.add(lowY); ycuts.add(highY);
-        for (Rect r : obstacles) {
-            if (r.minS > 0 && r.minS < distance) scuts.add(r.minS);
-            if (r.maxS > 0 && r.maxS < distance) scuts.add(r.maxS);
-            if (r.minY > lowY && r.minY < highY) ycuts.add(r.minY);
-            if (r.maxY > lowY && r.maxY < highY) ycuts.add(r.maxY);
+        int capacity = rectangleCoordinates / 2 + 4;
+        if (xs.length < capacity) {
+            xs = new double[capacity];
+            ys = new double[capacity];
         }
-        double[] xs = scuts.stream().mapToDouble(Double::doubleValue).toArray();
-        double[] ys = ycuts.stream().mapToDouble(Double::doubleValue).toArray();
-        int count = xs.length * ys.length;
-        int begin = Arrays.binarySearch(ys, 0.) * xs.length;
-        int goal = Arrays.binarySearch(ys, (double) dy) * xs.length + xs.length - 1;
-        boolean[] visited = new boolean[count];
-        int[] queue = new int[count];
+        int nx = 0, ny = 0;
+        xs[nx++] = 0.; xs[nx++] = distance;
+        ys[ny++] = 0.; ys[ny++] = dy; ys[ny++] = lowY; ys[ny++] = highY;
+        for (int i = 0; i < rectangleCoordinates; i += 4) {
+            if (rectangles[i] > 0 && rectangles[i] < distance) xs[nx++] = rectangles[i];
+            if (rectangles[i + 2] > 0 && rectangles[i + 2] < distance) xs[nx++] = rectangles[i + 2];
+            if (rectangles[i + 1] > lowY && rectangles[i + 1] < highY) ys[ny++] = rectangles[i + 1];
+            if (rectangles[i + 3] > lowY && rectangles[i + 3] < highY) ys[ny++] = rectangles[i + 3];
+        }
+        nx = sortUnique(xs, nx);
+        ny = sortUnique(ys, ny);
+        int count = nx * ny;
+        int begin = Arrays.binarySearch(ys, 0, ny, 0.) * nx;
+        int goal = Arrays.binarySearch(ys, 0, ny, (double) dy) * nx + nx - 1;
+        if (visited.length < count) {
+            visited = new boolean[count];
+            queue = new int[count];
+        } else Arrays.fill(visited, 0, count, false);
         visited[begin] = true; queue[0] = begin;
         int head = 0, tail = 1;
         while (head < tail) {
             int current = queue[head++];
             if (current == goal) return true;
-            int ix = current % xs.length, iy = current / xs.length;
+            int ix = current % nx, iy = current / nx;
             for (int edge = 0; edge < 4; edge++) {
                 int next = switch (edge) {
                     case 0 -> ix > 0 ? current - 1 : -1;
-                    case 1 -> ix + 1 < xs.length ? current + 1 : -1;
-                    case 2 -> iy > 0 ? current - xs.length : -1;
-                    default -> iy + 1 < ys.length ? current + xs.length : -1;
+                    case 1 -> ix + 1 < nx ? current + 1 : -1;
+                    case 2 -> iy > 0 ? current - nx : -1;
+                    default -> iy + 1 < ny ? current + nx : -1;
                 };
                 if (next < 0 || visited[next]) continue;
-                if (segmentClear(xs[ix], ys[iy], xs[next % xs.length], ys[next / xs.length], obstacles)) {
+                if (segmentClear(xs[ix], ys[iy], xs[next % nx], ys[next / nx])) {
                     visited[next] = true; queue[tail++] = next;
                 }
             }
@@ -139,14 +163,26 @@ final class BoundaryGeometry {
         return false;
     }
 
-    private static boolean blocksAtCut(List<Rect> obstacles, double cut, double low, double high) {
+    private static int sortUnique(double[] values, int count) {
+        Arrays.sort(values, 0, count);
+        int unique = 0;
+        for (int i = 0; i < count; i++) {
+            if (unique == 0 || Double.compare(values[i], values[unique - 1]) != 0) {
+                values[unique++] = values[i];
+            }
+        }
+        return unique;
+    }
+
+    private boolean blocksAtCut(double cut, double low, double high) {
         double covered = low;
         boolean changed;
         do {
             changed = false;
-            for (Rect r : obstacles) {
-                if (r.minS < cut && r.maxS > cut && r.minY < covered && r.maxY > covered) {
-                    covered = r.maxY; changed = true;
+            for (int i = 0; i < rectangleCoordinates; i += 4) {
+                if (rectangles[i] < cut && rectangles[i + 2] > cut
+                        && rectangles[i + 1] < covered && rectangles[i + 3] > covered) {
+                    covered = rectangles[i + 3]; changed = true;
                     if (covered > high) return true;
                 }
             }
@@ -154,19 +190,24 @@ final class BoundaryGeometry {
         return false;
     }
 
-    private static boolean pointClear(double s, double y, List<Rect> obstacles) {
-        for (Rect r : obstacles) if (s > r.minS && s < r.maxS && y > r.minY && y < r.maxY) return false;
+    private boolean pointClear(double s, double y) {
+        for (int i = 0; i < rectangleCoordinates; i += 4) {
+            if (s > rectangles[i] && s < rectangles[i + 2]
+                    && y > rectangles[i + 1] && y < rectangles[i + 3]) return false;
+        }
         return true;
     }
 
-    private static boolean segmentClear(double as, double ay, double bs, double by, List<Rect> obstacles) {
-        if (!pointClear(as, ay, obstacles) || !pointClear(bs, by, obstacles)) return false;
-        for (Rect r : obstacles) {
+    private boolean segmentClear(double as, double ay, double bs, double by) {
+        if (!pointClear(as, ay) || !pointClear(bs, by)) return false;
+        for (int i = 0; i < rectangleCoordinates; i += 4) {
             if (as == bs) {
-                if (as > r.minS && as < r.maxS && Math.max(ay, by) > r.minY
-                        && Math.min(ay, by) < r.maxY) return false;
-            } else if (ay > r.minY && ay < r.maxY && Math.max(as, bs) > r.minS
-                    && Math.min(as, bs) < r.maxS) return false;
+                if (as > rectangles[i] && as < rectangles[i + 2]
+                        && Math.max(ay, by) > rectangles[i + 1]
+                        && Math.min(ay, by) < rectangles[i + 3]) return false;
+            } else if (ay > rectangles[i + 1] && ay < rectangles[i + 3]
+                    && Math.max(as, bs) > rectangles[i]
+                    && Math.min(as, bs) < rectangles[i + 2]) return false;
         }
         return true;
     }
