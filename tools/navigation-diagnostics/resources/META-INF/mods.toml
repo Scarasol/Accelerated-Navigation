@@ -1,0 +1,13 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="AGPLv3"
+[[mods]]
+modId="antimelineprobe"
+version="1.0"
+displayName="Navigation timeline diagnostic probe"
+[[dependencies.antimelineprobe]]
+modId="accelerated_navigation"
+mandatory=true
+versionRange="[0,)"
+ordering="AFTER"
+side="SERVER"

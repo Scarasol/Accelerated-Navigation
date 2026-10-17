@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -52,6 +53,7 @@ final class ProductionBudgetChecks {
         for (String name : List.of("tokensNanos", "chargedNanos", "previousChargeAtEnd", "validTicks", "skippedTicks"))
             field(name).setLong(scheduler, 0);
         field("lastTick").set(scheduler, null);
+        field("readyHaveTime").set(scheduler, null);
         ((List<?>) field("dimensionOrder").get(scheduler)).clear();
         Arrays.fill((int[]) field("dimensionCursors").get(scheduler), 0);
         clock.set(0);
@@ -271,7 +273,8 @@ final class ProductionBudgetChecks {
                 () -> NavigationScheduler.beginTickEnvelope(server, () -> true),
                 () -> NavigationScheduler.beginServerTick(server),
                 () -> NavigationScheduler.endServerTick(server, true),
-                () -> scheduler.finishTickEnvelope(true))) {
+                () -> scheduler.finishTickEnvelope(true),
+                scheduler::requestReadyDispatch)) {
             AtomicReference<Throwable> rejection = new AtomicReference<>();
             Thread worker = new Thread(() -> { try { entry.run(); } catch (Throwable error) { rejection.set(error); } });
             worker.start(); worker.join(2000);
@@ -289,6 +292,87 @@ final class ProductionBudgetChecks {
         catch (IllegalStateException expected) { require(true, "duplicate END rejected"); }
         scheduler.finishTickEnvelope(true);
         require(scheduler.metrics().pendingRequests() == 0, "all controls clean up");
+        readyControls(server,scheduler,clock);
+    }
+
+    private static void ready(NavigationScheduler scheduler) throws Exception {
+        var dispatch=NavigationScheduler.class.getDeclaredMethod("drainReady");
+        dispatch.setAccessible(true);dispatch.invoke(scheduler);
+    }
+
+    private static void readyControls(MinecraftServer server,NavigationScheduler scheduler,AtomicLong clock) throws Exception {
+        reset(scheduler,clock);
+        AtomicInteger calls=new AtomicInteger();
+        UUID unstartedOwner=UUID.randomUUID();
+        var first=scheduler.submitSoft(Level.OVERWORLD,unstartedOwner,NavigationScheduler.Priority.ACTIVE,
+                500_000,()->calls.incrementAndGet());
+        ready(scheduler);
+        require(calls.get()==0,"ready cannot dispatch before a normal tick");
+        scheduler.cancel(Level.OVERWORLD,unstartedOwner);
+        begin(server,()->true);end(server,true);
+        var completed=scheduler.budgetMetrics().lastTick();
+        first=task(scheduler,clock,calls,1_000_000,false);
+        first.thenRun(()->clock.addAndGet(200_000));
+        ready(scheduler);
+        require(first.isDone()&&calls.get()==1,"ready uses remaining tick without another END");
+        require(scheduler.metrics().chargedNanos()==1_200_000
+                &&scheduler.metrics().availableNanos()==18_800_000,"ready task and callback fully charged");
+        require(scheduler.budgetMetrics().lastTick()==completed,"ready preserves completed envelope sample");
+        begin(server,()->true);
+        require(scheduler.metrics().availableNanos()==20_000_000,"ready does not borrow next tick grant");
+        end(server,true);
+        require(scheduler.budgetMetrics().lastTick().outsideNavigationNanos()==1_200_000,
+                "ready work retained in outside navigation ledger");
+
+        reset(scheduler,clock);
+        begin(server,()->true);end(server,true);
+        List<Integer> order=new ArrayList<>();
+        scheduler.submitSoft(Level.OVERWORLD,UUID.randomUUID(),NavigationScheduler.Priority.ACTIVE,500_000,()->order.add(1));
+        scheduler.submitSoft(Level.OVERWORLD,UUID.randomUUID(),NavigationScheduler.Priority.ACTIVE,500_000,()->order.add(3));
+        scheduler.submitSoft(Level.NETHER,UUID.randomUUID(),NavigationScheduler.Priority.ACTIVE,500_000,()->order.add(2));
+        ready(scheduler);
+        require(order.equals(List.of(1,2,3)),"ready preserves dimension rotation and FIFO");
+        var owner=UUID.randomUUID();
+        var cancelled=scheduler.submitSoft(Level.OVERWORLD,owner,NavigationScheduler.Priority.ACTIVE,500_000,()->99);
+        scheduler.cancel(Level.OVERWORLD,owner);ready(scheduler);
+        require(cancelled.isCancelled(),"ready cannot revive cancelled work");
+
+        reset(scheduler,clock);
+        begin(server,()->true);end(server,true);
+        calls.set(0);
+        first=task(scheduler,clock,calls,20_700_000,false);
+        var second=task(scheduler,clock,calls,0,true);
+        ready(scheduler);
+        require(first.isDone()&&!second.isDone()&&calls.get()==1,"ready overshoot stops following work");
+        require(scheduler.metrics().availableNanos()==-700_000,"ready overshoot recorded without clipping");
+        begin(server,()->true);
+        require(scheduler.metrics().availableNanos()==20_000_000,"ready overshoot creates no debt");
+        ready(scheduler);
+        require(!second.isDone(),"ready trampoline cannot run inside new envelope");
+        end(server,true);require(second.isDone(),"deferred ready work reaches next END");
+
+        reset(scheduler,clock);
+        begin(server,()->true);end(server,true);
+        first=task(scheduler,clock,calls,0,false);
+        clock.set(42_600_000);ready(scheduler);
+        require(!first.isDone(),"ready retains 500us real deadline threshold");
+        begin(server,()->true);end(server,true);require(first.isDone(),"ready deadline preserves queued work");
+
+        reset(scheduler,clock);
+        AtomicBoolean allowed=new AtomicBoolean(true);
+        begin(server,allowed::get);end(server,true);allowed.set(false);
+        first=task(scheduler,clock,calls,0,false);ready(scheduler);
+        require(!first.isDone(),"ready rechecks haveTime after END");
+        allowed.set(true);ready(scheduler);require(first.isDone(),"ready can resume within same original deadline");
+        begin(server,()->true);end(server,false);
+        first=task(scheduler,clock,calls,0,false);ready(scheduler);
+        require(!first.isDone(),"END false prohibits ready dispatch");
+        begin(server,()->true);end(server,true);
+        begin(server,()->true);scheduler.finishTickEnvelope(false);
+        first=task(scheduler,clock,calls,0,false);ready(scheduler);
+        require(!first.isDone(),"abnormal envelope disables ready window");
+        begin(server,()->true);end(server,true);
+        require(first.isDone()&&scheduler.metrics().pendingRequests()==0,"ready controls clean up");
     }
 
     private static final class Parking implements ResumableSearch<Integer> {

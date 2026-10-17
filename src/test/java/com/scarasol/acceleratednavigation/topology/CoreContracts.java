@@ -33,6 +33,14 @@ public final class CoreContracts {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && args[0].equals("macro-commit")) {
+            completedComponentSnapshotCoversAllCells();
+            runtimeReverseSearchWaitsUpdatesAndReleases();
+            runtimeSearchSurvivesSameVersionBoundaryRecovery(false);
+            runtimeSearchSurvivesSameVersionBoundaryRecovery(true);
+            System.out.println("Committed macro snapshot contracts: 4 passed");
+            return;
+        }
         if (args.length == 1 && args[0].equals("door")) {
             DoorContracts.run();
             graphCaptureKeepsStructureAndMarksMissingSections();
@@ -239,11 +247,31 @@ public final class CoreContracts {
                             connection.transition() instanceof MacroSearch.BoundaryTransition boundary
                                     && boundary.face() == Direction.EAST && boundary.verticalShift(0) == -3),
                     "runtime result did not restore the original forward crossing");
+            requireCompletedComponents(result.corridor());
+            var cached = request(runtime, dimension, start, goal);
+            require(cached.completedFromCache() && cached.corridor().components().equals(result.corridor().components()),
+                    "completed cache rematerialization lost immutable component membership");
+            var edges = result.corridor().connections().stream().filter(edge ->
+                    edge.from() instanceof MacroSearch.ComponentEndpoint && edge.to() instanceof MacroSearch.ComponentEndpoint).toList();
+            var destination = (MacroSearch.ComponentEndpoint)edges.get(edges.size()-1).to();
+            try (var window = GroundSegmentWindow.capture(runtime, result.corridor(),
+                    BaseClusterTopology.TraversalProfile.DEFAULT_GROUND, NavigationScheduler.Priority.PLAYER_PURSUIT,
+                    start, edges, destination, null, 0).get(10, TimeUnit.SECONDS)) {
+                require(window.contains(goal) && window.candidates.contains(goal), "original snapshot window lost boundary target");
+            }
             require(request(runtime, dimension, goal, start).corridor() == null,
                     "reverse query invented an uphill route for a one-way drop");
             publishFacts(runtime, dimension, target, 2L, groundFacts());
             require(request(runtime, dimension, start, goal).corridor() == null,
                     "version update reused the stale incoming boundary or completed corridor");
+            try (var window = GroundSegmentWindow.capture(runtime, result.corridor(),
+                    BaseClusterTopology.TraversalProfile.DEFAULT_GROUND, NavigationScheduler.Priority.PLAYER_PURSUIT,
+                    start, edges, destination, null, 0).get(10, TimeUnit.SECONDS)) {
+                require(window.contains(goal) && window.candidates.contains(goal),
+                        "later world update revoked a previously completed corridor");
+                window.close();
+                require(!window.contains(goal), "closed window remained usable");
+            }
             publishFacts(runtime, dimension, target, 3L, targetFacts);
             require(request(runtime, dimension, start, goal).corridor() != null,
                     "restored topology did not rebuild the incoming route");
@@ -327,6 +355,31 @@ public final class CoreContracts {
         return BaseClusterTopology.build(section, 1L, BaseClusterTopology.BuildInput.center(facts),
                 BaseClusterTopology.TraversalProfile.DEFAULT_GROUND.geometry(BaseClusterTopology.Channel.GROUND),
                 new BaseClusterTopology.BuildScratch());
+    }
+
+    private static void requireCompletedComponents(MacroSearch.Corridor corridor) {
+        for (var endpoint : corridor.endpoints()) if (endpoint instanceof MacroSearch.ComponentEndpoint component)
+            require(corridor.component(component).contains(component.anchor()), "completed component missing its original anchor");
+    }
+
+    private static void completedComponentSnapshotCoversAllCells() {
+        var section = SectionPos.of(-2, -1, -3);
+        var body = new BaseClusterTopology.GeometryKey(BaseClusterTopology.Channel.VOLUME, 1, 1, .3F, .4F, false, false);
+        var topology = BaseClusterTopology.build(section, 1, BaseClusterTopology.BuildInput.center(
+                BaseClusterTopology.PackedFacts.allAir()), body, new BaseClusterTopology.BuildScratch());
+        var anchor = new BlockPos(section.minBlockX(), section.minBlockY(), section.minBlockZ());
+        var endpoint = new MacroSearch.ComponentEndpoint(2, anchor, topology.signature(), section,
+                BaseClusterTopology.Channel.VOLUME, topology.componentAt(0, 0, 0));
+        var snapshot = new MacroSearch.ComponentSnapshot(endpoint, topology);
+        for (int cell = 0; cell < BaseClusterTopology.CELL_COUNT; cell++)
+            require(snapshot.contains(anchor.offset(BaseClusterTopology.x(cell), BaseClusterTopology.y(cell),
+                    BaseClusterTopology.z(cell))), "snapshot truncated a component cell");
+        require(!snapshot.contains(anchor.offset(16,0,0)), "snapshot accepted an adjacent section");
+        try {
+            new MacroSearch.ComponentSnapshot(new MacroSearch.ComponentEndpoint(3, anchor, topology.signature(),
+                    SectionPos.of(0,0,0), BaseClusterTopology.Channel.VOLUME, 0), topology);
+            throw new AssertionError("snapshot accepted a graph from a different section");
+        } catch (IllegalArgumentException expected) {}
     }
 
     private static BaseClusterTopology.PackedFacts doorwayFacts(boolean open) {
@@ -516,6 +569,7 @@ public final class CoreContracts {
                             && restored.size() == 2
                             && metrics.workerStaleResults() == 0 && metrics.automaticStaleRetries() == 0,
                     "unchanged world was rejected while restoring decoded boundary facts");
+            requireCompletedComponents(result.corridor());
         } finally {
             require(runtime.awaitStopped(10, TimeUnit.SECONDS), "recovery search workers did not stop");
         }

@@ -925,16 +925,51 @@ public final class MacroSearch {
         private static final AggregateTransition INSTANCE = new AggregateTransition();
     }
 
-    public record Corridor(List<Endpoint> endpoints, List<Connection> connections, float cost) {
+    /** Immutable component membership in the world used by a completed macro search. */
+    public static final class ComponentSnapshot {
+        private final SectionPos section;
+        private final long[] cells = new long[BaseClusterTopology.CELL_COUNT / Long.SIZE];
+
+        ComponentSnapshot(ComponentEndpoint endpoint, BaseClusterTopology topology) {
+            if (!topology.section().equals(endpoint.section()) || topology.signature() != endpoint.revision()
+                    || topology.geometry().channel() != endpoint.channel()
+                    || endpoint.componentId() >= topology.componentCount()) {
+                throw new IllegalArgumentException("component snapshot does not match endpoint");
+            }
+            section = endpoint.section();
+            for (int cell = 0; cell < BaseClusterTopology.CELL_COUNT; cell++) {
+                if (topology.componentAt(BaseClusterTopology.x(cell), BaseClusterTopology.y(cell),
+                        BaseClusterTopology.z(cell)) == endpoint.componentId()) cells[cell >>> 6] |= 1L << cell;
+            }
+        }
+
+        public boolean contains(BlockPos position) {
+            if (!SectionPos.of(position).equals(section)) return false;
+            int cell = BaseClusterTopology.cellIndex(Math.floorMod(position.getX(), 16),
+                    Math.floorMod(position.getY(), 16), Math.floorMod(position.getZ(), 16));
+            return (cells[cell >>> 6] & (1L << cell)) != 0;
+        }
+    }
+
+    public record Corridor(List<Endpoint> endpoints, List<Connection> connections, float cost,
+                           Map<ComponentEndpoint, ComponentSnapshot> components) {
+        public Corridor(List<Endpoint> endpoints, List<Connection> connections, float cost) {
+            this(endpoints, connections, cost, Map.of());
+        }
         public Corridor {
             endpoints = List.copyOf(endpoints);
             connections = List.copyOf(connections);
+            components = Map.copyOf(components);
             if (endpoints.size() != connections.size() + 1) {
                 throw new IllegalArgumentException("corridor endpoint count must be connection count plus one");
             }
             if (!Float.isFinite(cost) || cost < 0.0F) {
                 throw new IllegalArgumentException("corridor cost must be finite and non-negative");
             }
+        }
+
+        public ComponentSnapshot component(ComponentEndpoint endpoint) {
+            return Objects.requireNonNull(components.get(endpoint), "missing completed component snapshot");
         }
     }
 

@@ -171,7 +171,7 @@ public final class AutomaticNavigationBridge {
     public static boolean localDone(PathNavigation navigation,Supplier<Boolean> original) {
         if(!enabled(navigation)||service(navigation).active(navigation)==null)return original.get();
         Path path=((NavigationAccess)navigation).acceleratedNavigation$path();
-        return path==null||path.isDone()||!service(navigation).executionReady(navigation);
+        return path==null||path.isDone();
     }
     public static boolean deferAdvance(PathNavigation navigation,Path path,boolean following) {
         return enabled(navigation)&&service(navigation).deferSegmentAdvance(navigation,path,following);

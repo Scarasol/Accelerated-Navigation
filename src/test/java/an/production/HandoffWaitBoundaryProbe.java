@@ -129,7 +129,7 @@ public final class HandoffWaitBoundaryProbe {
                 return;
             }
             String current = scenarios.get(scenario);
-            if (current.startsWith("entry-")) {
+            if (current.startsWith("entry-") || current.equals("stale") || current.equals("recompute")) {
                 if (!request.terminal()) {
                     if (tick - disrupted > 350) throw new AssertionError("protected route did not finish");
                     return;
@@ -138,7 +138,7 @@ public final class HandoffWaitBoundaryProbe {
                         request.state);
                 check("normal-entry-without-recovery", service.metrics().recoveries() == recoveries, service.metrics());
                 check("normal-entry-only-final-search", service.metrics().nativeCalls() == calls + 1, service.metrics());
-            } else if (List.of("timeout", "native-stop", "stale", "recompute", "window-close").contains(current)
+            } else if (List.of("timeout", "native-stop", "window-close").contains(current)
                     && service.metrics().nativeCalls() == calls) {
                 if (tick - disrupted > 250) throw new AssertionError("no real search after fault");
                 return;
@@ -148,10 +148,7 @@ public final class HandoffWaitBoundaryProbe {
                 check("native-stop-no-cursor-advance", (int) field(work, "cursor") == cursor, field(work, "cursor"));
                 check("failed-target-recorded-only-after-real-recovery",
                         ((java.util.Set<?>) field(work, "failedTargets")).contains(originalTarget), originalTarget);
-            } else if (current.equals("stale")) {
-                check("stale-real-search-keeps-cursor", (int) field(work, "cursor") == cursor, field(work, "cursor"));
-                check("stale-publishes-current-proof", ((NativeQueryProof) field(work, "nativeProof")).current(), "fresh input");
-            } else if (current.equals("recompute") || current.equals("window-close")) {
+            } else if (current.equals("window-close")) {
                 check("replan-retains-request", service.active(actor.getNavigation()) == request, request.state);
                 check("replan-replaces-window", ((GroundSegmentWindow) field(work, "window")).current(), "new window");
             }
@@ -185,7 +182,7 @@ public final class HandoffWaitBoundaryProbe {
                 marker = actor.blockPosition().above(5);
                 level.setBlock(marker, Blocks.STONE.defaultBlockState(), 2);
                 check("actual-input-invalidated", !((NativeQueryProof) field(work, "nativeProof")).current(), marker);
-                check("stale-excludes-further-protection", !defer() && !service.executionReady(actor.getNavigation()),
+                check("world-change-preserves-handoff", defer() && service.executionReady(actor.getNavigation()),
                         "changed section revision");
             }
             case "cancel" -> {
@@ -200,7 +197,7 @@ public final class HandoffWaitBoundaryProbe {
             }
             case "recompute" -> {
                 actor.getNavigation().recomputePath();
-                check("recompute-queued", (boolean) field(work, "queued"), "same request replan");
+                check("recompute-preserves-committed-route", !(boolean) field(work, "queued"), "same committed route");
             }
             case "window-close" -> {
                 ((GroundSegmentWindow) field(work, "window")).close();

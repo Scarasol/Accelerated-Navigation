@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN">
+    <Appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="[%level] [%logger] %msg%n"/>
+        </Console>
+        <File name="Navigation" fileName="${sys:an.production.output}/navigation.log" append="false">
+            <PatternLayout pattern="[%level] %msg%n"/>
+        </File>
+    </Appenders>
+    <Loggers>
+        <Logger name="com.scarasol.acceleratednavigation.AcceleratedNavigation" level="TRACE" additivity="false">
+            <AppenderRef ref="Navigation"/>
+        </Logger>
+        <Root level="INFO">
+            <AppenderRef ref="Console"/>
+        </Root>
+    </Loggers>
+</Configuration>

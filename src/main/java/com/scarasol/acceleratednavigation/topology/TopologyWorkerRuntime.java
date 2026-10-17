@@ -5212,7 +5212,7 @@ final class TopologyWorkerRuntime {
 
     private static long estimateCorridorBytes(MacroSearch.Corridor corridor) {
         long bytes = 96L + corridor.endpoints().size() * 56L
-                + corridor.connections().size() * 72L;
+                + corridor.connections().size() * 72L + corridor.components().size() * 640L;
         for (MacroSearch.Connection connection : corridor.connections()) {
             if (connection.transition() instanceof MacroSearch.BoundaryTransition boundary) {
                 bytes += boundary.retainedBytes();
@@ -5262,7 +5262,7 @@ final class TopologyWorkerRuntime {
                     connection.transition()
             ));
         }
-        return new MacroSearch.Corridor(endpoints, connections, corridor.cost());
+        return new MacroSearch.Corridor(endpoints, connections, corridor.cost(), corridor.components());
     }
 
     private static int directComponent(
@@ -5498,6 +5498,7 @@ final class TopologyWorkerRuntime {
         private long recoveryEndpointSequence = 0x1000_0000L;
         private final List<MacroSearch.Endpoint> recoveredEndpoints = new ArrayList<>();
         private final List<MacroSearch.Connection> recoveredConnections = new ArrayList<>();
+        private final Map<MacroSearch.ComponentEndpoint, MacroSearch.ComponentSnapshot> completedComponents = new HashMap<>();
         private float recoveredCost;
         private MacroSearch.Metrics completedSearchMetrics;
         private long workerTasks;
@@ -5708,6 +5709,7 @@ final class TopologyWorkerRuntime {
                         }
                     } else if (candidate != null) {
                         result = restoreForwardCorridor(candidate);
+                        captureComponents(result);
                         status = Status.SUCCEEDED;
                         clearRequests();
                         releaseGraphs();
@@ -5949,6 +5951,7 @@ final class TopologyWorkerRuntime {
         }
 
         private void appendSegment(MacroSearch.Corridor segment) {
+            captureComponents(segment);
             witnessSegments++;
             if (recoveredEndpoints.isEmpty()) {
                 recoveredEndpoints.addAll(segment.endpoints());
@@ -5972,6 +5975,18 @@ final class TopologyWorkerRuntime {
             }
             recoveredCost += segment.cost();
             recoveryCurrent = recoveredEndpoints.get(recoveredEndpoints.size() - 1);
+        }
+
+        private void captureComponents(MacroSearch.Corridor segment) {
+            for (var endpoint : segment.endpoints()) {
+                if (!(endpoint instanceof MacroSearch.ComponentEndpoint component)
+                        || completedComponents.containsKey(component)) continue;
+                if (completedComponents.size() >= MAX_QUERY_VISITED_NODES)
+                    throw new IllegalStateException("completed component snapshot limit exceeded");
+                var captured = baseGraph.topologySnapshot.get(component.section().asLong());
+                if (captured == null) throw new IllegalStateException("completed component graph missing");
+                completedComponents.put(component, new MacroSearch.ComponentSnapshot(component, captured.topology));
+            }
         }
 
         private void appendWitness(PreparedWitness prepared) {
@@ -6036,6 +6051,13 @@ final class TopologyWorkerRuntime {
             if (result == null) {
                 throw new IllegalStateException("successful macro search has no corridor");
             }
+            for (var endpoint : result.endpoints()) {
+                if (endpoint instanceof MacroSearch.ComponentEndpoint component
+                        && !completedComponents.containsKey(component))
+                    throw new IllegalStateException("completed corridor snapshot incomplete");
+            }
+            result = new MacroSearch.Corridor(result.endpoints(), result.connections(),
+                    result.cost(), completedComponents);
             preparedResultStamps = usedSections.values().stream()
                     .sorted(Comparator.comparingLong(stamp -> stamp.key().section().asLong()))
                     .toList();
@@ -6489,6 +6511,7 @@ final class TopologyWorkerRuntime {
             clearRequests();
             drainDeferredGraphs();
             releaseGraphs();
+            completedComponents.clear();
             finishMeasurement();
         }
 
@@ -6498,6 +6521,7 @@ final class TopologyWorkerRuntime {
             status = Status.FAILED;
             clearRequests();
             releaseGraphs();
+            completedComponents.clear();
             finishMeasurement();
         }
 

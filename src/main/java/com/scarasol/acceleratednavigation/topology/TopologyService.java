@@ -292,13 +292,13 @@ public final class TopologyService {
     }
 
     public CompletableFuture<GroundSegmentWindow> prepareGroundWindow(ServerLevel level,
-            BaseClusterTopology.TraversalProfile profile, NavigationScheduler.Priority priority,
+            MacroSearch.Corridor corridor, BaseClusterTopology.TraversalProfile profile, NavigationScheduler.Priority priority,
             BlockPos actual, List<MacroSearch.Connection> edges, MacroSearch.ComponentEndpoint destination,
             @Nullable BlockPos reachTarget, int accuracy) {
         requireServerThread();
         if (!isAvailable() || level.getServer()!=server) return CompletableFuture.failedFuture(
                 new RejectedExecutionException("topology service unavailable"));
-        return GroundSegmentWindow.capture(runtime,level.dimension(),profile,priority,actual,edges,destination,reachTarget,accuracy);
+        return GroundSegmentWindow.capture(runtime,corridor,profile,priority,actual,edges,destination,reachTarget,accuracy);
     }
 
     public CompletableFuture<SharedSectionCandidate> requestSharedSection(ServerLevel level,

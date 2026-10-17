@@ -1,0 +1,47 @@
+allprojects {
+    afterEvaluate {
+        def trace = rootProject.file('tools/navigation-diagnostics')
+        def evidence = rootProject.file(System.getProperty('an.trace.build'))
+        def reference = rootProject.file('.tmp/current-performance-reference-20261016')
+        layout.buildDirectory = new File(evidence, 'build')
+        def mainInput = rootProject.file(System.getProperty('an.trace.main',
+                new File(reference, 'frozen/main').path))
+        sourceSets.main.java.setSrcDirs([new File(mainInput, 'java')])
+        sourceSets.main.resources.setSrcDirs([new File(mainInput, 'resources')])
+        tasks.named('jarJar').configure {
+            archiveFileName = 'production.jar'
+            destinationDirectory = new File(evidence, 'artifacts')
+        }
+        sourceSets {
+            timelineProbe {
+                java.srcDirs = [new File(trace, 'probe'), new File(reference, 'probe')]
+                java.exclude '**/ReferenceProbeMod.java'
+                resources.srcDirs = [new File(trace, 'resources')]
+                compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath +
+                    files(new File(evidence, 'artifacts/trace-helper.jar'))
+            }
+        }
+        tasks.named('compileTimelineProbeJava').configure {
+            source(rootProject.file('src/test/java/an/production/ProductionBudgetChecks.java'))
+            options.compilerArgs += ['-proc:none']
+        }
+        tasks.register('timelineHierarchyJar', Jar) {
+            from(sourceSets.main.output)
+            archiveFileName = 'hierarchy.jar'
+            destinationDirectory = new File(evidence, 'artifacts')
+        }
+        tasks.register('timelineProbeJar', Jar) {
+            dependsOn tasks.named('compileTimelineProbeJava')
+            from(sourceSets.timelineProbe.output)
+            from(new File(reference, 'probe-resources/an_reference.mixins.json'))
+            manifest { attributes('MixinConfigs': 'an_reference.mixins.json,an_failure.mixins.json') }
+            archiveFileName = 'timeline-probe.jar'
+            destinationDirectory = new File(evidence, 'artifacts')
+        }
+        reobf.create('timelineProbeJar') {}
+        tasks.named('reobfTimelineProbeJar').configure {
+            libraries.from(tasks.named('timelineHierarchyJar').flatMap { it.archiveFile })
+            dependsOn tasks.named('timelineHierarchyJar')
+        }
+    }
+}

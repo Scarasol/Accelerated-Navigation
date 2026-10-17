@@ -4,6 +4,7 @@ import com.scarasol.acceleratednavigation.AcceleratedNavigation;
 import com.scarasol.acceleratednavigation.api.ResumableSearch;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.TickTask;
 import net.minecraft.world.level.Level;
 
 import java.util.ArrayDeque;
@@ -61,6 +62,10 @@ public final class NavigationScheduler {
     private boolean startSeen;
     private boolean endSeen;
     private boolean closed;
+    private boolean endHadTime;
+    private boolean readyDispatchQueued;
+    private long readyDeadlineNanos;
+    private BooleanSupplier readyHaveTime;
     private long chargeAtStart;
     private long chargeAtDrainEnd;
     private long previousChargeAtEnd;
@@ -244,6 +249,7 @@ public final class NavigationScheduler {
         requireServerThread();
         requireOpen();
         if (inEnvelope) throw new IllegalStateException("nested navigation tick envelope");
+        readyHaveTime = null;
         this.haveTime = Objects.requireNonNull(haveTime, "haveTime");
         tickStartedNanos = clock.getAsLong();
         chargeAtStart = totalAccounted(tickStartedNanos);
@@ -282,6 +288,8 @@ public final class NavigationScheduler {
                         TICK_BUDGET_NANOS, TAIL_RESERVE_NANOS,
                         tail, balanceAfterRefill, balanceBeforeDrain, availableTokens(now),
                         pendingBeforeDrain, pending.size(), stopReason);
+                readyDeadlineNanos = tickStartedNanos + TARGET_NANOS - TAIL_RESERVE_NANOS;
+                readyHaveTime = endHadTime ? haveTime : null;
             } else skippedTicks = increment(skippedTicks);
         } finally {
             previousChargeAtEnd = chargeAtEnd;
@@ -297,6 +305,7 @@ public final class NavigationScheduler {
         if (!inEnvelope || !startSeen || endSeen)
             throw new IllegalStateException("missing START or duplicate navigation END");
         endSeen = true;
+        endHadTime = haveTime;
         pendingBeforeDrain = pending.size();
         balanceBeforeDrain = availableTokens();
         try (TimeAccount ignored = account()) {
@@ -314,16 +323,50 @@ public final class NavigationScheduler {
         }
     }
 
+    /**
+     * Wake the regular queue after a dependency is delivered. Post-envelope work
+     * spends this tick's remaining allowance, never a new or borrowed grant.
+     */
+    public void requestReadyDispatch() {
+        requireServerThread();
+        try (TimeAccount ignored = account()) {
+        if (readyDispatchQueued || draining || !readyDispatchAllowed()) return;
+        readyDispatchQueued = true;
+        try {
+            server.tell(new TickTask(server.getTickCount(), this::drainReady));
+        } catch (RejectedExecutionException rejected) {
+            readyDispatchQueued = false;
+        }
+        }
+    }
+
+    private boolean readyDispatchAllowed() {
+        return !closed && !inEnvelope && readyHaveTime != null && !pending.isEmpty()
+                && Math.min(readyDeadlineNanos - clock.getAsLong(), availableTokens()) >= MIN_SLICE_NANOS
+                && readyHaveTime.getAsBoolean();
+    }
+
+    private void drainReady() {
+        readyDispatchQueued = false;
+        // Existing accounting records this work in chargedNanos and the next
+        // envelope's outsideNavigationNanos; the completed tick sample stays intact.
+        try (TimeAccount ignored = account()) {
+            if (draining || !readyDispatchAllowed()) return;
+            drain(readyDeadlineNanos, Integer.MAX_VALUE);
+        }
+    }
+
     private void drain(long schedulerDeadline, int maxSlices) {
         if (draining) {
             return;
         }
         draining = true;
+        BooleanSupplier canContinue = inEnvelope ? haveTime : readyHaveTime;
         try {
             int slices = 0;
             int requestsWithoutProgress = 0;
             while (!closed && !pending.isEmpty() && requestsWithoutProgress < pending.size()) {
-                if (!haveTime.getAsBoolean()) {
+                if (!canContinue.getAsBoolean()) {
                     stopReason = StopReason.SERVER_NO_TIME;
                     return;
                 }
@@ -353,7 +396,7 @@ public final class NavigationScheduler {
                     continue;
                 }
 
-                if (!haveTime.getAsBoolean()) {
+                if (!canContinue.getAsBoolean()) {
                     enqueue(request);
                     stopReason = StopReason.SERVER_NO_TIME;
                     return;

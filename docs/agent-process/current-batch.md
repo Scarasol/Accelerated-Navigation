@@ -2,6 +2,12 @@
 
 旧工程只作只读备份，不在旧工程维护记录或修改源码。
 
+2026-10-17 当前主线为[导航性能优化交接](tasks/navigation-performance-handoff-20261017-zh.md)，完整流程和旧编号映射见[路线图](../designs/2026-10-16-navigation-performance-roadmap-zh.md)。统一使用1–10及4a/4b/4c、5a/5b。步骤2、3及4a/4b/4c按各自范围结清，整体性能和发布资格仍未取得。5a经[价值评估](../reports/2026-10-17-short-native-feasibility-assessment-zh.md)搁置，5b尾部候选封存、不接入生产。用户随后选择先进入6，覆盖此前楼梯优先顺序；关机后恢复并完成最终复审，**步骤6本轮中间窗口分配研究已有限结清，候选隔离封存、未接入生产**，见[任务](tasks/window-allocation-20261017-zh.md)及[报告](../reports/2026-10-17-window-allocation-validation-zh.md)。DeepSeek `ACCEPT_SCOPED`、必须修改项无；局部减量成立，唯一资源对2048/2048到达，但8格CPU/首Path P95及GC不利、观测窗不同，未证明稳定净收益。**后续顺序：保留6有限结清及原楼梯独立缺口 → 按授权和成本筛选7→8→9 → 补齐1的正式协议/同壳A/A校准 → 10组合验收 → 按授权处理生产接入与发行。** 不自动推进7或接入步骤6候选；6–9不是必做矩阵。原楼梯B正向未到达、反向到达，见[停止记录](../reports/2026-10-17-short-native-isolation-stopped-zh.md)；4b跨tick身份仍是独立条件事项。生产61份输入、4a/4b/4c和默认发行包保持。
+
+下列2026-10-15记录为历史研究及接入索引，不覆盖上面的当前主线顺序。
+
+2026-10-17 用户授权的[5b尾部隔离验证](tasks/segment-tail-handoff-20261017-zh.md)已按本轮范围有限结清，[正式报告](../reports/2026-10-17-segment-tail-handoff-validation-zh.md)。自然尾47/47、取消5/5、替换6/6保留，唯一B→C轻量资源对四条记录技术有效并到达；三场动态功能/21项后核及相关Node62/62通过。静止搜索3→2但资源混合，多目标CPU升高也如实保留；无A/A/净收益/生产资格，候选封存、不扩样、不接入生产。最终DeepSeek ACCEPT_SCOPED、必须修改项无，31.450秒/未超时/settings不变，只认可有限结清及停止；详见主交接第十七节。5a继续搁置，4b/4c和生产输入保持，原楼梯正向缺口独立保留；后续按6–9成本筛选。
+
 2026-10-15 [Portal/Boundary 源锚点骨架验证](tasks/portal-boundary-skeleton-20261015.md)已研究收尾，[正式报告](../reports/2026-10-15-portal-boundary-skeleton-validation-zh.md)。84组27,582字段/11,820能力比较、82 worker断言、16功能JVM2060自然请求含四个512门、29损坏拒绝+2正例通过；独立算术3440640决定/114688 mask补证当前源坐标选择器与旧bbox等价，不能新增依赖剪枝。新27矩阵在第12轮C/plain移动阶段失败停止，11完成/1失败/15未跑、2947完成逻辑/11物理、P实际4性能JVM；八走廊/256/r2未测，性能资格未取得，不表示候选性能被证伪。失败512均有首Path，快照2 UNAVAILABLE/510 REACHABLE，精确出口/谓词未测，不能归因Portal/偿债/主机。DeepSeek最终final-v2 5472B/33.400s ACCEPT_WITH_GATES/本轮必须修改项无：停止本候选的冷依赖缩减主线扩展、封存不接入，其他Portal构法不外推。只关闭忠实研究/中止报告，未来资格须另立范围/冻结先查C失败，不续旧矩阵、不扩预算支线。下段为上一轮闭包任务封存。
 
 2026-10-15[首次请求依赖闭包候选验证](tasks/first-request-closure-validation-20261015.md)已实际运行，[报告](../reports/2026-10-15-first-request-closure-validation-zh.md)已更新。候选全在`.tmp`；进入性能前28功能JVM、10组82 worker断言及57类损坏拒绝通过。冻结135轮在第104轮停止：103运行检查通过（候选35 JVM）、1 auto基线派发前UNAVAILABLE、31未执行，未取得性能资格。512已enqueue而dispatch/policy/physical/native均0，200tick仍有14.89..19.50ms余额却全SERVER_NO_TIME，原规划TTL后结束；不能据此判候选算法失败。DeepSeek以6462B/3920B两独立包认可中止及未测值纠正，必改项无；208原件/冻结身份及34 detail后处理封存，69 off/plain未测后继数为null。最终performance-abort-v2和review-seal-v2均明确matrixPassed/performanceQualified=false；进程已退出，不续旧矩阵、不进入尚未实现的Portal或生产。

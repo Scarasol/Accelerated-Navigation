@@ -1,0 +1,55 @@
+{
+  "schema": "NAVIGATION_BENCHMARK_CAMPAIGN_V1",
+  "name": "Current frozen navigation reference",
+  "runsRoot": "../../../.tmp/current-performance-reference-20261016/runs",
+  "minimumReadySeconds": 30,
+  "referenceVariant": "native",
+  "scenarioFields": ["distance", "concurrency"],
+  "scenarios": [
+    { "distance": 8, "concurrency": 1 },
+    { "distance": 8, "concurrency": 32 },
+    { "distance": 8, "concurrency": 512 },
+    { "distance": 28, "concurrency": 1 },
+    { "distance": 28, "concurrency": 32 },
+    { "distance": 28, "concurrency": 512 }
+  ],
+  "repeats": [0],
+  "warmups": [
+    { "distance": 8, "concurrency": 64, "repeat": -2 },
+    { "distance": 28, "concurrency": 64, "repeat": -1 }
+  ],
+  "deadlineMillis": [100, 500, 1000, 5000, 10000, 30000, 90000],
+  "variants": [
+    {
+      "id": "native",
+      "resultVariant": "vanilla-same-runtime",
+      "launchVariant": "native",
+      "productionSha256": "a4f03abd7ecde578bd4a88d71cea59b4453d9d420899d91e98937f4b74089c33"
+    },
+    {
+      "id": "accelerated",
+      "resultVariant": "accelerated",
+      "launchVariant": "accelerated",
+      "productionSha256": "a4f03abd7ecde578bd4a88d71cea59b4453d9d420899d91e98937f4b74089c33"
+    }
+  ],
+  "runs": [
+    { "id": "pair-1-native", "directory": "pair-1-native", "variant": "native", "pair": "1" },
+    { "id": "pair-1-accelerated", "directory": "pair-1-accelerated", "variant": "accelerated", "pair": "1" },
+    { "id": "pair-2-accelerated", "directory": "pair-2-accelerated", "variant": "accelerated", "pair": "2" },
+    { "id": "pair-2-native", "directory": "pair-2-native", "variant": "native", "pair": "2" },
+    { "id": "pair-3-native", "directory": "pair-3-native", "variant": "native", "pair": "3" },
+    { "id": "pair-3-accelerated", "directory": "pair-3-accelerated", "variant": "accelerated", "pair": "3" }
+  ],
+  "identity": {
+    "productionMod": "accelerated_navigation.jar",
+    "probeMod": "reference-probe.jar",
+    "probeSha256": "48c7a13296f7dce289fbbec11258a0535dbd943b8731a479dae9f8f645e171d8",
+    "templateSha256": "ab4a1959dc2e5327d99e3d5e8ccbaf8020c80b8ebc7d8f515d70aee46e7d6f7d",
+    "ignoredJvmArgPrefixes": [
+      "-Dan.production.output=",
+      "-Dan.production.performanceVanilla=",
+      "-Djdk.net.unixdomain.tmpdir="
+    ]
+  }
+}

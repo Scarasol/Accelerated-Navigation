@@ -74,8 +74,7 @@ public final class ProductionNavigationProbe {
     private int targetMoves;
     private int recomputations;
     private int semanticChanges;
-    private int semanticSearches;
-    private long searchBeforeChange=-1,wholeBeforePartial;
+    private long wholeBeforePartial;
     private long deferredNativeBefore,deferredDecisionBefore,deferredWholeBefore,deferredSegmentsBefore;
     private boolean sawSegmentPartial;
     private BlockPos selectedDecisionTarget;
@@ -314,22 +313,19 @@ public final class ProductionNavigationProbe {
             check("new-target-replaces",pig.getNavigation().moveTo(28,81,6,1)&&request.state==NavigationRequestPath.State.CANCELLED,"replaced");
             request=service.active(pig.getNavigation());phase(2);
         } else if(phase==2) {
-            if(searchBeforeChange>=0&&service.metrics().segmentCalls()>searchBeforeChange
-                    &&service.executionReady(pig.getNavigation())) {
-                check("native-input-change-runs-new-pathfinder-"+semanticSearches,
-                        !request.nativeBackend&&service.metrics().nativeWholeCalls()==0,
-                        "real segment searches "+searchBeforeChange+" -> "+service.metrics().segmentCalls());
-                semanticSearches++;searchBeforeChange=-1;
-            }
             if(!request.terminal()&&request.getNodeCount()>0&&semanticChanges<2
                     &&tick-phaseTick>=80+semanticChanges*25) {
-                searchBeforeChange=service.metrics().segmentCalls();
+                int nodesBeforeChange=request.getNodeCount();
+                int indexBeforeChange=request.getNextNodeIndex();
+                var pathBeforeChange=pig.getNavigation().getPath();
                 level.setBlock(new BlockPos(17,80,1),
                         (semanticChanges==0?Blocks.ANDESITE:Blocks.STONE).defaultBlockState(),2);
-                check("changed-native-input-pauses-local-execution-"+semanticChanges,
-                        !request.nativeBackend&&!service.executionReady(pig.getNavigation())
-                                &&AutomaticNavigationBridge.localDone(pig.getNavigation(),()->false)
-                                &&!pig.getNavigation().isDone(),"actual native read input awaits END search");
+                check("changed-native-input-preserves-execution-"+semanticChanges,
+                        !request.nativeBackend&&service.executionReady(pig.getNavigation())
+                                &&pig.getNavigation().getPath()==pathBeforeChange
+                                &&request.getNodeCount()==nodesBeforeChange
+                                &&request.getNextNodeIndex()==indexBeforeChange,
+                        "world change retains real native nodes");
                 semanticChanges++;
             }
             if(!request.terminal()&&recomputations<3&&tick-phaseTick>=20+recomputations*25) {
@@ -347,7 +343,6 @@ public final class ProductionNavigationProbe {
                         &&pig.blockPosition().distManhattan(new BlockPos(28,81,6))<=1,request.state+" "+pig.blockPosition());
                 check("three-normal-recomputations-complete",recomputations==3,recomputations);
                 check("two-safe-semantic-changes-complete",semanticChanges==2,semanticChanges);
-                check("two-native-input-researches-complete",semanticSearches==2,semanticSearches);
                 melee=spawn(new TestZombie(level),new BlockPos(3,81,10));melee.setTarget(target);phase(3);
             }
         } else if(phase==3) {

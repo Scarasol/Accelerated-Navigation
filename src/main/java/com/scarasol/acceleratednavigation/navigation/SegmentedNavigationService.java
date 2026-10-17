@@ -127,12 +127,10 @@ public final class SegmentedNavigationService {
         Work work=active.get(navigation);
         return work==null?null:work.request;
     }
+    /** Execution ownership only; world revisions cannot revoke a committed route. */
     public boolean executionReady(PathNavigation navigation) {
         Work work=active.get(navigation);
-        if(work==null||!work.segmented||work.window==null&&work.sharedCandidate==null)return true;
-        try(var ignored=scheduler.account()) {
-            return planningCurrent(work)&&work.nativeProof!=null&&work.nativeProof.current();
-        }
+        return work==null||live(work)&&!work.nativeStopped&&(work.window==null||work.window.current());
     }
     public NavigationRequestPath prepare(PathNavigation navigation,NavigationIntent intent,Object controller,long generation) {
         try(var ignored=scheduler.account()) {
@@ -350,8 +348,13 @@ public final class SegmentedNavigationService {
         else if(work.segmented)macroCandidate(work);
         else nativeWhole(work);
     }
+    private <T> void queueReady(Work work,Supplier<T> operation) {
+        queue(work,operation);
+        scheduler.requestReadyDispatch();
+    }
     private void macroCandidate(Work work) {
         closeWindow(work);
+        work.corridor=null;work.edges=List.of();
         cancelShared(work);
         work.sharedCandidate=null;
         if(work.candidateIndex>=work.targets.size()) {
@@ -392,7 +395,6 @@ public final class SegmentedNavigationService {
                     return;
                 }
                 if(error!=null) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
-                if(!candidate.current()) { queue(work,()-> { refresh(work);return null; });return; }
                 if(entityDrifted(work)) { queue(work,()-> { replan(work);return null; });return; }
                 if(!candidate.candidate()||candidate.anchors().isEmpty()) {
                     if(candidate.state().equals("NO_MACRO_CANDIDATE")) {
@@ -405,44 +407,47 @@ public final class SegmentedNavigationService {
                     work.searchLimit=12;
                     work.recoveryLimit=8;
                 }
-                queue(work,()-> { nextSegment(work);return null; });
+                queueReady(work,()-> { nextSegment(work);return null; });
             }
         });
     }
     private void existingMacroCandidate(Work work,BlockPos target,int selected) {
-        work.macro=TopologyService.forServer(server).requestMacroQuery(work.level,work.request.macroOwner,
+        var macro=TopologyService.forServer(server).requestMacroQuery(work.level,work.request.macroOwner,
                 work.request.mob.blockPosition(),target,BaseClusterTopology.Channel.GROUND,
                 work.request.intent.capabilities().profile(),work.priority);
-        work.macro.future().whenComplete((corridor,error)-> {
+        work.macro=macro;
+        macro.future().whenComplete((corridor,error)-> {
             try(var ignored=scheduler.account()) {
-                if(!live(work)||work.candidateIndex!=selected)return;
+                if(!live(work)||work.candidateIndex!=selected||work.macro!=macro)return;
                 work.preparing=false;
                 if(error!=null) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
-                if(!work.macro.current()) { queue(work,()-> { refresh(work);return null; });return; }
                 if(entityDrifted(work)) { queue(work,()-> { replan(work);return null; });return; }
                 if(corridor==null) {
-                    if(work.macro.progress().failure()==MacroSearch.Failure.NO_STRUCTURAL_ROUTE) {
+                    if(macro.progress().failure()==MacroSearch.Failure.NO_STRUCTURAL_ROUTE) {
                         work.candidateIndex++;queue(work,()-> { macroCandidate(work);return null; });
                     } else finish(work,NavigationRequestPath.State.UNAVAILABLE);
                     return;
                 }
                 work.corridor=corridor;
-                AcceleratedNavigation.LOGGER.debug("Navigation {} macro candidate: target={} endpoints={} connections={}",
-                        work.request.queryId,target,corridor.endpoints(),corridor.connections());
+                AcceleratedNavigation.LOGGER.debug("Navigation {} macro candidate: target={} endpointCount={} connectionCount={}",
+                        work.request.queryId,target,corridor.endpoints().size(),corridor.connections().size());
+                if(AcceleratedNavigation.LOGGER.isTraceEnabled())
+                    AcceleratedNavigation.LOGGER.trace("Navigation {} macro details: endpoints={} connections={}",
+                            work.request.queryId,corridor.endpoints(),corridor.connections());
                 work.edges=corridor.connections().stream().filter(e->e.from() instanceof MacroSearch.ComponentEndpoint
                         &&e.to() instanceof MacroSearch.ComponentEndpoint).toList();
                 if(work.searchLimit==0) {
                     work.searchLimit=Math.max(12,(work.edges.size()+1)*3);
                     work.recoveryLimit=Math.max(8,(work.edges.size()+1)*2);
                 }
-                queue(work,()-> { nextSegment(work);return null; });
+                queueReady(work,()-> { nextSegment(work);return null; });
             }
         });
     }
     private void prepareWindow(Work work,List<MacroSearch.Connection> edges,MacroSearch.ComponentEndpoint destination,
             BlockPos reach,int accuracy,Runnable ready) {
         work.preparing=true;work.pendingSince=work.level.getGameTime();
-        var future=TopologyService.forServer(server).prepareGroundWindow(work.level,work.request.intent.capabilities().profile(),
+        var future=TopologyService.forServer(server).prepareGroundWindow(work.level,work.corridor,work.request.intent.capabilities().profile(),
                 work.priority,work.request.mob.blockPosition(),edges,destination,reach,accuracy);
         work.pendingWindow=future;
         future.whenComplete((window,error)->server.execute(()-> {
@@ -450,21 +455,18 @@ public final class SegmentedNavigationService {
                 if(!live(work)||work.pendingWindow!=future) { if(window!=null)window.close();return; }
                 work.pendingWindow=null;work.preparing=false;
                 if(error!=null||window==null) {
+                    if(window!=null)window.close();
                     AcceleratedNavigation.LOGGER.debug("Navigation {} window preparation failed: cursor={} destination={} position={}",
                             work.request.queryId,work.cursor,destination,work.request.mob.blockPosition(),error);
-                    queue(work,()-> { refresh(work);return null; });return;
+                    finish(work,NavigationRequestPath.State.UNAVAILABLE);return;
                 }
                 work.window=window;
-                AcceleratedNavigation.LOGGER.debug("Navigation {} window inputs: cursor={} end={} sections={} destination={} candidates={}",
-                        work.request.queryId,work.cursor,work.stageEnd,window.sections(),window.destination,window.candidates);
-                queue(work,()-> {
-                    if(!window.current()) {
-                        AcceleratedNavigation.LOGGER.debug("Navigation {} window became stale before dispatch",work.request.queryId);
-                        refresh(work);
-                    }
-                    else ready.run();
-                    return null;
-                });
+                AcceleratedNavigation.LOGGER.debug("Navigation {} window inputs: cursor={} end={} sectionCount={} candidateCount={}",
+                        work.request.queryId,work.cursor,work.stageEnd,window.sections().size(),window.candidates.size());
+                if(AcceleratedNavigation.LOGGER.isTraceEnabled())
+                    AcceleratedNavigation.LOGGER.trace("Navigation {} window details: sections={} destination={} candidates={}",
+                            work.request.queryId,window.sections(),window.destination,window.candidates);
+                queueReady(work,()-> { ready.run();return null; });
             }
         }));
     }
@@ -476,7 +478,6 @@ public final class SegmentedNavigationService {
         work.segmentTarget=null;work.segmentReachable=false;
         work.nativeStopped=false;work.doneSince=-1;
         if(work.sharedCandidate!=null) {
-            if(!planningCurrent(work)) { refresh(work);return; }
             var anchors=work.sharedCandidate.anchors();
             work.stageEnd=Math.min(anchors.size()-1,work.cursor+4);
             work.last=work.stageEnd==anchors.size()-1;
@@ -493,8 +494,12 @@ public final class SegmentedNavigationService {
             for(var endpoint:work.corridor.endpoints())
                 if(endpoint instanceof MacroSearch.ComponentEndpoint component)destination=component;
             if(destination==null) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
-            prepareWindow(work,List.of(),destination,work.request.getTarget(),work.request.intent.accuracy(),
-                    ()->findSegment(work,Set.of(work.request.getTarget()),work.request.intent.accuracy()));
+            work.corridor.component(destination);
+            // Final targets need no window candidates; retain the search's own scheduler admission.
+            queue(work,()-> {
+                findSegment(work,Set.of(work.request.getTarget()),work.request.intent.accuracy());
+                return null;
+            });
             return;
         }
         work.last=false;
@@ -519,7 +524,7 @@ public final class SegmentedNavigationService {
                     +.05*p.distSqr(work.request.getTarget()));
             if(work.attempt>0)order=Comparator.comparingInt((BlockPos p)->-work.window.interiorNeighbors(p)).thenComparing(order);
             candidates.sort(order.thenComparingInt(BlockPos::getX).thenComparingInt(BlockPos::getY).thenComparingInt(BlockPos::getZ));
-            if(candidates.isEmpty()) { recover(work);return; }
+            if(candidates.isEmpty()) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
             // Several same-component ports are an internal segment choice, not an API target truncation.
             findSegment(work,new LinkedHashSet<>(candidates.subList(0,Math.min(work.attempt>0?1:8,candidates.size()))),0);
         });
@@ -534,15 +539,20 @@ public final class SegmentedNavigationService {
         if(awaitNative(work,()-> { findSegment(work,targets,accuracy);return null; }))return;
         if(++work.searches>work.searchLimit) { finish(work,NavigationRequestPath.State.FAILED);return; }
         work.segmentEntry=null;work.segmentTarget=null;work.segmentReachable=false;
-        NativeNavigationSearch.Result result=NativeNavigationSearch.find(work.request,targets,accuracy,localRange(work,targets),work.avoided);
+        // Endpoint distance does not bound native exploration around the final target.
+        float range=work.last?work.request.intent.range():localRange(work,targets);
+        NativeNavigationSearch.Result result=NativeNavigationSearch.find(work.request,targets,accuracy,range,work.avoided);
         nativeCalls++;segmentCalls++;
         work.nativeProof=result.proof();
         Path path=result.path();
         work.segmentTarget=path==null?null:path.getTarget();
-        AcceleratedNavigation.LOGGER.debug("Navigation {} native segment result: cursor={} end={} attempt={} stride={} start={} targets={} range={} reachable={} nodeCount={} nativeEnd={} unknown={}",
-                work.request.queryId,work.cursor,work.stageEnd,work.attempt,work.stride,work.request.mob.blockPosition(),
-                targets,localRange(work,targets),path!=null&&path.canReach(),path==null?0:path.getNodeCount(),
-                path==null?null:path.getEndNode(),result.unavailable());
+        AcceleratedNavigation.LOGGER.debug("Navigation {} native segment result: cursor={} end={} last={} range={} reachable={} nodeCount={} unknown={}",
+                work.request.queryId,work.cursor,work.stageEnd,work.last,range,
+                path!=null&&path.canReach(),path==null?0:path.getNodeCount(),result.unavailable());
+        if(AcceleratedNavigation.LOGGER.isTraceEnabled())
+            AcceleratedNavigation.LOGGER.trace("Navigation {} native segment details: attempt={} stride={} start={} targets={} nativeEnd={}",
+                    work.request.queryId,work.attempt,work.stride,work.request.mob.blockPosition(),
+                    targets,path==null?null:path.getEndNode());
         if(result.unavailable()) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
         if(path==null||path.getNodeCount()==0||path.getEndNode()==null) {
             recover(work);return;
@@ -661,8 +671,7 @@ public final class SegmentedNavigationService {
             if(!live(work)||!work.request.adopted)return false;
             if(work.last)return work.stable<3||!work.request.mob.onGround()||!finalArrival(work);
             if(work.sharedCandidate!=null)return false;
-            if(work.nativeStopped||work.window==null||!work.window.current()
-                    ||work.nativeProof==null||!work.nativeProof.current())return false;
+            if(work.nativeStopped||work.window==null||!work.window.current())return false;
             recordDestinationEntry(work,path);
             if(!following||intermediateArrival(work))return false;
             if(handoffDeferrals<Long.MAX_VALUE)handoffDeferrals++;
@@ -678,7 +687,7 @@ public final class SegmentedNavigationService {
                     work.window.destination.revision(),work.window.destination.componentId(),work.nativeProof,
                     work.level.getGameTime(),path.getNextNodeIndex(),path.getNextNodePos(),
                     work.request.mob.blockPosition(),work.request.mob.position());
-            AcceleratedNavigation.LOGGER.debug(
+            if(AcceleratedNavigation.LOGGER.isTraceEnabled())AcceleratedNavigation.LOGGER.trace(
                     "Navigation {} recorded intermediate destination entry: publication={} cursor={} nodeIndex={} node={} position={} component={} revision={}",
                     work.request.queryId,work.segmentPublication,work.cursor,path.getNextNodeIndex(),
                     path.getNextNodePos(),work.request.mob.position(),work.window.destination.componentId(),
@@ -726,6 +735,9 @@ public final class SegmentedNavigationService {
         Work work=active.get(navigation);
         if(work==null)return false;
         ((NavigationAccess)navigation).acceleratedNavigation$delayed(false);
+        // Block update callbacks cannot revoke an already committed macro route.
+        if(work.request.adopted&&work.segmented&&(work.corridor!=null||work.sharedCandidate!=null)
+                &&!work.nativeStopped)return true;
         if(work.level.getGameTime()-work.lastRecompute>=20&&!work.queued&&!work.preparing) {
             work.lastRecompute=work.level.getGameTime();
             queue(work,()-> { if(work.segmented)replan(work);else nativeWhole(work);return null; });
@@ -775,17 +787,9 @@ public final class SegmentedNavigationService {
                     work.lastProgress=tick;work.observedPosition=mob.blockPosition();
                 }
                 Path current=((NavigationAccess)work.request.navigation).acceleratedNavigation$path();
-                boolean windowCurrent=work.segmented&&planningCurrent(work);
-                boolean nativeInputCurrent=work.segmented&&work.nativeProof!=null&&work.nativeProof.current();
-                if(work.segmented&&(work.window!=null||work.sharedCandidate!=null)&&current!=null&&current.getNodeCount()>0
-                        &&(!windowCurrent||!nativeInputCurrent)) {
-                    AcceleratedNavigation.LOGGER.debug("Navigation {} native input stale: window={} cursor={} position={}",
-                            work.request.queryId,windowCurrent,work.cursor,mob.blockPosition());
-                    rescheduleStaleInput(work);continue;
-                }
                 if(current!=null&&!current.isDone()) {
                     work.lastNode=current.getNextNodePos();
-                    if(work.segmented&&work.window!=null&&!work.last&&work.segmentReachable&&!work.nativeStopped&&windowCurrent&&nativeInputCurrent
+                    if(work.segmented&&work.window!=null&&!work.last&&work.segmentReachable&&!work.nativeStopped
                             &&current.getNextNodeIndex()>=current.getNodeCount()-1)recordDestinationEntry(work,current);
                     if(tick-work.lastProgress>600)finish(work,NavigationRequestPath.State.FAILED);
                     continue;
@@ -822,10 +826,6 @@ public final class SegmentedNavigationService {
     }
     private void settle(Work work) {
         if(!live(work))return;
-        if(work.segmented&&(work.window!=null||work.sharedCandidate!=null)
-                &&(!planningCurrent(work)||work.nativeProof==null||!work.nativeProof.current())) {
-            rescheduleStaleInput(work);return;
-        }
         if(work.doneSince>=0&&work.level.getGameTime()-work.doneSince>LANDING_TTL) {
             if(work.lastNode!=null)work.avoided.add(work.lastNode);
             queue(work,()-> { recover(work);return null; });return;
@@ -843,34 +843,18 @@ public final class SegmentedNavigationService {
             queue(work,()-> { nextSegment(work);return null; });
         } else queue(work,()-> { recover(work);return null; });
     }
-    private void rescheduleStaleInput(Work work) {
-        work.segmentEntry=null;
-        queue(work,()-> {
-            if(planningCurrent(work)) {
-                work.request.clearNodes();
-                work.request.state=NavigationRequestPath.State.PENDING;
-                work.nativeStopped=false;
-                findSegment(work,work.segmentTargets,work.segmentAccuracy);
-            } else refresh(work);
-            return null;
-        });
-    }
     private boolean intermediateArrival(Work work) {
         if(work.sharedCandidate!=null)
-            return !work.nativeStopped&&work.segmentReachable&&planningCurrent(work)
-                    &&work.nativeProof!=null&&work.nativeProof.current()&&work.request.isDone();
-        if(work.nativeStopped||work.window==null||!work.window.current()
-                ||work.nativeProof==null||!work.nativeProof.current())return false;
+            return !work.nativeStopped&&work.segmentReachable&&work.request.isDone();
+        if(work.nativeStopped||work.window==null)return false;
         SegmentDestinationEntry entry=work.segmentEntry;
         if(entry!=null&&entry.request()==work.request&&entry.publication()==work.segmentPublication
                 &&entry.nativeProof()==work.nativeProof&&work.window!=null
                 &&work.window.destination.revision()==entry.windowRevision()
-                &&work.window.destination.componentId()==entry.destinationComponent()
-                &&work.window.current()&&entry.nativeProof().current()) {
+                &&work.window.destination.componentId()==entry.destinationComponent()) {
             return true;
         }
-        return work.window!=null&&work.window.current()
-                &&work.window.contains(work.request.mob.blockPosition());
+        return work.window.contains(work.request.mob.blockPosition());
     }
     private boolean finalArrival(Work work) {
         return work.request.mob.blockPosition().distManhattan(work.request.getTarget())<=work.request.intent.accuracy();
@@ -890,10 +874,6 @@ public final class SegmentedNavigationService {
     }
     private void recover(Work work) {
         if(!live(work))return;
-        if(work.segmented&&(work.window!=null||work.sharedCandidate!=null)&&work.request.getNodeCount()>0
-                &&(!planningCurrent(work)||work.nativeProof==null||!work.nativeProof.current())) {
-            rescheduleStaleInput(work);return;
-        }
         if(work.sharedCandidate!=null&&work.nativeStopped) {
             finish(work,NavigationRequestPath.State.EXHAUSTED);return;
         }
@@ -904,8 +884,11 @@ public final class SegmentedNavigationService {
                 &&intermediateArrival(work)&&physical(work)) {
             settle(work);return;
         }
-        AcceleratedNavigation.LOGGER.debug("Navigation {} recover: cursor={} end={} attempt={} stride={} last={} position={} avoided={}",
-                work.request.queryId,work.cursor,work.stageEnd,work.attempt,work.stride,work.last,work.request.mob.blockPosition(),work.avoided);
+        AcceleratedNavigation.LOGGER.debug("Navigation {} recover: cursor={} end={} attempt={} stride={} last={} avoidedCount={}",
+                work.request.queryId,work.cursor,work.stageEnd,work.attempt,work.stride,work.last,work.avoided.size());
+        if(AcceleratedNavigation.LOGGER.isTraceEnabled())
+            AcceleratedNavigation.LOGGER.trace("Navigation {} recovery details: position={} avoided={}",
+                    work.request.queryId,work.request.mob.blockPosition(),work.avoided);
         if(work.segmentTarget!=null)work.failedTargets.add(work.segmentTarget);
         recoveries++;work.recoveryCount++;
         if(work.recoveryCount>work.recoveryLimit) { finish(work,NavigationRequestPath.State.FAILED);return; }
@@ -938,11 +921,6 @@ public final class SegmentedNavigationService {
         work.segmentEntry=null;
         work.segmentTarget=null;
     }
-    private boolean planningCurrent(Work work) {
-        return work.sharedCandidate!=null
-                ? work.sharedInterest!=null&&work.sharedInterest.get()&&work.sharedCandidate.current()
-                : work.window!=null&&work.window.current();
-    }
     private void cancelShared(Work work) {
         if(work.sharedInterest!=null)work.sharedInterest.set(false);
         if(work.pendingShared!=null)work.pendingShared.cancel(false);
@@ -964,6 +942,7 @@ public final class SegmentedNavigationService {
             }
             if(work.macro!=null)work.macro.cancel();
             cancelShared(work);
+            work.sharedCandidate=null;work.corridor=null;work.edges=List.of();work.macro=null;
             if(work.pendingWindow!=null) {
                 if(work.pendingWindow.isDone()&&!work.pendingWindow.isCompletedExceptionally()) {
                     GroundSegmentWindow pending=work.pendingWindow.getNow(null);
