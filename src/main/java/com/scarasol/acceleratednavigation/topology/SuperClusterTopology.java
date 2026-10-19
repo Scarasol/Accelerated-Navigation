@@ -289,6 +289,56 @@ final class SuperClusterTopology {
             throw new IllegalArgumentException("base boundary views are not compatible");
         }
 
+        if (source.geometry().channel() == BaseClusterTopology.Channel.VOLUME)
+            return scalarBoundaryLinks(source, target, face);
+        Long2ObjectOpenHashMap<long[]> masks = new Long2ObjectOpenHashMap<>();
+        BoundaryGeometry collision = new BoundaryGeometry(source, target);
+        int sectionYDelta = (target.section().y() - source.section().y()) * BaseClusterTopology.SIDE;
+        boolean vertical = face.getAxis().isVertical();
+        boolean volume = source.geometry().channel() == BaseClusterTopology.Channel.VOLUME;
+        int depth = volume ? 1 : vertical
+                ? (face == Direction.UP ? BaseClusterTopology.MAX_STRUCTURAL_STEP
+                : BaseClusterTopology.MAX_STRUCTURAL_DROP) : BaseClusterTopology.MAX_STRUCTURAL_JUMP;
+        Direction[] directions = vertical && !volume ? HORIZONTAL_DIRECTIONS : new Direction[]{face};
+        int maximumDistance = volume ? (vertical ? 0 : 1) : BaseClusterTopology.MAX_STRUCTURAL_JUMP;
+        int minimumDy = volume ? face.getStepY() : -BaseClusterTopology.MAX_STRUCTURAL_DROP;
+        int maximumDy = volume ? face.getStepY() : BaseClusterTopology.MAX_STRUCTURAL_STEP;
+        for (int inset = 0; inset < depth; inset++) {
+            int firstDistance = volume && vertical ? 0 : vertical ? 1 : inset + 1;
+            for (int v = 0; v < BaseClusterTopology.SIDE; v++) {
+                for (Direction direction : directions) {
+                    for (int distance = firstDistance; distance <= maximumDistance; distance++) {
+                        for (int dy = minimumDy; dy <= maximumDy; dy++) {
+                            int candidates = source.portBits().candidates(target.portBits(), face, inset, v,
+                                    direction, distance, dy, sectionYDelta);
+                            while (candidates != 0) {
+                                int u = Integer.numberOfTrailingZeros(candidates);
+                                candidates &= candidates - 1;
+                                int cell = faceCell(face, u, v, inset);
+                                int component = source.componentAt(BaseClusterTopology.x(cell),
+                                        BaseClusterTopology.y(cell), BaseClusterTopology.z(cell));
+                                addBoundaryMask(masks, collision, source, component, target, face, cell,
+                                        faceIndex(u, v), inset, direction, distance, dy, sectionYDelta);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return BoundaryLinks.from(face, source.componentCount(), target.componentCount(), masks);
+    }
+
+    private static BoundaryLinks scalarBoundaryLinks(BaseClusterTopology source,
+                                       BaseClusterTopology target,
+                                       Direction face) {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(target, "target");
+        Objects.requireNonNull(face, "face");
+        if (!source.geometry().equals(target.geometry())
+                || !adjacentWithVerticalBand(source.section(), target.section(), face)) {
+            throw new IllegalArgumentException("base boundary views are not compatible");
+        }
+
         Long2ObjectOpenHashMap<long[]> masks = new Long2ObjectOpenHashMap<>();
         BoundaryGeometry collision = new BoundaryGeometry(source, target);
         int sectionYDelta = (target.section().y() - source.section().y()) * BaseClusterTopology.SIDE;

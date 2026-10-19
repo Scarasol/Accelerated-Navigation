@@ -106,7 +106,12 @@ final class TopologyWorkerRuntime {
     private long nextFactDecision;
     private final AtomicBoolean prewarmAllowed = new AtomicBoolean(true);
     private final Object runtimeLock = new Object();
-    private final ThreadLocal<List<Runnable>> afterRuntimeLock = new ThreadLocal<>();
+    private static final class DeferredActions {
+        boolean active;
+        List<Runnable> pending;
+    }
+    private final ThreadLocal<DeferredActions> afterRuntimeLock =
+            ThreadLocal.withInitial(DeferredActions::new);
     private Map<ClusterKey, SectionEvent> pendingSectionEvents = new HashMap<>();
     private Map<ClusterKey, SectionEvent> processingSectionEvents = Map.of();
     private Map<FactDecision, FactFeedback> pendingFactFeedback = new HashMap<>();
@@ -361,13 +366,14 @@ final class TopologyWorkerRuntime {
         if (Thread.holdsLock(runtimeLock)) {
             return command.get();
         }
-        List<Runnable> deferred = new ArrayList<>();
+        DeferredActions context = afterRuntimeLock.get();
+        List<Runnable> deferred;
         boolean wakePrewarm;
         T result = null;
         RuntimeException runtimeFailure = null;
         Error error = null;
         synchronized (runtimeLock) {
-            afterRuntimeLock.set(deferred);
+            context.active = true;
             try {
                 result = command.get();
                 if (allowPrewarmAdmission) admitPrewarm();
@@ -378,10 +384,12 @@ final class TopologyWorkerRuntime {
             } finally {
                 boolean allowed = !closed && !stopRequested && !foregroundWorkPresent();
                 wakePrewarm = allowed && !prewarmAllowed.getAndSet(allowed);
-                afterRuntimeLock.remove();
+                deferred = context.pending;
+                context.pending = null;
+                context.active = false;
             }
         }
-        deferred.forEach(Runnable::run);
+        if (deferred != null) deferred.forEach(Runnable::run);
         if (wakePrewarm) taskExecutor.signalWork();
         if (runtimeFailure != null) throw runtimeFailure;
         if (error != null) throw error;
@@ -389,11 +397,12 @@ final class TopologyWorkerRuntime {
     }
 
     private void afterRuntimeLock(Runnable action) {
-        List<Runnable> deferred = afterRuntimeLock.get();
-        if (deferred == null) {
+        DeferredActions context = afterRuntimeLock.get();
+        if (!context.active) {
             action.run();
         } else {
-            deferred.add(action);
+            if (context.pending == null) context.pending = new ArrayList<>();
+            context.pending.add(action);
         }
     }
 
@@ -7343,6 +7352,10 @@ final class TopologyWorkerRuntime {
             SuperClusterTopology.BoundaryLinks links =
                     sourceTopology.boundaryLinks(face, -yShift, targetTopology);
             if (links == null) {
+                if (!BoundaryPortBits.mayLink(source, -1, targetTopology.topology, target.componentId(), face)) {
+                    output.completePart(part);
+                    return;
+                }
                 output.addDependency(part, MacroSearch.DependencyKey.baseBoundary(
                         sourceSection, target.cluster().section(), face));
                 return;
@@ -7442,6 +7455,10 @@ final class TopologyWorkerRuntime {
             SuperClusterTopology.BoundaryLinks links =
                     sourceTopology.boundaryLinks(face, yShift, neighbor);
             if (links == null) {
+                if (!BoundaryPortBits.mayLink(sourceTopology.topology, sourceComponentId, neighbor.topology, -1, face)) {
+                    output.completePart(part);
+                    return;
+                }
                 output.addDependency(part, MacroSearch.DependencyKey.baseBoundary(
                         source.cluster().section(), neighborSection, face));
                 return;

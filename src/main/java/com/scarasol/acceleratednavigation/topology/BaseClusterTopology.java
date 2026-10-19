@@ -55,6 +55,8 @@ public final class BaseClusterTopology {
     private final long[] haloRevisions;
     private final long[] haloFingerprints;
     private final BuildInput boundaryFacts;
+    private final BoundaryPortBits portBits;
+    BoundaryPortBits portBits() { return portBits; }
     private final long signature;
     private final int retainedBytes;
     private volatile IncomingEdges incomingEdges;
@@ -73,7 +75,7 @@ public final class BaseClusterTopology {
                                 byte[] haloOffsets,
                                 long[] haloRevisions,
                                 long[] haloFingerprints,
-                                BuildInput boundaryFacts) {
+                                BuildInput boundaryFacts, BoundaryPortBits portBits) {
         this.section = Objects.requireNonNull(section, "section");
         this.revision = revision;
         this.sourceFingerprint = sourceFingerprint;
@@ -89,6 +91,7 @@ public final class BaseClusterTopology {
         this.haloRevisions = haloRevisions;
         this.haloFingerprints = haloFingerprints;
         this.boundaryFacts = Objects.requireNonNull(boundaryFacts, "boundaryFacts");
+        this.portBits = portBits;
         this.signature = signature(section, revision, sourceFingerprint, geometry,
                 haloOffsets, haloRevisions, haloFingerprints);
         this.retainedBytes = 128 + componentLabels.getRaw().length * Long.BYTES
@@ -97,7 +100,7 @@ public final class BaseClusterTopology {
                 + outgoingCapabilityMasks.length * Long.BYTES
                 + outgoingLowerBounds.length * Float.BYTES
                 + haloOffsets.length + (haloRevisions.length + haloFingerprints.length) * Long.BYTES
-                + boundaryFacts.referenceBytes()
+                + boundaryFacts.referenceBytes() + (portBits == null ? 0 : portBits.retainedBytes())
                 + IncomingEdges.reservedBytes(componentCount(), outgoingTargets.length);
         validate();
     }
@@ -136,7 +139,7 @@ public final class BaseClusterTopology {
                 stamps.offsets,
                 stamps.revisions,
                 stamps.fingerprints,
-                boundaryFacts
+                boundaryFacts, geometry.channel() == Channel.GROUND ? new BoundaryPortBits(scratch.legalMask) : null
         );
     }
 

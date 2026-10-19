@@ -28,8 +28,13 @@ export function traceIntegrity(statuses, events) {
   return errors;
 }
 export const coverageScenes=['entity-stationary','entity-drift','ai-goalselector','brain-walk-target',
-  'query-only-multi','query-ready-adopt-multi','query-pending-adopt-multi','shared-accuracy0',
-  'legacy-createpath-move','poi-acquire','dynamic-block','native-stuck-recovery'];
+  'query-only-multi','query-ready-adopt-multi','query-pending-adopt-multi','shared-cold1','shared-warm1','shared-accuracy0',
+  'legacy-createpath-move','poi-acquire','dynamic-block','native-stuck-recovery',
+  'shared-accuracy1','shared-boundary1','shared-neighbor1','shared-obstacle1',
+  'shared-drift1','shared-cancel1','shared-replace1','shared-range4','shared-range12',
+  'shared-dynamic1','shared-pending-cancel1','shared-pending-replace1','shared-timeout1',
+  'shared-low-budget0','shared-anchor-drift0',
+  'shared-query-only-multi','shared-query-ready-adopt-multi','shared-query-pending-adopt-multi'];
 export function qualificationReasons(accuracy, width, height, start, goal) {
   const reasons=[];
   if(accuracy!==0)reasons.push('accuracy');
@@ -97,6 +102,7 @@ export function analyze(directory) {
     single:['same8-first-use','same8-repeat','cross8-first-use','cross8-repeat','cross28-first-use','cross28-repeat','single-wall8','doorway8'],
     burst:['warmup8','warmup28','burst8','burst28'],
     supplement:['doorway8-known-slots','super304','ai-melee-query-adopt'],
+    closure:['super304-cold','super304-warm'],
     coverage:coverageScenes,
     failures:[8,28].flatMap(d=>[`wall${d}-all`,`door${d}-all`,`wall${d}-reverse`,`door${d}-reverse`])
       .concat(['explicit-range4','explicit-range12','cancel-pending','cancel-published','replace-pending'])

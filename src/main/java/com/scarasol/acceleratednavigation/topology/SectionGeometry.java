@@ -35,6 +35,7 @@ final class SectionGeometry {
     private final Shape[] palette;
     private final long fingerprint;
     private final boolean hasDoors;
+    private final short[] nonEmptyRows;
 
     private SectionGeometry(short[] cells, Shape[] palette) {
         this.cells = cells;
@@ -42,6 +43,11 @@ final class SectionGeometry {
         this.fingerprint = fingerprint(cells, palette);
         this.hasDoors = Arrays.stream(palette).anyMatch(Shape::isDoor);
         validate();
+        this.nonEmptyRows = new short[256];
+        for (int cell = 0; cell < cells.length; cell++) {
+            if (palette[Short.toUnsignedInt(cells[cell])].coordinateCount() != 0)
+                nonEmptyRows[cell >>> 4] |= (short) (1 << (cell & 15));
+        }
     }
 
     static SectionGeometry allAir() {
@@ -170,6 +176,10 @@ final class SectionGeometry {
 
     boolean hasDoors() { return hasDoors; }
 
+    int nonEmptyRow(int y, int z) {
+        return Short.toUnsignedInt(nonEmptyRows[(y << 4) | z]);
+    }
+
     boolean occupied(int cell, float width, float height, boolean canOpenDoors) {
         Shape shape = shape(cell);
         if (shape == Shape.EMPTY || canOpenDoors && shape.openableDoor()) return false;
@@ -188,7 +198,7 @@ final class SectionGeometry {
     }
 
     int retainedBytes() {
-        int total = 16 + cells.length * Short.BYTES;
+        int total = 16 + cells.length * Short.BYTES + 16 + nonEmptyRows.length * Short.BYTES;
         for (Shape shape : palette) total += shape.coordinates.length * Short.BYTES;
         return total;
     }

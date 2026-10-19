@@ -267,3 +267,23 @@ tasks.register('verifyCoreContracts', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.scarasol.acceleratednavigation.topology.CoreContracts'
 }
+
+tasks.register('verifyWorkerAlgorithms', JavaExec) {
+    group = 'verification'
+    description = 'Checks worker selection, boundary bitmaps, collision rows and callback contracts.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.scarasol.acceleratednavigation.topology.WorkerAlgorithmContracts'
+}
+
+tasks.register('verifySharedStages', JavaExec) {
+    group = 'verification'
+    description = 'Checks shared stage selection against an independent suffix oracle and Base components.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.scarasol.acceleratednavigation.topology.SharedStageContracts'
+}
+
+tasks.named('check').configure {
+    dependsOn tasks.named('verifyCoreContracts'), tasks.named('verifyWorkerAlgorithms'), tasks.named('verifySharedStages')
+}

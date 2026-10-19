@@ -14,6 +14,7 @@ public final class SharedSectionCandidate {
     }
     private final RuntimeSharedTopology.Result source;
     private final List<BlockPos> anchors;
+    private final int walkingSuffix;
 
     SharedSectionCandidate(SectionPos section, RuntimeSharedTopology.Result source) {
         this.source = source;
@@ -21,6 +22,13 @@ public final class SharedSectionCandidate {
                 section.minBlockX() + BaseClusterTopology.x(cell),
                 section.minBlockY() + BaseClusterTopology.y(cell),
                 section.minBlockZ() + BaseClusterTopology.z(cell))).toList();
+        int suffix=anchors.size()-1;
+        while(suffix>0) {
+            BlockPos from=anchors.get(suffix-1),to=anchors.get(suffix);
+            if(from.getY()!=to.getY()||from.distManhattan(to)!=1)break;
+            suffix--;
+        }
+        walkingSuffix=suffix;
     }
 
     public boolean current() { return source.current(); }
@@ -28,6 +36,19 @@ public final class SharedSectionCandidate {
     public String state() { return source.state(); }
     public List<BlockPos> anchors() { return anchors; }
     public long newRows() { return source.newRows(); }
+
+    public int stageEnd(int cursor,float range) {
+        return stageEnd(cursor,range,true);
+    }
+
+    public int stageEnd(int cursor,float range,boolean coalesce) {
+        if(cursor<0||cursor>=anchors.size())throw new IndexOutOfBoundsException("shared cursor");
+        if(!Float.isFinite(range)||range<0)throw new IllegalArgumentException("shared range");
+        int last=anchors.size()-1;
+        // A level unit-step suffix stays in one ordinary Base component.
+        // Native PathFinder requires walkedDistance < range, including at the target.
+        return coalesce&&cursor>=walkingSuffix&&last-cursor<range?last:Math.min(last,cursor+4);
+    }
 
     public static boolean supports(BaseClusterTopology.TraversalProfile profile,
                                    BlockPos start, BlockPos goal, int accuracy) {

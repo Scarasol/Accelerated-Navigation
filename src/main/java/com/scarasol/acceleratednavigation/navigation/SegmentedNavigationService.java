@@ -240,6 +240,7 @@ public final class SegmentedNavigationService {
         CompletableFuture<GroundSegmentWindow> pendingWindow;
         CompletableFuture<SharedSectionCandidate> pendingShared;
         SharedSectionCandidate sharedCandidate;
+        boolean sharedMergeRejected;
         AtomicBoolean sharedInterest;
         TopologyService.MacroRequest macro;
         NavigationPreview preview;
@@ -479,9 +480,17 @@ public final class SegmentedNavigationService {
         work.nativeStopped=false;work.doneSince=-1;
         if(work.sharedCandidate!=null) {
             var anchors=work.sharedCandidate.anchors();
-            work.stageEnd=Math.min(anchors.size()-1,work.cursor+4);
+            int legacyEnd=Math.min(anchors.size()-1,work.cursor+4);
+            int legacyStages=(anchors.size()-1-work.cursor+3)/4;
+            boolean coalesce=!work.sharedMergeRejected&&legacyStages<work.searchLimit-work.searches;
+            work.stageEnd=work.sharedCandidate.stageEnd(work.cursor,work.request.intent.range(),coalesce);
             work.last=work.stageEnd==anchors.size()-1;
-            if(work.last)updateEntityTarget(work);
+            if(work.last) {
+                updateEntityTarget(work);
+                if(work.stageEnd>legacyEnd&&!anchors.get(anchors.size()-1).equals(work.request.getTarget())) {
+                    work.stageEnd=legacyEnd;work.last=work.stageEnd==anchors.size()-1;
+                }
+            }
             BlockPos target=work.last?work.request.getTarget():anchors.get(work.stageEnd);
             sharedSectionSegments++;
             findSegment(work,Set.of(target),work.last?work.request.intent.accuracy():0);
@@ -545,6 +554,12 @@ public final class SegmentedNavigationService {
         nativeCalls++;segmentCalls++;
         work.nativeProof=result.proof();
         Path path=result.path();
+        if(work.sharedCandidate!=null&&!work.sharedMergeRejected&&work.stageEnd>work.cursor+4
+                &&(result.unavailable()||path==null||path.getNodeCount()==0||path.getEndNode()==null||!path.canReach())) {
+            work.sharedMergeRejected=true;
+            queueReady(work,()-> { nextSegment(work);return null; });
+            return;
+        }
         work.segmentTarget=path==null?null:path.getTarget();
         AcceleratedNavigation.LOGGER.debug("Navigation {} native segment result: cursor={} end={} last={} range={} reachable={} nodeCount={} unknown={}",
                 work.request.queryId,work.cursor,work.stageEnd,work.last,range,

@@ -48,8 +48,29 @@ public final class Agent {
         TARGETS.put("an/production/TimelineScenarioProbe", Set.of());
         TARGETS.put("an/production/CoverageScenarioProbe", Set.of("observe","track","action"));
         TARGETS.put("an/trace/SelfCheck", Set.of("root","nested","failure"));
+        if (Boolean.getBoolean("an.trace.closure")) {
+            extend("topology/TopologyWorkerRuntime", "markLatestDerivedStale", "invalidateHaloDependents",
+                    "changeFactReferences", "changeTopologyFactReferences", "holdFacts", "releaseHeldFacts",
+                    "pinBase", "releaseBasePin", "pinSuper", "releaseSuperPin", "buildInput",
+                    "requestClusterDependency", "requestSuperCluster", "beginSuperRequest", "completeSuperChildren",
+                    "beginSuperBuild", "beginSuperBoundaryChildren", "requestBaseBoundaryLinks",
+                    "requestSuperBoundaryLinks", "captureBaseStamps", "finishCorridors", "replayCompletedCorridor");
+            extend("topology/TopologyWorkerRuntime$MacroQuery", "prepareEndpoints", "requestDependency",
+                    "completeDependencyRequest", "captureDependency", "attachResolvedDependencies",
+                    "prepareRecoveryWitness", "captureComponents", "drainDeferredGraphs");
+            target("topology/TopologyWorkerRuntime$TopologyGraph", "expandInto", "captureInitialTopology",
+                    "attachTopology", "attachBoundary", "binding", "close");
+            target("topology/TopologyWorkerRuntime$SuperTopologyGraph", "expandInto", "captureInitialTopology",
+                    "attachTopology", "attachBoundary", "binding", "close");
+            target("topology/BoundaryPortBits", "mayLink");
+        }
     }
     static void target(String owner, String... names) { TARGETS.put(BASE+owner, Set.of(names)); }
+    static void extend(String owner, String... names) {
+        Set<String> merged = new LinkedHashSet<>(TARGETS.getOrDefault(BASE+owner, Set.of()));
+        merged.addAll(Arrays.asList(names));
+        TARGETS.put(BASE+owner, Set.copyOf(merged));
+    }
     public static void premain(String directory, Instrumentation inst) throws Exception {
         instrumentation = inst;
         Path root = Path.of(directory);

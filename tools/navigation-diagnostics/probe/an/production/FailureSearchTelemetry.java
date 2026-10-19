@@ -16,7 +16,10 @@ import net.minecraft.world.level.pathfinder.*;
 public final class FailureSearchTelemetry {
     private static final JsonArray ROWS=new JsonArray();
     private static final Gson JSON=new GsonBuilder().setPrettyPrinting().create();
-    private static final boolean ENABLED=System.getProperty("an.trace.suite","").equals("failures");
+    private static final boolean ENABLED=System.getProperty("an.trace.suite","").equals("failures")
+            ||System.getProperty("an.trace.suite","").equals("coverage")
+                &&System.getProperty("an.trace.scene","").contains("shared-")
+                &&!Boolean.getBoolean("an.trace.omitObservations");
     private static final boolean REPLAY=Boolean.getBoolean("an.trace.replay");
     private static final ThreadLocal<JsonObject> COUNTERS=new ThreadLocal<>();
     public static void beginSearch(Node start,float range) {

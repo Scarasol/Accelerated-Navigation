@@ -77,31 +77,42 @@ final class BoundaryGeometry {
         int minY = (int) Math.floor(y + lowY), maxY = (int) Math.ceil(y + highY + height) - 1;
         rectangleCoordinates = 0;
         for (int cy = minY; cy <= maxY; cy++) for (int cz = minZ; cz <= maxZ; cz++) {
-            for (int cx = minX; cx <= maxX; cx++) {
-                SectionGeometry geometry = at(cx, cy, cz);
+            for (int rowStart = minX; rowStart <= maxX;) {
+                int rowEnd = (int) Math.min((long) maxX, ((long) (rowStart >> 4) + 1) * 16 - 1);
+                SectionGeometry geometry = at(rowStart, cy, cz);
                 if (geometry == null) return false;
-                SectionGeometry.Shape shape = geometry.shape(BaseClusterTopology.cellIndex(
-                        Math.floorMod(cx, 16), Math.floorMod(cy, 16), Math.floorMod(cz, 16)));
-                if (body.canOpenDoors() && shape.openableDoor()) continue;
-                for (int box = 0; box < shape.coordinateCount(); box += 6) {
-                    double aS = (xAxis ? cx : cz) + shape.coordinate(box + (xAxis ? 0 : 2)) / 16.;
-                    double bS = (xAxis ? cx : cz) + shape.coordinate(box + (xAxis ? 3 : 5)) / 16.;
-                    double aL = (xAxis ? cz : cx) + shape.coordinate(box + (xAxis ? 2 : 0)) / 16.;
-                    double bL = (xAxis ? cz : cx) + shape.coordinate(box + (xAxis ? 5 : 3)) / 16.;
-                    if (aL >= lateral + half || bL <= lateral - half) continue;
-                    double aY = cy + shape.coordinate(box + 1) / 16. - height - y;
-                    double bY = cy + shape.coordinate(box + 4) / 16. - y;
-                    double a = sign > 0 ? aS - originS - half : originS - bS - half;
-                    double b = sign > 0 ? bS - originS + half : originS - aS + half;
-                    if (a >= distance || b <= 0 || aY >= highY || bY <= lowY) continue;
-                    if (rectangleCoordinates + 4 > rectangles.length) {
-                        rectangles = Arrays.copyOf(rectangles, Math.max(32, rectangles.length * 2));
+                int first = rowStart & 15, last = rowEnd & 15;
+                int mask = geometry.nonEmptyRow(cy & 15, cz & 15)
+                        & (0xffff << first) & (0xffff >>> (15 - last));
+                while (mask != 0) {
+                    int localX = Integer.numberOfTrailingZeros(mask);
+                    mask &= mask - 1;
+                    int cx = rowStart - first + localX;
+                    SectionGeometry.Shape shape = geometry.shape(BaseClusterTopology.cellIndex(
+                            cx & 15, cy & 15, cz & 15));
+                    if (body.canOpenDoors() && shape.openableDoor()) continue;
+                    for (int box = 0; box < shape.coordinateCount(); box += 6) {
+                        double aS = (xAxis ? cx : cz) + shape.coordinate(box + (xAxis ? 0 : 2)) / 16.;
+                        double bS = (xAxis ? cx : cz) + shape.coordinate(box + (xAxis ? 3 : 5)) / 16.;
+                        double aL = (xAxis ? cz : cx) + shape.coordinate(box + (xAxis ? 2 : 0)) / 16.;
+                        double bL = (xAxis ? cz : cx) + shape.coordinate(box + (xAxis ? 5 : 3)) / 16.;
+                        if (aL >= lateral + half || bL <= lateral - half) continue;
+                        double aY = cy + shape.coordinate(box + 1) / 16. - height - y;
+                        double bY = cy + shape.coordinate(box + 4) / 16. - y;
+                        double a = sign > 0 ? aS - originS - half : originS - bS - half;
+                        double b = sign > 0 ? bS - originS + half : originS - aS + half;
+                        if (a >= distance || b <= 0 || aY >= highY || bY <= lowY) continue;
+                        if (rectangleCoordinates + 4 > rectangles.length) {
+                            rectangles = Arrays.copyOf(rectangles, Math.max(32, rectangles.length * 2));
+                        }
+                        rectangles[rectangleCoordinates++] = a;
+                        rectangles[rectangleCoordinates++] = aY;
+                        rectangles[rectangleCoordinates++] = b;
+                        rectangles[rectangleCoordinates++] = bY;
                     }
-                    rectangles[rectangleCoordinates++] = a;
-                    rectangles[rectangleCoordinates++] = aY;
-                    rectangles[rectangleCoordinates++] = b;
-                    rectangles[rectangleCoordinates++] = bY;
                 }
+                if (rowEnd == maxX) break;
+                rowStart = rowEnd + 1;
             }
         }
         if (!pointClear(0, 0) || !pointClear(distance, dy)) return false;
@@ -199,7 +210,6 @@ final class BoundaryGeometry {
     }
 
     private boolean segmentClear(double as, double ay, double bs, double by) {
-        if (!pointClear(as, ay) || !pointClear(bs, by)) return false;
         for (int i = 0; i < rectangleCoordinates; i += 4) {
             if (as == bs) {
                 if (as > rectangles[i] && as < rectangles[i + 2]

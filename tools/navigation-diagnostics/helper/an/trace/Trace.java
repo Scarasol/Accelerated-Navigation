@@ -12,6 +12,7 @@ public final class Trace {
     public static volatile int trial;
     public static volatile int tick;
     public static final boolean ENABLED = !Boolean.getBoolean("an.trace.disabled");
+    private static final boolean CLOSURE = Boolean.getBoolean("an.trace.closure");
     private static final int CAPACITY = Integer.getInteger("an.trace.capacity", 350_000);
     private static final com.sun.management.ThreadMXBean MEMORY =
             (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
@@ -34,6 +35,8 @@ public final class Trace {
     };
     static {
         if (!MEMORY.isThreadAllocatedMemoryEnabled()) MEMORY.setThreadAllocatedMemoryEnabled(true);
+        if (CLOSURE && MEMORY.isCurrentThreadCpuTimeSupported() && !MEMORY.isThreadCpuTimeEnabled())
+            MEMORY.setThreadCpuTimeEnabled(true);
     }
     private static final class Buffer {
         final Thread thread = Thread.currentThread();
@@ -46,6 +49,8 @@ public final class Trace {
                 b = new Object[CAPACITY], result = new Object[CAPACITY];
         final int[] stack = new int[256];
         final long[] childTime = new long[256], childBytes = new long[256], allocated = new long[256];
+        final long[] cpu = new long[CLOSURE ? CAPACITY : 0], exclusiveCpu = new long[CLOSURE ? CAPACITY : 0];
+        final long[] enteredCpu = new long[256], childCpu = new long[256];
         int size, depth, suppressed;
         long errors, dropped;
     }
@@ -87,6 +92,11 @@ public final class Trace {
         buffer.stack[d] = i; buffer.childTime[d] = buffer.childBytes[d] = 0;
         buffer.phase[i] = phase; buffer.trials[i] = trial; buffer.ticks[i] = tick; buffer.depths[i] = d;
         buffer.self[i] = self; buffer.a[i] = a; buffer.b[i] = b;
+        if (CLOSURE && a == null && b == null && self != null
+                && self.getClass().getName().endsWith("TopologyWorkerRuntime$MacroQuery")) {
+            buffer.a[i] = field(self, "baseGraph");
+            buffer.b[i] = field(self, "superGraph");
+        }
         Object work = isWork(self) ? self : isWork(a) ? a : isWork(b) ? b : null;
         if (work != null) {
             buffer.detail[i] = number(work, "segmentPublication");
@@ -97,6 +107,10 @@ public final class Trace {
                     | (Boolean.TRUE.equals(field(work,"nativeStopped")) ? 1L << 48 : 0);
         }
         buffer.allocated[d] = allocated();
+        if (CLOSURE) {
+            buffer.enteredCpu[d] = MEMORY.getCurrentThreadCpuTime();
+            buffer.childCpu[d] = 0;
+        }
         buffer.start[i] = System.nanoTime();
     }
     private static boolean isWork(Object object) {
@@ -114,6 +128,12 @@ public final class Trace {
         buffer.end[i] = end; buffer.bytes[i] = allocation; buffer.result[i] = result;
         buffer.exclusive[i] = elapsed - buffer.childTime[d];
         buffer.exclusiveBytes[i] = allocation - buffer.childBytes[d];
+        if (CLOSURE) {
+            long cpu = MEMORY.getCurrentThreadCpuTime() - buffer.enteredCpu[d];
+            buffer.cpu[i] = cpu;
+            buffer.exclusiveCpu[i] = cpu - buffer.childCpu[d];
+            if (d != 0) buffer.childCpu[d - 1] += cpu;
+        }
         buffer.flags[i] = completed ? 0 : 1;
         if (d != 0) { buffer.childTime[d - 1] += elapsed; buffer.childBytes[d - 1] += allocation; }
     }
@@ -155,14 +175,16 @@ public final class Trace {
         IdentityHashMap<Object, Integer> ids = new IdentityHashMap<>();
         List<Object> objects = new ArrayList<>();
         try (var out = Files.newBufferedWriter(directory.resolve("events.tsv"), StandardOpenOption.CREATE_NEW)) {
-            out.write("thread\ttrial\ttick\tphase\tdepth\tstart\tend\texclusive\tbytes\texclusiveBytes\tself\ta\tb\tresult\tdetail\tdetail2\tfailed\tworkState\n");
+            out.write("thread\ttrial\ttick\tphase\tdepth\tstart\tend\texclusive\tbytes\texclusiveBytes\tself\ta\tb\tresult\tdetail\tdetail2\tfailed\tworkState"
+                    +(CLOSURE ? "\tcpu\texclusiveCpu" : "")+"\n");
             for (Buffer buffer : BUFFERS) for (int i = 0; i < buffer.size; i++) {
                 if (buffer.trials[i] == 0) continue;
                 out.write(buffer.thread.getId()+"\t"+buffer.trials[i]+"\t"+buffer.ticks[i]+"\t"+buffer.phase[i]+"\t"+
                         buffer.depths[i]+"\t"+buffer.start[i]+"\t"+buffer.end[i]+"\t"+buffer.exclusive[i]+"\t"+
                         buffer.bytes[i]+"\t"+buffer.exclusiveBytes[i]+"\t"+id(ids,objects,buffer.self[i])+"\t"+
                         id(ids,objects,buffer.a[i])+"\t"+id(ids,objects,buffer.b[i])+"\t"+id(ids,objects,buffer.result[i])+"\t"+
-                                buffer.detail[i]+"\t"+buffer.detail2[i]+"\t"+buffer.flags[i]+"\t"+buffer.workState[i]+"\n");
+                                buffer.detail[i]+"\t"+buffer.detail2[i]+"\t"+buffer.flags[i]+"\t"+buffer.workState[i]
+                                +(CLOSURE ? "\t"+buffer.cpu[i]+"\t"+buffer.exclusiveCpu[i] : "")+"\n");
             }
         }
         try (var out = Files.newBufferedWriter(directory.resolve("objects.tsv"), StandardOpenOption.CREATE_NEW)) {
@@ -171,19 +193,28 @@ public final class Trace {
                 Object object = objects.get(i); Class<?> type = object.getClass();
                 int id = i + 1;
                 out.write(id+"\t"+clean(type.getName())+"\t\tlabel\t"+clean(label(object))+"\n");
+                if (CLOSURE && object instanceof Collection<?> collection && collection.size() <= 512) {
+                    int index=0;
+                    for (Object value : collection) if (value != null)
+                        out.write(id+"\t"+clean(type.getName())+"\titem"+index+++"\tref\t"+id(ids,objects,value)+"\n");
+                }
+                if (CLOSURE && object instanceof Object[] array && array.length <= 512)
+                    for (int index=0; index<array.length; index++) if (array[index] != null)
+                        out.write(id+"\t"+clean(type.getName())+"\titem"+index+"\tref\t"+id(ids,objects,array[index])+"\n");
                 if (!type.getName().startsWith("com.scarasol.acceleratednavigation.")
                         && !type.getName().startsWith("an.production.")) continue;
                 for (Field field : FIELDS.get(type).values()) {
                     if (field.getName().equals("this$0") || field.getName().equals("level")
-                            || field.getName().equals("server") || field.getName().equals("topology")
-                            || field.getType().isArray()) continue;
+                            || field.getName().equals("server") || field.getName().equals("topology") && !CLOSURE
+                            || field.getType().isArray() && (!CLOSURE || field.getType().getComponentType().isPrimitive())) continue;
                     try {
                         Object value = field.get(object);
                         if (value == null) continue;
                         boolean scalar = field.getType().isPrimitive() || value instanceof String
                                 || value instanceof UUID || value instanceof Enum<?>;
                         if (!scalar && !(value.getClass().getName().startsWith("com.scarasol.acceleratednavigation.")
-                                || field.getName().startsWith("arg$") || field.getName().equals("targets"))) continue;
+                                || field.getName().startsWith("arg$") || field.getName().equals("targets")
+                                || CLOSURE && closureValue(value))) continue;
                         out.write(id+"\t"+clean(type.getName())+"\t"+field.getName()+"\t"+(scalar?"scalar":"ref")+"\t"+
                                 (scalar?clean(String.valueOf(value)):id(ids,objects,value))+"\n");
                     } catch (ReflectiveOperationException error) { throw new IOException(error); }
@@ -202,6 +233,12 @@ public final class Trace {
         Integer existing = ids.get(value);
         if (existing != null) return existing;
         int id = objects.size() + 1; objects.add(value); ids.put(value,id); return id;
+    }
+    private static boolean closureValue(Object value) {
+        String name=value.getClass().getName();
+        return name.equals("net.minecraft.core.BlockPos") || name.equals("net.minecraft.core.SectionPos")
+                || value instanceof Collection<?> collection && collection.size() <= 512
+                || value instanceof Object[] array && array.length <= 512;
     }
     private static String label(Object value) {
         String name = value.getClass().getName();

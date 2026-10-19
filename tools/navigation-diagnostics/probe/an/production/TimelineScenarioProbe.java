@@ -59,10 +59,14 @@ public final class TimelineScenarioProbe {
     private MinecraftServer server;
     private ServerLevel level;
     private SegmentedNavigationService service;
+    private NavigationScheduler scheduler;
     private int index=-1, ticks, prepareTick, closeTick=-1;
     private long started, ready, submitted, closed, nextSample;
     private Measurements.Snapshot initialCost, finalCost;
     private Object topologyBefore, topologyAfter;
+    private Object sharedBefore,sharedAfter;
+    private long sharedRequestsBefore,sharedSegmentsBefore,sharedFallbacksBefore;
+    private long sharedRequestsAfter,sharedSegmentsAfter,sharedFallbacksAfter;
     private Method metrics;
     private boolean closing, done, submittedScene;
     private String failure="";
@@ -97,6 +101,9 @@ public final class TimelineScenarioProbe {
             scenes.add(new Scene("warmup28",28,64,"reference"));
             scenes.add(new Scene("burst8",8,512,"reference"));
             scenes.add(new Scene("burst28",28,512,"reference"));
+        } else if(suite.equals("closure")) {
+            scenes.add(new Scene("super304-cold",304,1,"long"));
+            scenes.add(new Scene("super304-warm",304,1,"long"));
         } else if(suite.equals("supplement")) {
             scenes.add(new Scene("doorway8-known-slots",8,8,"door-known"));
             scenes.add(new Scene("super304",304,1,"long"));
@@ -141,6 +148,7 @@ public final class TimelineScenarioProbe {
             Method load=PerformanceComparisonProbe.class.getDeclaredMethod("loadArena",ServerLevel.class);
             load.setAccessible(true);load.invoke(null,level);
             service=SegmentedNavigationService.forServer(server);
+            scheduler=NavigationScheduler.forServer(server);
             metrics=TopologyService.class.getDeclaredMethod("metrics");metrics.setAccessible(true);
             String base="com.scarasol.acceleratednavigation.";
             for(String name:List.of("navigation.SegmentedNavigationService$Work","topology.TopologyTaskExecutor$Task",
@@ -205,6 +213,10 @@ public final class TimelineScenarioProbe {
                 Trace.trial=index+1;
                 Trace.clock();
                 topologyBefore=metrics.invoke(TopologyService.forServer(server));
+                sharedBefore=TopologyService.forServer(server).sharedTopologyMetrics();
+                sharedRequestsBefore=service.sharedSectionRequests();
+                sharedSegmentsBefore=service.sharedSectionSegments();
+                sharedFallbacksBefore=service.sharedSectionFallbacks();
                 initialCost=Measurements.snapshot();submitted=System.nanoTime();submittedScene=true;
                 for(Actor actor:actors) {
                     if(AutomaticNavigationBridge.enabled(actor.mob.getNavigation())==vanilla)
@@ -280,6 +292,10 @@ public final class TimelineScenarioProbe {
             if(actors.stream().allMatch(a->a.terminal!=0&&ticks-a.terminalTick>=10)) {
                 closed=System.nanoTime();finalCost=Measurements.snapshot();
                 topologyAfter=metrics.invoke(TopologyService.forServer(server));
+                sharedAfter=TopologyService.forServer(server).sharedTopologyMetrics();
+                sharedRequestsAfter=service.sharedSectionRequests();
+                sharedSegmentsAfter=service.sharedSectionSegments();
+                sharedFallbacksAfter=service.sharedSectionFallbacks();
                 closeTick=ticks;Trace.clock();Trace.trial=0;
             }
         }catch(Throwable error){abort(error);}
@@ -302,6 +318,9 @@ public final class TimelineScenarioProbe {
         row.add("costStart",gson.toJsonTree(initialCost));row.add("costEnd",gson.toJsonTree(finalCost));
         row.add("costSamples",costSamples.deepCopy());
         row.add("topologyBefore",gson.toJsonTree(topologyBefore));row.add("topologyAfter",gson.toJsonTree(topologyAfter));
+        row.add("sharedRuntimeBefore",gson.toJsonTree(sharedBefore));row.add("sharedRuntimeAfter",gson.toJsonTree(sharedAfter));
+        row.add("sharedDelta",gson.toJsonTree(Map.of("requests",sharedRequestsAfter-sharedRequestsBefore,
+                "segments",sharedSegmentsAfter-sharedSegmentsBefore,"fallbacks",sharedFallbacksAfter-sharedFallbacksBefore)));
         JsonArray all=new JsonArray();
         for(Actor actor:actors) {
             JsonObject a=new JsonObject();
@@ -347,9 +366,11 @@ public final class TimelineScenarioProbe {
     }
     private void abort(Throwable error){failure=error.toString();error.printStackTrace();stop();}
     private void stop(){if(closing)return;closing=true;Trace.trial=0;try{write();}catch(Exception e){e.printStackTrace();}server.halt(false);}
-    @SubscribeEvent public void stopped(ServerStoppedEvent event) throws Exception {
+    @SubscribeEvent(priority=EventPriority.LOWEST) public void stopped(ServerStoppedEvent event) throws Exception {
         JsonObject row=new JsonObject();row.addProperty("passed",done&&failure.isEmpty()&&service.metrics().records()==0
-                &&NavigationScheduler.forServer(server).metrics().pendingRequests()==0);
-        row.add("service",gson.toJsonTree(service.metrics()));Files.writeString(output.resolve("shutdown.json"),gson.toJson(row));
+                &&scheduler.metrics().pendingRequests()==0);
+        row.add("service",gson.toJsonTree(service.metrics()));
+        row.add("scheduler",gson.toJsonTree(scheduler.metrics()));
+        Files.writeString(output.resolve("shutdown.json"),gson.toJson(row));
     }
 }

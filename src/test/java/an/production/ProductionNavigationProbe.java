@@ -75,6 +75,7 @@ public final class ProductionNavigationProbe {
     private int recomputations;
     private int semanticChanges;
     private long wholeBeforePartial;
+    private long semanticWholeBefore,semanticSegmentsBefore;
     private long deferredNativeBefore,deferredDecisionBefore,deferredWholeBefore,deferredSegmentsBefore;
     private boolean sawSegmentPartial;
     private BlockPos selectedDecisionTarget;
@@ -238,6 +239,8 @@ public final class ProductionNavigationProbe {
                 actor.discard();
             }
             var goal=new MeleeAttackGoal((net.minecraft.world.entity.PathfinderMob)pig,1,true);
+            semanticWholeBefore=service.metrics().nativeWholeCalls();
+            semanticSegmentsBefore=service.metrics().segmentCalls();
             request=AutomaticNavigationBridge.delegate(goal,1,"SELECT",()->(NavigationRequestPath)pig.getNavigation().createPath(target,1));
             check("query-does-not-move",request!=null&&pig.getNavigation().isDone()&&pig.getNavigation().getPath()==null,request==null?"null":request.state);
             check("pending-empty-path",request.isDone()&&request.getNodeCount()==0&&!request.canReach(),request.state);
@@ -249,8 +252,10 @@ public final class ProductionNavigationProbe {
                     &&(request.nativeBackend||request.canReach()),
                     request.state+" macro="+NavigationCapabilities.capture(pig).macroSupported()+" "+request.getNodeCount());
             check("semantic-neighborhood-enters-real-segment-search",!request.nativeBackend
-                    &&service.metrics().segmentCalls()>0&&service.metrics().nativeWholeCalls()==0,
-                    "magma and rail near the candidate are decided by the native evaluator");
+                    &&service.metrics().segmentCalls()>semanticSegmentsBefore
+                    &&service.metrics().nativeWholeCalls()==semanticWholeBefore,
+                    java.util.Map.of("wholeBefore",semanticWholeBefore,"wholeAfter",service.metrics().nativeWholeCalls(),
+                            "segmentsBefore",semanticSegmentsBefore,"segmentsAfter",service.metrics().segmentCalls()));
             int retainedNodes=request.getNodeCount(),retainedNext=request.getNextNodeIndex();
             long retainedCalls=service.metrics().nativeCalls();
             check("repeated-request-path-move-keeps-current-segment",pig.getNavigation().moveTo(request,.9)

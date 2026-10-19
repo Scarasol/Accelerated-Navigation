@@ -16,11 +16,13 @@ import java.util.function.Consumer;
 final class TopologyTaskExecutor {
 
     private static final int WORKER_COUNT = 2;
+    private static final NavigationScheduler.Priority[] PRIORITIES = NavigationScheduler.Priority.values();
     private static final long AGING_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
 
     private final Object monitor = new Object();
     private final BooleanSupplier prewarmAllowed;
     private final NavigableMap<TaskKey, Task> foreground = new TreeMap<>();
+    private final Task[][] foregroundHeads = new Task[PRIORITIES.length][WorkKind.FOREGROUND_ORDER.length];
     private final NavigableMap<Long, Task> prewarm = new TreeMap<>();
     private final ThreadLocal<Task> currentTask = new ThreadLocal<>();
     private final ThreadLocal<QueryScratch> queryScratch = new ThreadLocal<>();
@@ -386,7 +388,7 @@ final class TopologyTaskExecutor {
     private Task bestForeground(long now) {
         Task selected = null;
         int selectedRank = Integer.MAX_VALUE;
-        for (NavigationScheduler.Priority priority : NavigationScheduler.Priority.values()) {
+        for (NavigationScheduler.Priority priority : PRIORITIES) {
             for (WorkKind kind : WorkKind.FOREGROUND_ORDER) {
                 if (kind.isForegroundBuild() && buildRunning) {
                     continue;
@@ -409,6 +411,24 @@ final class TopologyTaskExecutor {
     }
 
     private Task firstInGroup(NavigationScheduler.Priority priority, WorkKind kind) {
+        return foregroundHeads[priority.ordinal()][kind.order];
+    }
+
+    private void putForeground(Task task) {
+        foreground.put(task.key(), task);
+        Task head = foregroundHeads[task.priority.ordinal()][task.kind.order];
+        if (head == null || task.sequence < head.sequence)
+            foregroundHeads[task.priority.ordinal()][task.kind.order] = task;
+    }
+
+    private boolean removeForeground(Task task) {
+        boolean removed = foreground.remove(task.key(), task);
+        if (removed && foregroundHeads[task.priority.ordinal()][task.kind.order] == task)
+            foregroundHeads[task.priority.ordinal()][task.kind.order] = lookupFirstInGroup(task.priority, task.kind);
+        return removed;
+    }
+
+    private Task lookupFirstInGroup(NavigationScheduler.Priority priority, WorkKind kind) {
         Map.Entry<TaskKey, Task> entry = foreground.ceilingEntry(
                 new TaskKey(priority.ordinal(), kind.order, Long.MIN_VALUE));
         if (entry == null || entry.getKey().priorityRank != priority.ordinal()
@@ -435,7 +455,7 @@ final class TopologyTaskExecutor {
 
     private void insertQueued(Task task) {
         if (task.kind == WorkKind.PREWARM) prewarm.put(task.sequence, task);
-        else if (task.kind != WorkKind.CONTROL) foreground.put(task.key(), task);
+        else if (task.kind != WorkKind.CONTROL) putForeground(task);
         int kind = task.kind.ordinal();
         queuedByKind[kind]++;
         highestQueuedByKind[kind] = Math.max(highestQueuedByKind[kind], queuedByKind[kind]);
@@ -448,7 +468,7 @@ final class TopologyTaskExecutor {
 
     private boolean removeQueued(Task task) {
         boolean removed = switch (task.kind) {
-            case BUILD, QUICK_SEARCH, LONG_SEARCH -> foreground.remove(task.key(), task);
+            case BUILD, QUICK_SEARCH, LONG_SEARCH -> removeForeground(task);
             case PREWARM -> prewarm.remove(task.sequence, task);
             case CONTROL -> controlTask == task && task.state == TaskState.QUEUED;
         };
@@ -470,6 +490,7 @@ final class TopologyTaskExecutor {
     private void cancelQueuedTasks() {
         foreground.values().forEach(this::cancelQueued);
         foreground.clear();
+        for (Task[] heads : foregroundHeads) java.util.Arrays.fill(heads, null);
         for (Task task : prewarm.values()) {
             cancelQueued(task);
         }
@@ -588,11 +609,11 @@ final class TopologyTaskExecutor {
             if (kind == WorkKind.PREWARM) {
                 priority = requested;
             } else {
-                if (!foreground.remove(key(), this)) {
+                if (!removeForeground(this)) {
                     throw new IllegalStateException("queued topology task is missing");
                 }
                 priority = requested;
-                foreground.put(key(), this);
+                putForeground(this);
             }
             monitor.notifyAll();
         }

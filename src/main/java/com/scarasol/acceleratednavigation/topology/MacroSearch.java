@@ -158,27 +158,62 @@ public final class MacroSearch {
     }
 
     public List<DependencyKey> pendingDependencies(int limit) {
-        if (limit <= 0) {
-            throw new IllegalArgumentException("limit must be positive");
+        if (limit <= 0) throw new IllegalArgumentException("limit must be positive");
+        if (limit > 16) {
+            return waitingByDependency.entrySet().stream()
+                    .map(entry -> Map.entry(
+                            entry.getKey(),
+                            entry.getValue().stream()
+                                    .map(node -> node.f)
+                                    .min(Float::compare)
+                                    .orElse(Float.POSITIVE_INFINITY)
+                    ))
+                    .sorted(Comparator
+                            .comparingDouble((Map.Entry<DependencyKey, Float> entry) -> entry.getValue())
+                            .thenComparingInt(entry -> entry.getKey().kind().ordinal())
+                            .thenComparingInt(entry -> entry.getKey().position().x())
+                            .thenComparingInt(entry -> entry.getKey().position().y())
+                            .thenComparingInt(entry -> entry.getKey().position().z()))
+                    .limit(limit)
+                    .map(Map.Entry::getKey)
+                    .toList();
         }
-        return waitingByDependency.entrySet().stream()
-                .map(entry -> Map.entry(
-                        entry.getKey(),
-                        entry.getValue().stream()
-                                .map(node -> node.f)
-                                .min(Float::compare)
-                                .orElse(Float.POSITIVE_INFINITY)
-                ))
-                .sorted(Comparator
-                        .comparingDouble((Map.Entry<DependencyKey, Float> entry) -> entry.getValue())
-                        .thenComparingInt(entry -> entry.getKey().kind().ordinal())
-                        .thenComparingInt(entry -> entry.getKey().position().x())
-                        .thenComparingInt(entry -> entry.getKey().position().y())
-                        .thenComparingInt(entry -> entry.getKey().position().z()))
-                .limit(limit)
-                .map(Map.Entry::getKey)
-                .toList();
+        int capacity = Math.min(limit, waitingByDependency.size());
+        if (capacity == 0) return List.of();
+        DependencyKey[] keys = new DependencyKey[capacity];
+        float[] scores = new float[capacity];
+        int size = 0;
+        for (var entry : waitingByDependency.entrySet()) {
+            float best = Float.POSITIVE_INFINITY;
+            boolean found = false;
+            for (SearchNode node : entry.getValue()) {
+                if (!found || Float.compare(node.f, best) < 0) best = node.f;
+                found = true;
+            }
+            DependencyKey key = entry.getKey();
+            int at = size;
+            if (size == capacity) {
+                if (comparePending(key, best, keys[size - 1], scores[size - 1]) >= 0) continue;
+                at--;
+            }
+            while (at > 0 && comparePending(key, best, keys[at - 1], scores[at - 1]) < 0) {
+                keys[at] = keys[at - 1]; scores[at] = scores[at - 1]; at--;
+            }
+            keys[at] = key; scores[at] = best;
+            if (size < capacity) size++;
+        }
+        return List.of(keys);
     }
+
+    private static int comparePending(DependencyKey a, float af, DependencyKey b, float bf) {
+        int c = Float.compare(af, bf);
+        if (c == 0) c = Integer.compare(a.kind().ordinal(), b.kind().ordinal());
+        if (c == 0) c = Integer.compare(a.position().x(), b.position().x());
+        if (c == 0) c = Integer.compare(a.position().y(), b.position().y());
+        if (c == 0) c = Integer.compare(a.position().z(), b.position().z());
+        return c;
+    }
+
 
     /**
      * Marks a pending dependency as unavailable without reopening the blocked node.
