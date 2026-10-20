@@ -34,7 +34,7 @@ public final class NavigationScheduler {
     public static final long TICK_BUDGET_NANOS = 20_000_000L;
     public static final long TARGET_NANOS = 45_000_000L;
     public static final long TAIL_RESERVE_NANOS = 2_000_000L;
-    private static final long MIN_SLICE_NANOS = 500_000L;
+    private static final long MIN_START_BUDGET_NANOS = 500_000L;
     private static final long MAX_SLICE_NANOS = 1_000_000L;
     private static final long AGING_INTERVAL_NANOS = 250_000_000L;
     private static final int MAX_EXPANSIONS_PER_SLICE = 64;
@@ -125,7 +125,7 @@ public final class NavigationScheduler {
                                                   UUID owner,
                                                   Priority priority,
                                                   ResumableSearch<R> search) {
-        return submit(dimension, owner, priority, search, MIN_SLICE_NANOS);
+        return submit(dimension, owner, priority, search, MIN_START_BUDGET_NANOS);
     }
 
     /**
@@ -143,7 +143,7 @@ public final class NavigationScheduler {
         }
         Objects.requireNonNull(task, "task");
         long startThreshold = Math.max(
-                MIN_SLICE_NANOS,
+                MIN_START_BUDGET_NANOS,
                 Math.min(MAX_SLICE_NANOS, estimatedCostNanos)
         );
         return submit(dimension, owner, priority, new AtomicSearch<>(task), startThreshold);
@@ -297,6 +297,7 @@ public final class NavigationScheduler {
             haveTime = null;
             tickStartedNanos = 0L;
         }
+        if (readyHaveTime != null && !pending.isEmpty()) requestReadyDispatch();
     }
 
     private void endTick(boolean haveTime) {
@@ -314,8 +315,8 @@ public final class NavigationScheduler {
             long budget = Math.min(Math.max(0L, availableTokens(now)), tickDeadline - now);
             if (!haveTime || !this.haveTime.getAsBoolean()) stopReason = StopReason.SERVER_NO_TIME;
             else if (pending.isEmpty()) stopReason = StopReason.EMPTY;
-            else if (availableTokens(now) < MIN_SLICE_NANOS) stopReason = StopReason.BALANCE;
-            else if (budget < MIN_SLICE_NANOS) stopReason = StopReason.HEADROOM;
+            else if (availableTokens(now) < MIN_START_BUDGET_NANOS) stopReason = StopReason.BALANCE;
+            else if (budget <= 0L) stopReason = StopReason.HEADROOM;
             else drain(Math.min(now + budget, tickDeadline), Integer.MAX_VALUE);
         } finally {
             drainEndedNanos = clock.getAsLong();
@@ -325,7 +326,7 @@ public final class NavigationScheduler {
 
     /**
      * Wake the regular queue after a dependency is delivered. Post-envelope work
-     * spends this tick's remaining allowance, never a new or borrowed grant.
+     * uses the remaining wall-clock window and records its full cost.
      */
     public void requestReadyDispatch() {
         requireServerThread();
@@ -342,7 +343,7 @@ public final class NavigationScheduler {
 
     private boolean readyDispatchAllowed() {
         return !closed && !inEnvelope && readyHaveTime != null && !pending.isEmpty()
-                && Math.min(readyDeadlineNanos - clock.getAsLong(), availableTokens()) >= MIN_SLICE_NANOS
+                && readyDeadlineNanos - clock.getAsLong() > 0L
                 && readyHaveTime.getAsBoolean();
     }
 
@@ -361,7 +362,8 @@ public final class NavigationScheduler {
             return;
         }
         draining = true;
-        BooleanSupplier canContinue = inEnvelope ? haveTime : readyHaveTime;
+        boolean enforceBudget = inEnvelope;
+        BooleanSupplier canContinue = enforceBudget ? haveTime : readyHaveTime;
         try {
             int slices = 0;
             int requestsWithoutProgress = 0;
@@ -370,9 +372,12 @@ public final class NavigationScheduler {
                     stopReason = StopReason.SERVER_NO_TIME;
                     return;
                 }
-                long remaining = Math.min(schedulerDeadline - clock.getAsLong(), availableTokens());
-                if (remaining < MIN_SLICE_NANOS || slices >= maxSlices) {
-                    stopReason = availableTokens() < MIN_SLICE_NANOS ? StopReason.BALANCE : StopReason.HEADROOM;
+                long remaining = schedulerDeadline - clock.getAsLong();
+                if (enforceBudget) remaining = Math.min(remaining, availableTokens());
+                if (remaining <= 0L || (enforceBudget && availableTokens() < MIN_START_BUDGET_NANOS)
+                        || slices >= maxSlices) {
+                    stopReason = enforceBudget && availableTokens() < MIN_START_BUDGET_NANOS
+                            ? StopReason.BALANCE : StopReason.HEADROOM;
                     return;
                 }
 
@@ -389,8 +394,8 @@ public final class NavigationScheduler {
                     continue;
                 }
 
-                remaining = Math.min(schedulerDeadline - clock.getAsLong(), availableTokens());
-                if (remaining < request.startThresholdNanos) {
+                remaining = enforceBudget ? availableTokens() : Long.MAX_VALUE;
+                if (enforceBudget && remaining < request.startThresholdNanos) {
                     enqueue(request);
                     requestsWithoutProgress++;
                     continue;
@@ -401,14 +406,19 @@ public final class NavigationScheduler {
                     stopReason = StopReason.SERVER_NO_TIME;
                     return;
                 }
-                remaining = Math.min(schedulerDeadline - clock.getAsLong(), availableTokens());
-                if (remaining < request.startThresholdNanos) {
+                remaining = enforceBudget ? availableTokens() : Long.MAX_VALUE;
+                if (enforceBudget && remaining < request.startThresholdNanos) {
                     enqueue(request);
                     requestsWithoutProgress++;
                     continue;
                 }
-                long allowance = Math.min(MAX_SLICE_NANOS, remaining);
                 long sliceStarted = clock.getAsLong();
+                long allowance = Math.min(MAX_SLICE_NANOS, Math.min(remaining, schedulerDeadline - sliceStarted));
+                if (allowance <= 0L) {
+                    enqueue(request);
+                    stopReason = StopReason.HEADROOM;
+                    return;
+                }
                 ResumableSearch.Status status;
                 try {
                     status = Objects.requireNonNull(

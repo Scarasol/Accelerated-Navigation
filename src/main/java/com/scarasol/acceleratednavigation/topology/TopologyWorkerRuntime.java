@@ -1290,6 +1290,41 @@ final class TopologyWorkerRuntime {
         else factReferences.remove(facts);
     }
 
+    private void applyFactReferences(BaseClusterTopology.PackedFacts facts, FactReferences refs,
+                                     int idle, int active) {
+        long bytes = facts.retainedBytes();
+        if (refs.active > 0) activeFactBytes -= bytes;
+        else if (refs.idle > 0) baseRetainedBytes -= bytes;
+        refs.idle += idle;
+        refs.active += active;
+        if (refs.idle < 0 || refs.active < 0) throw new IllegalStateException("negative fact ownership");
+        if (refs.active > 0) activeFactBytes += bytes;
+        else if (refs.idle > 0) baseRetainedBytes += bytes;
+        else factReferences.remove(facts);
+    }
+
+    private void changeFactReferenceRun(BaseClusterTopology.PackedFacts facts, int count,
+                                         int idle, int active) {
+        boolean supported = idle == 0 && (active == 1 || active == -1)
+                || idle == 1 && active == -1 || idle == -1 && active == 1;
+        if (count > 1 && supported) {
+            FactReferences refs = factReferences.get(facts);
+            int oldIdle = refs == null ? 0 : refs.idle;
+            int oldActive = refs == null ? 0 : refs.active;
+            long idleDelta = (long) idle * count, activeDelta = (long) active * count;
+            long nextIdle = oldIdle + idleDelta, nextActive = oldActive + activeDelta;
+            if (oldIdle >= 0 && oldActive >= 0 && nextIdle >= 0 && nextIdle <= Integer.MAX_VALUE
+                    && nextActive >= 0 && nextActive <= Integer.MAX_VALUE
+                    && idleDelta >= Integer.MIN_VALUE && idleDelta <= Integer.MAX_VALUE
+                    && activeDelta >= Integer.MIN_VALUE && activeDelta <= Integer.MAX_VALUE) {
+                if (refs == null) refs = factReferences.computeIfAbsent(facts, ignored -> new FactReferences());
+                applyFactReferences(facts, refs, (int) idleDelta, (int) activeDelta);
+                return;
+            }
+        }
+        for (int index = 0; index < count; index++) changeFactReferences(facts, idle, active);
+    }
+
     private boolean requestClusterDependency(
             ResourceKey<Level> dimension,
             SectionPos section,
@@ -3588,7 +3623,12 @@ final class TopologyWorkerRuntime {
     }
 
     private void changeTopologyFactReferences(BaseClusterTopology topology, int idle, int active) {
-        topology.boundaryFacts().visitFacts(facts -> changeFactReferences(facts, idle, active));
+        BaseClusterTopology.BuildInput input = topology.boundaryFacts();
+        if (!input.hasFactRuns()) {
+            input.visitFacts(facts -> changeFactReferences(facts, idle, active));
+        } else {
+            input.visitFactRuns((facts, count) -> changeFactReferenceRun(facts, count, idle, active));
+        }
     }
 
     @Nullable

@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.WeakHashMap;
 import java.util.function.Consumer;
+import java.util.function.ObjIntConsumer;
 
 /** One immutable macro traversal view for a section generation and normalized geometry. */
 public final class BaseClusterTopology {
@@ -500,6 +501,7 @@ public final class BaseClusterTopology {
                                                     GeometryKey geometry,
                                                     BuildScratch scratch,
                                                     int componentCount) {
+        if (componentCount <= 1) return PrimitiveEdges.empty(componentCount);
         Long2LongOpenHashMap merged = scratch.edgeMap;
         BoundaryGeometry collision = input.hasDoors ? new BoundaryGeometry(input) : null;
         for (int cell = 0; cell < CELL_COUNT; cell++) {
@@ -799,6 +801,7 @@ public final class BaseClusterTopology {
         private final long[] revisions;
         private final long[] fingerprints;
         private final boolean hasDoors;
+        private final int airSlots;
 
         BuildInput(PackedFacts center,
                    byte[] offsets,
@@ -824,6 +827,11 @@ public final class BaseClusterTopology {
                 }
                 previous = value;
             }
+            int air = center == PackedFacts.allAir() ? 1 : 0;
+            for (int index = 0; index < this.facts.length; index++) {
+                if (this.facts[index] == PackedFacts.allAir()) air |= 1 << (index + 1);
+            }
+            this.airSlots = (air & (air >>> 1)) == 0 ? 0 : air;
         }
 
         static BuildInput center(PackedFacts facts) {
@@ -854,6 +862,29 @@ public final class BaseClusterTopology {
             for (PackedFacts fact : facts) consumer.accept(fact);
         }
 
+        boolean hasFactRuns() {
+            return airSlots != 0;
+        }
+
+        void visitFactRuns(ObjIntConsumer<PackedFacts> consumer) {
+            if (airSlots == 0) {
+                consumer.accept(center, 1);
+                for (PackedFacts fact : facts) consumer.accept(fact, 1);
+                return;
+            }
+            for (int slot = 0; slot <= facts.length;) {
+                int shifted = airSlots >>> slot;
+                if ((shifted & 1) != 0) {
+                    int count = Integer.numberOfTrailingZeros(~shifted);
+                    consumer.accept(PackedFacts.allAir(), count);
+                    slot += count;
+                } else {
+                    consumer.accept(slot == 0 ? center : facts[slot - 1], 1);
+                    slot++;
+                }
+            }
+        }
+
         BuildInput withFacts(PackedFacts replacementCenter, Map<Integer, PackedFacts> replacements) {
             PackedFacts[] next = facts.clone();
             long[] nextFingerprints = fingerprints.clone();
@@ -865,7 +896,7 @@ public final class BaseClusterTopology {
         }
 
         int referenceBytes() {
-            return 128 + offsets.length + facts.length * Long.BYTES
+            return 136 + offsets.length + facts.length * Long.BYTES
                     + (revisions.length + fingerprints.length) * Long.BYTES;
         }
 

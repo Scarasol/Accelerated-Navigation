@@ -289,6 +289,8 @@ final class SuperClusterTopology {
             throw new IllegalArgumentException("base boundary views are not compatible");
         }
 
+        if (source.componentCount() == 0 || target.componentCount() == 0)
+            return BoundaryLinks.empty(face, source.componentCount(), target.componentCount());
         if (source.geometry().channel() == BaseClusterTopology.Channel.VOLUME)
             return scalarBoundaryLinks(source, target, face);
         Long2ObjectOpenHashMap<long[]> masks = new Long2ObjectOpenHashMap<>();
@@ -921,6 +923,11 @@ final class SuperClusterTopology {
             this.capabilities = capabilities;
             this.masks = masks;
             this.lowerBounds = lowerBounds;
+        }
+
+        private static BoundaryLinks empty(Direction face, int sourceCount, int targetCount) {
+            return new BoundaryLinks(face, targetCount, new int[sourceCount + 1], new int[0],
+                    new int[1], new short[0], new long[0], new long[0], new float[0]);
         }
 
         private static BoundaryLinks from(Direction face,

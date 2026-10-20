@@ -38,11 +38,16 @@ final class ProductionBudgetChecks {
         NavigationScheduler.beginTickEnvelope(server, haveTime);
         NavigationScheduler.beginServerTick(server);
     }
-    private static void end(MinecraftServer server, boolean haveTime) {
+    private static void end(MinecraftServer server, boolean haveTime) throws Exception {
         NavigationScheduler.endServerTick(server, haveTime);
-        NavigationScheduler.forServer(server).finishTickEnvelope(true);
+        NavigationScheduler scheduler = NavigationScheduler.forServer(server);
+        boolean queued = field("readyDispatchQueued").getBoolean(scheduler);
+        // Fake-clock controls invoke ready directly instead of posting real server tasks.
+        field("readyDispatchQueued").setBoolean(scheduler, true);
+        try { scheduler.finishTickEnvelope(true); }
+        finally { field("readyDispatchQueued").setBoolean(scheduler, queued); }
     }
-    private static void idle(MinecraftServer server, int count) {
+    private static void idle(MinecraftServer server, int count) throws Exception {
         for (int i = 0; i < count; i++) { begin(server, () -> true); end(server, true); }
     }
     private static long grant(NavigationScheduler scheduler) throws Exception {
@@ -179,6 +184,30 @@ final class ProductionBudgetChecks {
                 "real deadline rechecked between tasks");
         begin(server, () -> true); end(server, true);
         require(second.isDone(), "deadline preserves queued work");
+
+        for (long remaining : new long[] {400_000, 100_000, 1}) {
+            reset(scheduler, clock);
+            calls.set(0);
+            first = task(scheduler, clock, calls, remaining, false);
+            second = task(scheduler, clock, calls, 0, true);
+            begin(server, () -> true); clock.set(43_000_000 - remaining); end(server, true);
+            require(first.isDone() && !second.isDone() && calls.get() == 1,
+                    "END accepts positive wall headroom " + remaining);
+            require(scheduler.budgetMetrics().lastTick().stopReason() == NavigationScheduler.StopReason.HEADROOM,
+                    "END stops at exact wall deadline " + remaining);
+            begin(server, () -> true); end(server, true);
+            require(second.isDone(), "END deadline preserves remaining work " + remaining);
+        }
+        for (long offset : new long[] {0, 1}) {
+            reset(scheduler, clock);
+            first = task(scheduler, clock, calls, 0, false);
+            begin(server, () -> true); clock.set(43_000_000 + offset); end(server, true);
+            require(!first.isDone()
+                    && scheduler.budgetMetrics().lastTick().stopReason() == NavigationScheduler.StopReason.HEADROOM,
+                    "END rejects deadline or later " + offset);
+            begin(server, () -> true); end(server, true);
+            require(first.isDone(), "END rejected work remains queued " + offset);
+        }
 
         reset(scheduler, clock);
         calls.set(0);
@@ -343,20 +372,107 @@ final class ProductionBudgetChecks {
         first=task(scheduler,clock,calls,20_700_000,false);
         var second=task(scheduler,clock,calls,0,true);
         ready(scheduler);
-        require(first.isDone()&&!second.isDone()&&calls.get()==1,"ready overshoot stops following work");
+        require(first.isDone()&&second.isDone()&&calls.get()==2,"ready continues after budget exhaustion with wall headroom");
         require(scheduler.metrics().availableNanos()==-700_000,"ready overshoot recorded without clipping");
         begin(server,()->true);
         require(scheduler.metrics().availableNanos()==20_000_000,"ready overshoot creates no debt");
+        second=task(scheduler,clock,calls,0,true);
         ready(scheduler);
         require(!second.isDone(),"ready trampoline cannot run inside new envelope");
         end(server,true);require(second.isDone(),"deferred ready work reaches next END");
 
         reset(scheduler,clock);
+        calls.set(0);
+        first=task(scheduler,clock,calls,20_700_000,false);
         begin(server,()->true);end(server,true);
-        first=task(scheduler,clock,calls,0,false);
-        clock.set(42_600_000);ready(scheduler);
-        require(!first.isDone(),"ready retains 500us real deadline threshold");
-        begin(server,()->true);end(server,true);require(first.isDone(),"ready deadline preserves queued work");
+        require(first.isDone()&&scheduler.metrics().availableNanos()==-700_000,
+                "normal END can finish with negative navigation balance");
+        var regularSample=scheduler.budgetMetrics().lastTick();
+        second=task(scheduler,clock,calls,1_000_000,true);
+        ready(scheduler);
+        require(second.isDone()&&calls.get()==2,"ready starts after normal END exhausted its budget");
+        require(scheduler.metrics().chargedNanos()==21_700_000
+                &&scheduler.metrics().availableNanos()==-1_700_000,
+                "unbudgeted ready work retains complete cost and balance");
+        require(scheduler.budgetMetrics().lastTick()==regularSample,
+                "unbudgeted ready preserves completed envelope sample");
+        begin(server,()->true);
+        require(scheduler.metrics().availableNanos()==20_000_000,
+                "unbudgeted ready does not reduce next tick allowance");
+        end(server,true);
+        require(scheduler.budgetMetrics().lastTick().outsideNavigationNanos()==1_000_000,
+                "unbudgeted ready remains in outside navigation ledger");
+
+        reset(scheduler,clock);
+        begin(server,()->true);end(server,true);
+        first=task(scheduler,clock,calls,20_000_000,false);
+        ready(scheduler);
+        require(first.isDone()&&scheduler.metrics().availableNanos()==0,
+                "ready can use the complete normal budget");
+        Parking unbudgetedSearch=new Parking();
+        var parked=scheduler.submitStrict(Level.OVERWORLD,UUID.randomUUID(),
+                NavigationScheduler.Priority.ACTIVE,unbudgetedSearch);
+        ready(scheduler);
+        require(unbudgetedSearch.steps==1&&!parked.isDone(),
+                "ready cooperative work starts with zero budget and parks normally");
+        unbudgetedSearch.wake.run();ready(scheduler);
+        require(parked.isDone()&&parked.join()==9&&unbudgetedSearch.steps==2,
+                "ready cooperative work resumes with zero budget");
+
+        reset(scheduler,clock);
+        calls.set(0);
+        begin(server,()->true);end(server,true);
+        first=task(scheduler,clock,calls,43_000_000,false);
+        second=task(scheduler,clock,calls,0,true);
+        ready(scheduler);
+        require(first.isDone()&&!second.isDone()&&calls.get()==1,
+                "ready wall deadline stops work despite ignoring budget");
+        require(scheduler.metrics().chargedNanos()==43_000_000
+                &&scheduler.metrics().availableNanos()==-23_000_000,
+                "ready wall deadline overshoot remains fully accounted");
+        begin(server,()->true);end(server,true);
+        require(second.isDone(),"ready wall deadline preserves queued work");
+
+        for(long remaining:new long[]{400_000,100_000,1}) {
+            reset(scheduler,clock);
+            calls.set(0);
+            begin(server,()->true);end(server,true);
+            first=task(scheduler,clock,calls,remaining,false);
+            second=task(scheduler,clock,calls,0,true);
+            clock.set(43_000_000-remaining);ready(scheduler);
+            require(first.isDone()&&!second.isDone()&&calls.get()==1,
+                    "ready accepts positive wall headroom "+remaining);
+            require(scheduler.metrics().chargedNanos()==remaining,
+                    "ready near-deadline work remains fully charged "+remaining);
+            ready(scheduler);
+            require(!second.isDone(),"ready stops at exact wall deadline "+remaining);
+            begin(server,()->true);end(server,true);
+            require(second.isDone(),"ready deadline preserves queued work "+remaining);
+        }
+        for(long offset:new long[]{0,1}) {
+            reset(scheduler,clock);
+            begin(server,()->true);end(server,true);
+            first=task(scheduler,clock,calls,0,false);
+            clock.set(43_000_000+offset);ready(scheduler);
+            require(!first.isDone(),"ready rejects deadline or later "+offset);
+            begin(server,()->true);end(server,true);
+            require(first.isDone(),"ready rejected work remains queued "+offset);
+        }
+
+        for(int permissionCall:new int[]{2,3}) {
+            reset(scheduler,clock);
+            begin(server,()->true);end(server,true);
+            first=task(scheduler,clock,calls,0,false);
+            AtomicInteger permissions=new AtomicInteger();
+            field("readyHaveTime").set(scheduler,(BooleanSupplier)()-> {
+                clock.set(permissions.incrementAndGet()>=permissionCall?43_000_000:42_999_999);
+                return true;
+            });
+            ready(scheduler);
+            require(!first.isDone(),"ready rechecks wall deadline after server permission "+permissionCall);
+            begin(server,()->true);end(server,true);
+            require(first.isDone(),"permission deadline race preserves queued work "+permissionCall);
+        }
 
         reset(scheduler,clock);
         AtomicBoolean allowed=new AtomicBoolean(true);
