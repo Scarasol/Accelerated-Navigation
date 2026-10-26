@@ -5400,6 +5400,69 @@ final class TopologyWorkerRuntime {
                         .thenComparingLong(MacroComponentKey::signature);
     }
 
+    private record ComponentSnapshotKey(SectionPos section, long revision,
+                                        BaseClusterTopology.Channel channel, int componentId) {}
+
+    private static final class ComponentSnapshotIndex {
+        private static final int SMALL_CAPACITY = 8;
+        private Object[] entries = new Object[SMALL_CAPACITY * 2];
+        private int count;
+        private Map<ComponentSnapshotKey, MacroSearch.ComponentSnapshot> overflow;
+
+        private MacroSearch.ComponentSnapshot snapshot(
+                MacroSearch.ComponentEndpoint endpoint, BaseClusterTopology topology) {
+            MacroSearch.ComponentSnapshot snapshot = null;
+            ComponentSnapshotKey key = null;
+            if (overflow != null) {
+                key = new ComponentSnapshotKey(endpoint.section(), endpoint.revision(),
+                        endpoint.channel(), endpoint.componentId());
+                snapshot = overflow.get(key);
+            } else {
+                for (int index = 0; index < count; index++) {
+                    var stored = (MacroSearch.ComponentEndpoint) entries[index * 2];
+                    if (stored.componentId() == endpoint.componentId()
+                            && stored.revision() == endpoint.revision()
+                            && stored.channel() == endpoint.channel()
+                            && stored.section().equals(endpoint.section())) {
+                        snapshot = (MacroSearch.ComponentSnapshot) entries[index * 2 + 1];
+                        break;
+                    }
+                }
+            }
+            if (snapshot != null) {
+                if (!topology.section().equals(endpoint.section())
+                        || topology.signature() != endpoint.revision()
+                        || topology.geometry().channel() != endpoint.channel()
+                        || endpoint.componentId() >= topology.componentCount()) {
+                    throw new IllegalArgumentException("component snapshot does not match endpoint");
+                }
+                return snapshot;
+            }
+            snapshot = new MacroSearch.ComponentSnapshot(endpoint, topology);
+            if (overflow != null) {
+                overflow.put(key, snapshot);
+            } else if (count < SMALL_CAPACITY) {
+                entries[count * 2] = endpoint;
+                entries[count * 2 + 1] = snapshot;
+                count++;
+            } else {
+                var promoted = new HashMap<ComponentSnapshotKey, MacroSearch.ComponentSnapshot>();
+                for (int index = 0; index < count; index++) {
+                    var stored = (MacroSearch.ComponentEndpoint) entries[index * 2];
+                    promoted.put(new ComponentSnapshotKey(stored.section(), stored.revision(),
+                            stored.channel(), stored.componentId()),
+                            (MacroSearch.ComponentSnapshot) entries[index * 2 + 1]);
+                }
+                promoted.put(new ComponentSnapshotKey(endpoint.section(), endpoint.revision(),
+                        endpoint.channel(), endpoint.componentId()), snapshot);
+                overflow = promoted;
+                entries = null;
+                count = 0;
+            }
+            return snapshot;
+        }
+    }
+
     private record CandidateResolution(List<MacroComponentKey> candidates,
                                        @Nullable SectionPos unavailable,
                                        @Nullable MacroSearch.Failure unavailableFailure) {
@@ -5548,6 +5611,7 @@ final class TopologyWorkerRuntime {
         private final List<MacroSearch.Endpoint> recoveredEndpoints = new ArrayList<>();
         private final List<MacroSearch.Connection> recoveredConnections = new ArrayList<>();
         private final Map<MacroSearch.ComponentEndpoint, MacroSearch.ComponentSnapshot> completedComponents = new HashMap<>();
+        private ComponentSnapshotIndex recoveryComponentSnapshots;
         private float recoveredCost;
         private MacroSearch.Metrics completedSearchMetrics;
         private long workerTasks;
@@ -6034,7 +6098,14 @@ final class TopologyWorkerRuntime {
                     throw new IllegalStateException("completed component snapshot limit exceeded");
                 var captured = baseGraph.topologySnapshot.get(component.section().asLong());
                 if (captured == null) throw new IllegalStateException("completed component graph missing");
-                completedComponents.put(component, new MacroSearch.ComponentSnapshot(component, captured.topology));
+                if (!refining) {
+                    completedComponents.put(component, new MacroSearch.ComponentSnapshot(component, captured.topology));
+                    continue;
+                }
+                if (recoveryComponentSnapshots == null)
+                    recoveryComponentSnapshots = new ComponentSnapshotIndex();
+                completedComponents.put(component,
+                        recoveryComponentSnapshots.snapshot(component, captured.topology));
             }
         }
 
@@ -6561,6 +6632,7 @@ final class TopologyWorkerRuntime {
             drainDeferredGraphs();
             releaseGraphs();
             completedComponents.clear();
+            recoveryComponentSnapshots = null;
             finishMeasurement();
         }
 
@@ -6571,6 +6643,7 @@ final class TopologyWorkerRuntime {
             clearRequests();
             releaseGraphs();
             completedComponents.clear();
+            recoveryComponentSnapshots = null;
             finishMeasurement();
         }
 
