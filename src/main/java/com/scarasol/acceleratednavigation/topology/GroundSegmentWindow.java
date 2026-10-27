@@ -62,8 +62,8 @@ public final class GroundSegmentWindow implements AutoCloseable {
             sections.add(((MacroSearch.ComponentEndpoint)edge.from()).section());
             sections.add(((MacroSearch.ComponentEndpoint)edge.to()).section());
         }
-        if (sections.size() > 4) return CompletableFuture.failedFuture(
-                new IllegalArgumentException("segment exceeds four sections"));
+        if (sections.size() > 9) return CompletableFuture.failedFuture(
+                new IllegalArgumentException("segment exceeds nine sections"));
         CompletableFuture<GroundSegmentWindow> result = new CompletableFuture<>();
         try {
             runtime.submitWindowWork(priority, () -> {

@@ -7,19 +7,25 @@ import com.scarasol.acceleratednavigation.navigation.NativeNavigationSearch;
 import com.scarasol.acceleratednavigation.navigation.NavigationRequestPath;
 import java.util.Set;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Vec3i;
 import net.minecraft.util.profiling.ProfilerFiller;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.ai.navigation.PathNavigation;
 import net.minecraft.world.level.pathfinder.Path;
 import net.minecraft.world.phys.Vec3;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(PathNavigation.class)
 public abstract class AutomaticNavigationMixin {
+    @Shadow protected Path path;
+    @Shadow protected long timeoutTimer;
+
     @Inject(method="createPath(Lnet/minecraft/world/entity/Entity;I)Lnet/minecraft/world/level/pathfinder/Path;",
             at=@At("HEAD"),cancellable=true,require=1,expect=1,allow=1)
     private void prepareEntity(Entity target,int accuracy,CallbackInfoReturnable<Path> callback) {
@@ -85,6 +91,14 @@ public abstract class AutomaticNavigationMixin {
     @Inject(method="stop()V",at=@At("HEAD"),cancellable=true,require=1,expect=1,allow=1)
     private void stop(CallbackInfo callback) {
         if(AutomaticNavigationBridge.externalStop((PathNavigation)(Object)this))callback.cancel();
+    }
+    @ModifyArg(method="doStuckDetection(Lnet/minecraft/world/phys/Vec3;)V",
+            at=@At(value="INVOKE",
+                    target="Lnet/minecraft/world/phys/Vec3;atBottomCenterOf(Lnet/minecraft/core/Vec3i;)Lnet/minecraft/world/phys/Vec3;"),
+            index=0,require=1,expect=1,allow=1)
+    private Vec3i nextNodeTimeout(Vec3i next) {
+        if(path instanceof NavigationRequestPath)timeoutTimer=0L;
+        return next;
     }
     @WrapOperation(method={"doStuckDetection(Lnet/minecraft/world/phys/Vec3;)V","timeoutPath()V"},at=@At(value="INVOKE",
             target="Lnet/minecraft/world/entity/ai/navigation/PathNavigation;stop()V"),require=2,expect=2,allow=2)

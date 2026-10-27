@@ -13,17 +13,49 @@ import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.EmptyLevelChunk;
 import com.scarasol.acceleratednavigation.navigation.UnknownNavigationChunk;
 import com.scarasol.acceleratednavigation.navigation.NavigationRegionSnapshot;
+import com.scarasol.acceleratednavigation.navigation.NeighborSafety;
+import com.scarasol.acceleratednavigation.navigation.NeighborSafetyRegion;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(PathNavigationRegion.class)
-public abstract class NavigationRegionMixin implements NavigationRegionSnapshot {
+public abstract class NavigationRegionMixin implements NavigationRegionSnapshot, NeighborSafetyRegion {
     @Shadow protected int centerX;
     @Shadow protected int centerZ;
     @Shadow protected ChunkAccess[][] chunks;
+    @Unique private ServerLevel acceleratedNavigation$neighborLevel;
+    public void acceleratedNavigation$neighborLevel(ServerLevel level) {
+        acceleratedNavigation$neighborLevel=level;
+    }
+    public boolean acceleratedNavigation$neighborsSafe(int x,int y,int z) {
+        ServerLevel level=acceleratedNavigation$neighborLevel;
+        if(level==null||y-1<level.getMinBuildHeight()||y+1>=level.getMaxBuildHeight())return false;
+        int minX=(x-1)>>4,maxX=(x+1)>>4,minZ=(z-1)>>4,maxZ=(z+1)>>4;
+        int low=level.getSectionIndex(y-1),high=level.getSectionIndex(y+1);
+        for(int cx=minX;cx<=maxX;cx++)for(int cz=minZ;cz<=maxZ;cz++) {
+            int localX=cx-centerX,localZ=cz-centerZ;
+            if(localX<0||localX>=chunks.length||localZ<0||localZ>=chunks[localX].length)return false;
+            ChunkAccess chunk=chunks[localX][localZ];
+            if(chunk==null||chunk.getClass()!=LevelChunk.class||!level.getChunkSource().hasChunk(cx,cz))return false;
+            LevelChunkSection[] sections=chunk.getSections();
+            if(low<0||high>=sections.length)return false;
+            for(int index=low;index<=high;index++) {
+                LevelChunkSection section=sections[index];
+                if(section==null||section.getClass()!=LevelChunkSection.class)return false;
+                if(section.hasOnlyAir()) {
+                    if(NeighborSafety.potential(Blocks.AIR.defaultBlockState()))return false;
+                } else if(section.getStates().maybeHas(NeighborSafety.POTENTIAL))return false;
+            }
+        }
+        return true;
+    }
     public int acceleratedNavigation$centerX() { return centerX; }
     public int acceleratedNavigation$centerZ() { return centerZ; }
     public ChunkAccess[][] acceleratedNavigation$chunks() { return chunks; }

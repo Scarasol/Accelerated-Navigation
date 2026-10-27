@@ -50,7 +50,7 @@ public final class NativeNavigationSearch {
         long timeoutTimer=access.acceleratedNavigation$timeoutTimer();
         double timeoutLimit=access.acceleratedNavigation$timeoutLimit();
         boolean stuck=access.acceleratedNavigation$stuck();
-        NavigationCapabilities previous=NavigationCapabilities.capture(mob);
+        NavigationRestoreState previous=NavigationRestoreState.capture(mob);
         Scope scope=new Scope(request.navigation,(ServerLevel)mob.level(),Set.copyOf(avoided));
         RAW.set(scope);
         Throwable originalFailure=null;
@@ -96,7 +96,10 @@ public final class NativeNavigationSearch {
                     }
                     access.acceleratedNavigation$multiplier(multiplier);
                 }
-            } finally { RAW.remove(); }
+            } finally {
+                NeighborSafety.close(scope.region);
+                RAW.remove();
+            }
             if(cleanupFailure!=null) {
                 if(originalFailure!=null)originalFailure.addSuppressed(cleanupFailure);
                 else if(cleanupFailure instanceof Error error)throw error;

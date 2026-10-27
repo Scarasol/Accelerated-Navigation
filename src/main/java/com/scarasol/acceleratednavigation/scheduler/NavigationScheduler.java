@@ -26,18 +26,16 @@ import java.util.function.LongSupplier;
 import java.util.function.BooleanSupplier;
 
 /**
- * Main-thread cooperative scheduler shared by all navigation backends on one
- * server. It owns time, fairness and request lifecycle, never path semantics.
+ * Main-thread request queue with the original END/ready dispatch points.
+ * This isolated candidate has no navigation execution budget.
  */
 public final class NavigationScheduler {
 
-    public static final long TICK_BUDGET_NANOS = 20_000_000L;
-    public static final long TARGET_NANOS = 45_000_000L;
-    public static final long TAIL_RESERVE_NANOS = 2_000_000L;
-    private static final long MIN_START_BUDGET_NANOS = 500_000L;
-    private static final long MAX_SLICE_NANOS = 1_000_000L;
+    // Compatibility fields for existing telemetry; zero means no budget is granted.
+    public static final long TICK_BUDGET_NANOS = 0L;
+    public static final long TARGET_NANOS = 0L;
+    public static final long TAIL_RESERVE_NANOS = 0L;
     private static final long AGING_INTERVAL_NANOS = 250_000_000L;
-    private static final int MAX_EXPANSIONS_PER_SLICE = 64;
     private static final int MAX_PENDING_REQUESTS = 1_024;
 
     private static final Map<MinecraftServer, NavigationScheduler> SERVICES = new IdentityHashMap<>();
@@ -51,27 +49,21 @@ public final class NavigationScheduler {
 
     private long tickStartedNanos;
     private long requestSequence;
-    private long tokensNanos;
     private boolean draining;
     private int accountingDepth;
     private long accountingStarted;
     private LongSupplier clock = System::nanoTime;
     private long chargedNanos;
-    private BooleanSupplier haveTime;
     private boolean inEnvelope;
     private boolean startSeen;
     private boolean endSeen;
     private boolean closed;
-    private boolean endHadTime;
     private boolean readyDispatchQueued;
-    private long readyDeadlineNanos;
-    private BooleanSupplier readyHaveTime;
+    private boolean readyWindowValid;
     private long chargeAtStart;
     private long chargeAtDrainEnd;
     private long previousChargeAtEnd;
     private long drainEndedNanos;
-    private long balanceAfterRefill;
-    private long balanceBeforeDrain;
     private long outsideNavigationNanos;
     private long validTicks;
     private long skippedTicks;
@@ -79,6 +71,12 @@ public final class NavigationScheduler {
     private StopReason stopReason = StopReason.NO_END;
     private final long[] stopCounts = new long[StopReason.values().length];
     private TickSample lastTick;
+    private long experimentOriginNanos;
+    private long experimentDrains;
+    private long experimentSteps;
+    private final long[] experimentSpans = new long[3 * 65_536];
+    private int experimentSpanCount;
+    private boolean experimentSpanOverflow;
 
     private NavigationScheduler(MinecraftServer server) {
         this.server = server;
@@ -118,6 +116,10 @@ public final class NavigationScheduler {
         if (scheduler != null) {
             scheduler.closed = true;
             scheduler.cancelAll();
+            AcceleratedNavigation.LOGGER.debug(
+                    "AN_SCHEDULER_EXPERIMENT variant=U drains={} steps={}",
+                    scheduler.experimentDrains, scheduler.experimentSteps);
+            scheduler.writeExperimentSpans();
         }
     }
 
@@ -125,13 +127,13 @@ public final class NavigationScheduler {
                                                   UUID owner,
                                                   Priority priority,
                                                   ResumableSearch<R> search) {
-        return submit(dimension, owner, priority, search, MIN_START_BUDGET_NANOS);
+        return submit(dimension, owner, priority, search);
     }
 
     /**
      * Schedules an unmodified synchronous backend as one atomic call. The
-     * scheduler controls when it starts and charges its actual runtime to the
-     * current tick, but cannot preempt it after invocation.
+     * queue controls when it starts and observes its runtime without imposing a
+     * navigation allowance or deadline.
      */
     public <R> CompletableFuture<R> submitSoft(ResourceKey<Level> dimension,
                                                 UUID owner,
@@ -142,11 +144,7 @@ public final class NavigationScheduler {
             throw new IllegalArgumentException("estimatedCostNanos must be positive");
         }
         Objects.requireNonNull(task, "task");
-        long startThreshold = Math.max(
-                MIN_START_BUDGET_NANOS,
-                Math.min(MAX_SLICE_NANOS, estimatedCostNanos)
-        );
-        return submit(dimension, owner, priority, new AtomicSearch<>(task), startThreshold);
+        return submit(dimension, owner, priority, new AtomicSearch<>(task));
     }
 
     public boolean cancel(ResourceKey<Level> dimension, UUID owner) {
@@ -202,8 +200,7 @@ public final class NavigationScheduler {
     private <R> CompletableFuture<R> submit(ResourceKey<Level> dimension,
                                              UUID owner,
                                              Priority priority,
-                                              ResumableSearch<R> search,
-                                             long startThresholdNanos) {
+                                              ResumableSearch<R> search) {
         requireServerThread();
         requireOpen();
         try (TimeAccount ignored = account()) {
@@ -235,7 +232,6 @@ public final class NavigationScheduler {
                 key,
                 priority,
                 search,
-                startThresholdNanos,
                 new CompletableFuture<>(),
                 clock.getAsLong()
         );
@@ -249,9 +245,10 @@ public final class NavigationScheduler {
         requireServerThread();
         requireOpen();
         if (inEnvelope) throw new IllegalStateException("nested navigation tick envelope");
-        readyHaveTime = null;
-        this.haveTime = Objects.requireNonNull(haveTime, "haveTime");
+        readyWindowValid = false;
+        Objects.requireNonNull(haveTime, "haveTime");
         tickStartedNanos = clock.getAsLong();
+        experimentOriginNanos = tickStartedNanos;
         chargeAtStart = totalAccounted(tickStartedNanos);
         outsideNavigationNanos = Math.max(0L, chargeAtStart - previousChargeAtEnd);
         inEnvelope = true;
@@ -265,11 +262,6 @@ public final class NavigationScheduler {
         requireOpen();
         if (!inEnvelope || startSeen) throw new IllegalStateException("missing envelope or duplicate navigation START");
         startSeen = true;
-        long now = clock.getAsLong();
-        long active = activeElapsed(now);
-        // Start a fresh allowance while retaining work already charged inside this tick.
-        balanceAfterRefill = TICK_BUDGET_NANOS - Math.max(0L, totalAccounted(now) - chargeAtStart);
-        tokensNanos = balanceAfterRefill + active;
     }
 
     public void finishTickEnvelope(boolean completedNormally) {
@@ -285,19 +277,16 @@ public final class NavigationScheduler {
                 validTicks = increment(validTicks);
                 stopCounts[stopReason.ordinal()] = increment(stopCounts[stopReason.ordinal()]);
                 lastTick = new TickSample(validTicks, full, navigation, outsideNavigationNanos,
-                        TICK_BUDGET_NANOS, TAIL_RESERVE_NANOS,
-                        tail, balanceAfterRefill, balanceBeforeDrain, availableTokens(now),
+                        0L, 0L, tail, 0L, 0L, 0L,
                         pendingBeforeDrain, pending.size(), stopReason);
-                readyDeadlineNanos = tickStartedNanos + TARGET_NANOS - TAIL_RESERVE_NANOS;
-                readyHaveTime = endHadTime ? haveTime : null;
+                readyWindowValid = true;
             } else skippedTicks = increment(skippedTicks);
         } finally {
             previousChargeAtEnd = chargeAtEnd;
             inEnvelope = startSeen = endSeen = false;
-            haveTime = null;
             tickStartedNanos = 0L;
         }
-        if (readyHaveTime != null && !pending.isEmpty()) requestReadyDispatch();
+        if (readyWindowValid && !pending.isEmpty()) requestReadyDispatch();
     }
 
     private void endTick(boolean haveTime) {
@@ -306,18 +295,10 @@ public final class NavigationScheduler {
         if (!inEnvelope || !startSeen || endSeen)
             throw new IllegalStateException("missing START or duplicate navigation END");
         endSeen = true;
-        endHadTime = haveTime;
         pendingBeforeDrain = pending.size();
-        balanceBeforeDrain = availableTokens();
         try (TimeAccount ignored = account()) {
-            long now = clock.getAsLong();
-            long tickDeadline = tickStartedNanos + TARGET_NANOS - TAIL_RESERVE_NANOS;
-            long budget = Math.min(Math.max(0L, availableTokens(now)), tickDeadline - now);
-            if (!haveTime || !this.haveTime.getAsBoolean()) stopReason = StopReason.SERVER_NO_TIME;
-            else if (pending.isEmpty()) stopReason = StopReason.EMPTY;
-            else if (availableTokens(now) < MIN_START_BUDGET_NANOS) stopReason = StopReason.BALANCE;
-            else if (budget <= 0L) stopReason = StopReason.HEADROOM;
-            else drain(Math.min(now + budget, tickDeadline), Integer.MAX_VALUE);
+            if (pending.isEmpty()) stopReason = StopReason.EMPTY;
+            else drain();
         } finally {
             drainEndedNanos = clock.getAsLong();
             chargeAtDrainEnd = totalAccounted(drainEndedNanos);
@@ -325,8 +306,7 @@ public final class NavigationScheduler {
     }
 
     /**
-     * Wake the regular queue after a dependency is delivered. Post-envelope work
-     * uses the remaining wall-clock window and records its full cost.
+     * Queue a main-thread ready callback at the original dispatch point.
      */
     public void requestReadyDispatch() {
         requireServerThread();
@@ -342,9 +322,7 @@ public final class NavigationScheduler {
     }
 
     private boolean readyDispatchAllowed() {
-        return !closed && !inEnvelope && readyHaveTime != null && !pending.isEmpty()
-                && readyDeadlineNanos - clock.getAsLong() > 0L
-                && readyHaveTime.getAsBoolean();
+        return !closed && !inEnvelope && readyWindowValid && !pending.isEmpty();
     }
 
     private void drainReady() {
@@ -353,34 +331,19 @@ public final class NavigationScheduler {
         // envelope's outsideNavigationNanos; the completed tick sample stays intact.
         try (TimeAccount ignored = account()) {
             if (draining || !readyDispatchAllowed()) return;
-            drain(readyDeadlineNanos, Integer.MAX_VALUE);
+            drain();
         }
     }
 
-    private void drain(long schedulerDeadline, int maxSlices) {
+    private void drain() {
         if (draining) {
             return;
         }
         draining = true;
-        boolean enforceBudget = inEnvelope;
-        BooleanSupplier canContinue = enforceBudget ? haveTime : readyHaveTime;
+        long experimentStarted = clock.getAsLong();
+        experimentDrains++;
         try {
-            int slices = 0;
-            int requestsWithoutProgress = 0;
-            while (!closed && !pending.isEmpty() && requestsWithoutProgress < pending.size()) {
-                if (!canContinue.getAsBoolean()) {
-                    stopReason = StopReason.SERVER_NO_TIME;
-                    return;
-                }
-                long remaining = schedulerDeadline - clock.getAsLong();
-                if (enforceBudget) remaining = Math.min(remaining, availableTokens());
-                if (remaining <= 0L || (enforceBudget && availableTokens() < MIN_START_BUDGET_NANOS)
-                        || slices >= maxSlices) {
-                    stopReason = enforceBudget && availableTokens() < MIN_START_BUDGET_NANOS
-                            ? StopReason.BALANCE : StopReason.HEADROOM;
-                    return;
-                }
-
+            while (!closed && !pending.isEmpty()) {
                 QueuedSearch<?> request = takeNext(clock.getAsLong());
                 if (request == null) {
                     stopReason = StopReason.DEPENDENCY;
@@ -394,38 +357,12 @@ public final class NavigationScheduler {
                     continue;
                 }
 
-                remaining = enforceBudget ? availableTokens() : Long.MAX_VALUE;
-                if (enforceBudget && remaining < request.startThresholdNanos) {
-                    enqueue(request);
-                    requestsWithoutProgress++;
-                    continue;
-                }
-
-                if (!canContinue.getAsBoolean()) {
-                    enqueue(request);
-                    stopReason = StopReason.SERVER_NO_TIME;
-                    return;
-                }
-                remaining = enforceBudget ? availableTokens() : Long.MAX_VALUE;
-                if (enforceBudget && remaining < request.startThresholdNanos) {
-                    enqueue(request);
-                    requestsWithoutProgress++;
-                    continue;
-                }
                 long sliceStarted = clock.getAsLong();
-                long allowance = Math.min(MAX_SLICE_NANOS, Math.min(remaining, schedulerDeadline - sliceStarted));
-                if (allowance <= 0L) {
-                    enqueue(request);
-                    stopReason = StopReason.HEADROOM;
-                    return;
-                }
+                experimentSteps++;
                 ResumableSearch.Status status;
                 try {
                     status = Objects.requireNonNull(
-                            request.search.step(
-                                    MAX_EXPANSIONS_PER_SLICE,
-                                    Math.min(sliceStarted + allowance, schedulerDeadline)
-                            ),
+                            request.search.step(Integer.MAX_VALUE, Long.MAX_VALUE),
                             "search step returned null status"
                     );
                 } catch (Throwable failure) {
@@ -440,13 +377,9 @@ public final class NavigationScheduler {
                             used,
                             failure
                     );
-                    requestsWithoutProgress = 0;
-                    slices++;
                     continue;
                 }
 
-                requestsWithoutProgress = 0;
-                slices++;
                 if (status == ResumableSearch.Status.RUNNING) {
                     boolean parked;
                     try {
@@ -481,9 +414,39 @@ public final class NavigationScheduler {
                     AcceleratedNavigation.LOGGER.error("Navigation result publication for {} failed", request.key.owner, failure);
                 }
             }
-            stopReason = pending.isEmpty() ? StopReason.EMPTY : StopReason.START_THRESHOLD;
+            stopReason = pending.isEmpty() ? StopReason.EMPTY : StopReason.DEPENDENCY;
         } finally {
+            recordExperimentSpan(experimentOriginNanos, experimentStarted, clock.getAsLong());
             draining = false;
+        }
+    }
+
+    private void recordExperimentSpan(long origin, long start, long end) {
+        int offset = experimentSpanCount * 3;
+        if (offset == experimentSpans.length) { experimentSpanOverflow = true; return; }
+        experimentSpans[offset] = origin;
+        experimentSpans[offset + 1] = start;
+        experimentSpans[offset + 2] = end;
+        experimentSpanCount++;
+    }
+
+    private void writeExperimentSpans() {
+        String output = System.getProperty("an.production.output");
+        if (output == null) return;
+        StringBuilder json = new StringBuilder("{\"variant\":\"U\",\"overflow\":")
+                .append(experimentSpanOverflow).append(",\"spans\":[");
+        for (int i = 0; i < experimentSpanCount; i++) {
+            if (i > 0) json.append(',');
+            int offset = i * 3;
+            json.append('[').append(experimentSpans[offset]).append(',')
+                    .append(experimentSpans[offset + 1]).append(',')
+                    .append(experimentSpans[offset + 2]).append(']');
+        }
+        try {
+            java.nio.file.Files.writeString(java.nio.file.Path.of(output, "scheduler-spans.json"),
+                    json.append("]}").toString());
+        } catch (java.io.IOException failure) {
+            throw new java.io.UncheckedIOException(failure);
         }
     }
 
@@ -526,21 +489,15 @@ public final class NavigationScheduler {
             closed = true;
             if (--accountingDepth == 0) {
                 long used = Math.max(0L, clock.getAsLong() - accountingStarted);
-                tokensNanos -= used;
                 chargedNanos += used;
             }
         }
-    }
-
-    private long availableTokens() {
-        return availableTokens(clock.getAsLong());
     }
 
     private long activeElapsed(long now) {
         return accountingDepth == 0 ? 0L : Math.max(0L, now - accountingStarted);
     }
 
-    private long availableTokens(long now) { return tokensNanos - activeElapsed(now); }
     private long totalAccounted(long now) { return chargedNanos + activeElapsed(now); }
     private static long increment(long value) { return value == Long.MAX_VALUE ? value : value + 1; }
 
@@ -549,7 +506,7 @@ public final class NavigationScheduler {
     public Metrics metrics() {
         requireServerThread();
         long now = clock.getAsLong();
-        return new Metrics(totalAccounted(now), availableTokens(now), pending.size());
+        return new Metrics(totalAccounted(now), 0L, pending.size());
     }
 
     public enum StopReason { NO_END, EMPTY, BALANCE, HEADROOM, SERVER_NO_TIME, DEPENDENCY, START_THRESHOLD }
@@ -688,7 +645,6 @@ public final class NavigationScheduler {
         private final RequestKey key;
         private Priority priority;
         private final ResumableSearch<R> search;
-        private final long startThresholdNanos;
         private final CompletableFuture<R> future;
         private final long enqueuedNanos;
         private boolean queued;
@@ -698,14 +654,12 @@ public final class NavigationScheduler {
                              RequestKey key,
                              Priority priority,
                              ResumableSearch<R> search,
-                             long startThresholdNanos,
                              CompletableFuture<R> future,
                              long enqueuedNanos) {
             this.sequence = sequence;
             this.key = key;
             this.priority = priority;
             this.search = search;
-            this.startThresholdNanos = startThresholdNanos;
             this.future = future;
             this.enqueuedNanos = enqueuedNanos;
         }

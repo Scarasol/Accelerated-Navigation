@@ -25,7 +25,13 @@
     "WallNavigationAccess",
     "WallNavigationMixin",
     "NativeNavigationSearchMixin",
-    "NavigationRegionMixin"
+    "NavigationRegionMixin",
+    "NeighborStateMixin",
+    "NeighborPaletteMixin",
+    "NeighborContainerMixin",
+    "WalkNeighborSafetyMixin",
+    "NativeNodeCacheMixin",
+    "NativeWalkedDistanceMixin"
   ],
   "client": []
 }

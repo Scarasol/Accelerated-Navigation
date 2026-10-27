@@ -225,6 +225,7 @@ public final class SegmentedNavigationService {
         int stable;
         double previousY=Double.NaN;
         boolean segmented,last,segmentReachable,decisionAdopted,queued,preparing,nativeStopped,running;
+        boolean longSpanDisabled,mergedFinal,finalMergeRejected,finalSearchCommitted;
         Supplier<?> followup;
         Supplier<?> waitingSearch;
         BlockPos lastNode,observedPosition,plannedEntityTarget,plannedStart,segmentTarget;
@@ -459,6 +460,7 @@ public final class SegmentedNavigationService {
                     if(window!=null)window.close();
                     AcceleratedNavigation.LOGGER.debug("Navigation {} window preparation failed: cursor={} destination={} position={}",
                             work.request.queryId,work.cursor,destination,work.request.mob.blockPosition(),error);
+                    if(work.stride>2&&!work.last) { recover(work);return; }
                     finish(work,NavigationRequestPath.State.UNAVAILABLE);return;
                 }
                 work.window=window;
@@ -474,6 +476,7 @@ public final class SegmentedNavigationService {
     private void nextSegment(Work work) {
         if(!live(work))return;
         closeWindow(work);
+        work.mergedFinal=false;
         work.nativeProof=null;
         work.segmentEntry=null;
         work.segmentTarget=null;work.segmentReachable=false;
@@ -496,22 +499,13 @@ public final class SegmentedNavigationService {
             findSegment(work,Set.of(target),work.last?work.request.intent.accuracy():0);
             return;
         }
-        if(work.cursor>=work.edges.size()) {
-            work.last=true;
-            updateEntityTarget(work);
-            MacroSearch.ComponentEndpoint destination=null;
-            for(var endpoint:work.corridor.endpoints())
-                if(endpoint instanceof MacroSearch.ComponentEndpoint component)destination=component;
-            if(destination==null) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
-            work.corridor.component(destination);
-            // Final targets need no window candidates; retain the search's own scheduler admission.
-            queue(work,()-> {
-                findSegment(work,Set.of(work.request.getTarget()),work.request.intent.accuracy());
-                return null;
-            });
+        if(work.finalSearchCommitted||work.cursor>=work.edges.size()) {
+            finalSegment(work,false);
             return;
         }
         work.last=false;
+        if(!work.longSpanDisabled&&work.attempt==0&&work.stride==2&&work.edges.size()-work.cursor>2)
+            work.stride=4;
         work.stageEnd=Math.min(work.edges.size(),work.cursor+work.stride);
         Set<SectionPos> sections=new LinkedHashSet<>();
         sections.add(SectionPos.of(work.request.mob.blockPosition()));
@@ -519,10 +513,14 @@ public final class SegmentedNavigationService {
             sections.add(((MacroSearch.ComponentEndpoint)edge.from()).section());
             sections.add(((MacroSearch.ComponentEndpoint)edge.to()).section());
         }
-        if(sections.size()>4) {
+        if(sections.size()>(work.stride>2?9:4)) {
             recoveries++;
             if(++work.recoveryCount>work.recoveryLimit) { finish(work,NavigationRequestPath.State.FAILED);return; }
             work.stride=1;work.stageEnd=work.cursor+1;
+        }
+        if(work.stageEnd==work.edges.size()&&!work.finalMergeRejected) {
+            finalSegment(work,true);
+            return;
         }
         var edges=work.edges.subList(work.cursor,work.stageEnd);
         var destination=(MacroSearch.ComponentEndpoint)edges.get(edges.size()-1).to();
@@ -533,10 +531,34 @@ public final class SegmentedNavigationService {
                     +.05*p.distSqr(work.request.getTarget()));
             if(work.attempt>0)order=Comparator.comparingInt((BlockPos p)->-work.window.interiorNeighbors(p)).thenComparing(order);
             candidates.sort(order.thenComparingInt(BlockPos::getX).thenComparingInt(BlockPos::getY).thenComparingInt(BlockPos::getZ));
-            if(candidates.isEmpty()) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
+            if(candidates.isEmpty()) {
+                if(work.stride>2)recover(work);else finish(work,NavigationRequestPath.State.UNAVAILABLE);
+                return;
+            }
             // Several same-component ports are an internal segment choice, not an API target truncation.
             findSegment(work,new LinkedHashSet<>(candidates.subList(0,Math.min(work.attempt>0?1:8,candidates.size()))),0);
         });
+    }
+    private void finalSegment(Work work,boolean merged) {
+        updateEntityTarget(work);
+        MacroSearch.ComponentEndpoint destination=null;
+        for(var endpoint:work.corridor.endpoints())
+            if(endpoint instanceof MacroSearch.ComponentEndpoint component)destination=component;
+        if(destination==null) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
+        work.corridor.component(destination);
+        work.last=true;work.mergedFinal=merged;
+        // Final targets need no port window; retain the search's own scheduler admission.
+        queue(work,()-> {
+            findSegment(work,Set.of(work.request.getTarget()),work.request.intent.accuracy());
+            return null;
+        });
+    }
+    private void rejectFinalMerge(Work work) {
+        AcceleratedNavigation.LOGGER.debug("Navigation {} final merge rejected: cursor={} end={}",
+                work.request.queryId,work.cursor,work.stageEnd);
+        work.finalMergeRejected=true;work.mergedFinal=false;work.last=false;
+        work.nativeProof=null;
+        nextSegment(work);
     }
     private float localRange(Work work,Set<BlockPos> targets) {
         double farthest=0;
@@ -568,6 +590,14 @@ public final class SegmentedNavigationService {
             AcceleratedNavigation.LOGGER.trace("Navigation {} native segment details: attempt={} stride={} start={} targets={} nativeEnd={}",
                     work.request.queryId,work.attempt,work.stride,work.request.mob.blockPosition(),
                     targets,path==null?null:path.getEndNode());
+        if(work.mergedFinal&&(result.unavailable()||path==null||path.getNodeCount()==0
+                ||path.getEndNode()==null||!path.canReach())) {
+            rejectFinalMerge(work);return;
+        }
+        if(!work.last&&work.stride>2&&(result.unavailable()||path==null||path.getNodeCount()==0
+                ||path.getEndNode()==null||!path.canReach())) {
+            recover(work);return;
+        }
         if(result.unavailable()) { finish(work,NavigationRequestPath.State.UNAVAILABLE);return; }
         if(path==null||path.getNodeCount()==0||path.getEndNode()==null) {
             recover(work);return;
@@ -631,8 +661,12 @@ public final class SegmentedNavigationService {
     private void publish(Work work,Path path) {
         for(int index=0;index<path.getNodeCount();index++)
             if(!work.level.hasChunkAt(path.getNode(index).asBlockPos())) {
+                if(work.mergedFinal) { rejectFinalMerge(work);return; }
+                if(work.segmented&&!work.last&&work.stride>2) { recover(work);return; }
                 finish(work,NavigationRequestPath.State.UNAVAILABLE);return;
             }
+        // A published final path may already have crossed components when execution later fails.
+        if(work.mergedFinal)work.finalSearchCommitted=true;
         if(path!=work.request)work.request.publish(path);
         if(work.segmented) {
             work.segmentPublication++;
@@ -907,6 +941,10 @@ public final class SegmentedNavigationService {
         if(work.segmentTarget!=null)work.failedTargets.add(work.segmentTarget);
         recoveries++;work.recoveryCount++;
         if(work.recoveryCount>work.recoveryLimit) { finish(work,NavigationRequestPath.State.FAILED);return; }
+        if(work.stride>2&&!work.last) {
+            work.longSpanDisabled=true;work.stride=2;work.attempt=0;
+            nextSegment(work);return;
+        }
         if(work.attempt<2)work.attempt++;
         else if(work.stride==2&&!work.last) { work.stride=1;work.attempt=0; }
         else { refresh(work);return; }
@@ -923,6 +961,7 @@ public final class SegmentedNavigationService {
     }
     private void replan(Work work) {
         closeWindow(work);
+        work.finalSearchCommitted=false;
         work.segmentEntry=null;
         work.cursor=0;work.attempt=0;work.stride=2;work.avoided.clear();work.failedTargets.clear();
         work.request.clearNodes();work.request.state=NavigationRequestPath.State.PENDING;

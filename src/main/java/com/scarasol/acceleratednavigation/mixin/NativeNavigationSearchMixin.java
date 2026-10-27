@@ -3,6 +3,7 @@ package com.scarasol.acceleratednavigation.mixin;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.scarasol.acceleratednavigation.navigation.NativeNavigationSearch;
+import com.scarasol.acceleratednavigation.navigation.NeighborSafety;
 import net.minecraft.util.profiling.ProfilerFiller;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.level.PathNavigationRegion;
@@ -21,6 +22,7 @@ public abstract class NativeNavigationSearchMixin {
         if(NativeNavigationSearch.raw()) {
             NativeNavigationSearch.scope().prepared=true;
             NativeNavigationSearch.scope().region=region;
+            NeighborSafety.bind(region,NativeNavigationSearch.scope().level,evaluator);
         }
         original.call(evaluator,region,mob);
     }

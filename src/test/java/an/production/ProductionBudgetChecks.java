@@ -74,6 +74,10 @@ final class ProductionBudgetChecks {
     }
 
     static void run(MinecraftServer server) throws Exception {
+        if (NavigationScheduler.TICK_BUDGET_NANOS == 0L) {
+            NoBudgetSchedulerChecks.run(server);
+            return;
+        }
         NavigationScheduler scheduler = NavigationScheduler.forServer(server);
         require(scheduler.metrics().pendingRequests() == 0, "controls start empty");
         Map<Field, Object> saved = new LinkedHashMap<>();
@@ -489,6 +493,184 @@ final class ProductionBudgetChecks {
         require(!first.isDone(),"abnormal envelope disables ready window");
         begin(server,()->true);end(server,true);
         require(first.isDone()&&scheduler.metrics().pendingRequests()==0,"ready controls clean up");
+    }
+
+    /** Keeps the existing single-source probe builds compatible with disabled budgets. */
+    private static final class NoBudgetSchedulerChecks {
+        private static final long MS = 1_000_000L;
+        private static void check(List<String> checks, boolean value, String name) {
+            if (!value) throw new AssertionError("unbudgeted scheduler: " + name);
+            checks.add(name);
+        }
+        private static void begin(MinecraftServer server) {
+            NavigationScheduler.beginTickEnvelope(server, () -> {
+                throw new AssertionError("navigation must not consult the removed budget gate");
+            });
+            NavigationScheduler.beginServerTick(server);
+        }
+        private static void end(MinecraftServer server, NavigationScheduler scheduler) {
+            NavigationScheduler.endServerTick(server, false);
+            scheduler.finishTickEnvelope(true);
+        }
+        private static CompletableFuture<Integer> task(
+                NavigationScheduler scheduler, AtomicLong clock, long cost) {
+            return scheduler.submitSoft(Level.OVERWORLD, UUID.randomUUID(), NavigationScheduler.Priority.ACTIVE,
+                    500_000, () -> { clock.addAndGet(cost); return 7; });
+        }
+        static void run(MinecraftServer server) throws Exception {
+            NavigationScheduler scheduler = NavigationScheduler.forServer(server);
+            if (scheduler.metrics().pendingRequests() != 0)
+                throw new AssertionError("controls require an empty queue");
+            Map<Field, Object> saved = new LinkedHashMap<>();
+            for (Field candidate : NavigationScheduler.class.getDeclaredFields()) {
+                if (Modifier.isStatic(candidate.getModifiers()) || Modifier.isFinal(candidate.getModifiers())) continue;
+                candidate.setAccessible(true);
+                saved.put(candidate, candidate.get(scheduler));
+            }
+            long[] stops = ((long[]) field("stopCounts").get(scheduler)).clone();
+            int[] cursors = ((int[]) field("dimensionCursors").get(scheduler)).clone();
+            @SuppressWarnings("unchecked")
+            List<Object> dimensions = (List<Object>) field("dimensionOrder").get(scheduler);
+            List<Object> previousDimensions = new ArrayList<>(dimensions);
+            List<String> checks = new ArrayList<>();
+            AtomicLong clock = new AtomicLong();
+            try {
+                field("inEnvelope").setBoolean(scheduler, false);
+                field("startSeen").setBoolean(scheduler, false);
+                field("endSeen").setBoolean(scheduler, false);
+                field("accountingDepth").setInt(scheduler, 0);
+                field("clock").set(scheduler, (java.util.function.LongSupplier) clock::get);
+                // Fake-clock controls must not post real server TickTasks.
+                field("readyDispatchQueued").setBoolean(scheduler, true);
+                for (int pass = 0; pass < 2; pass++) {
+                    field("chargedNanos").setLong(scheduler, 0L);
+                    field("previousChargeAtEnd").setLong(scheduler, 0L);
+                    field("readyWindowValid").setBoolean(scheduler, false);
+                    dimensions.clear();
+                    Arrays.fill((int[]) field("dimensionCursors").get(scheduler), 0);
+                    clock.set(0);
+                    var first = task(scheduler, clock, 80 * MS);
+                    var second = task(scheduler, clock, 90 * MS);
+                    check(checks, !first.isDone() && !second.isDone(), "submit only queues");
+                    begin(server);
+                    clock.addAndGet(100 * MS);
+                    end(server, scheduler);
+                    check(checks, first.join() == 7 && second.join() == 7,
+                            "END drains beyond old time gates with haveTime false");
+                    check(checks, scheduler.metrics().chargedNanos() == 170 * MS, "all actual work is charged");
+                    var sample = scheduler.budgetMetrics().lastTick();
+                    check(checks, scheduler.metrics().availableNanos() == 0 && sample.grantNanos() == 0
+                            && sample.finalBalanceNanos() == 0, "disabled budget is explicit");
+                    first = task(scheduler, clock, 2 * MS);
+                    ready(scheduler);
+                    field("readyDispatchQueued").setBoolean(scheduler, true);
+                    check(checks, first.join() == 7 && scheduler.budgetMetrics().lastTick() == sample,
+                            "ready runs without cutoff and preserves completed sample");
+                    begin(server);
+                    end(server, scheduler);
+                    check(checks, scheduler.budgetMetrics().lastTick().outsideNavigationNanos() == 2 * MS,
+                            "ready time remains in outside ledger");
+                    var inside = task(scheduler, clock, 0);
+                    begin(server);
+                    ready(scheduler);
+                    field("readyDispatchQueued").setBoolean(scheduler, true);
+                    check(checks, !inside.isDone(), "ready cannot run inside an envelope");
+                    end(server, scheduler);
+                    check(checks, inside.isDone(), "deferred task reaches END");
+
+                    var search = new Parking();
+                    var parked = scheduler.submitStrict(Level.OVERWORLD, UUID.randomUUID(),
+                            NavigationScheduler.Priority.ACTIVE, search);
+                    begin(server);
+                    end(server, scheduler);
+                    check(checks, search.steps == 1 && !parked.isDone()
+                            && scheduler.budgetMetrics().parkedRequests() == 1, "dependency parks");
+                    search.wake.run();
+                    check(checks, search.steps == 1 && scheduler.budgetMetrics().runnableRequests() == 1,
+                            "wake only enqueues");
+                    ready(scheduler);
+                    field("readyDispatchQueued").setBoolean(scheduler, true);
+                    check(checks, parked.join() == 9 && search.steps == 2, "ready resumes dependency");
+                    search.wake.run();
+                    check(checks, scheduler.metrics().pendingRequests() == 0, "stale wake is harmless");
+
+                    UUID owner = UUID.randomUUID();
+                    var old = scheduler.submitSoft(Level.OVERWORLD, owner, NavigationScheduler.Priority.ACTIVE,
+                            500_000, () -> 1);
+                    var replacement = scheduler.submitSoft(Level.OVERWORLD, owner, NavigationScheduler.Priority.ACTIVE,
+                            500_000, () -> 2);
+                    check(checks, old.isCancelled() && !replacement.isDone(), "same owner replaces old task");
+                    scheduler.cancel(Level.OVERWORLD, owner);
+                    check(checks, replacement.isCancelled(), "cancel clears replacement");
+                    var cancelled = task(scheduler, clock, 0);
+                    cancelled.cancel(false);
+                    var live = task(scheduler, clock, 0);
+                    begin(server);
+                    end(server, scheduler);
+                    check(checks, live.isDone() && scheduler.metrics().pendingRequests() == 0,
+                            "cancelled head does not block progress");
+
+                    dimensions.clear();
+                    Arrays.fill((int[]) field("dimensionCursors").get(scheduler), 0);
+                    List<Integer> order = new ArrayList<>();
+                    scheduler.submitSoft(Level.OVERWORLD, UUID.randomUUID(), NavigationScheduler.Priority.ACTIVE,
+                            500_000, () -> order.add(1));
+                    scheduler.submitSoft(Level.OVERWORLD, UUID.randomUUID(), NavigationScheduler.Priority.ACTIVE,
+                            500_000, () -> order.add(3));
+                    scheduler.submitSoft(Level.NETHER, UUID.randomUUID(), NavigationScheduler.Priority.ACTIVE,
+                            500_000, () -> order.add(2));
+                    begin(server);
+                    end(server, scheduler);
+                    check(checks, order.equals(List.of(1, 2, 3)), "dimension rotation and FIFO remain");
+                    AtomicInteger calls = new AtomicInteger(), depth = new AtomicInteger();
+                    AtomicInteger maximum = new AtomicInteger();
+                    Runnable[] append = new Runnable[1];
+                    append[0] = () -> scheduler.submitSoft(Level.OVERWORLD, UUID.randomUUID(),
+                            NavigationScheduler.Priority.ACTIVE, 500_000, () -> {
+                                maximum.accumulateAndGet(depth.incrementAndGet(), Math::max);
+                                if (calls.incrementAndGet() < 1000) append[0].run();
+                                depth.decrementAndGet();
+                                return 1;
+                            });
+                    append[0].run();
+                    check(checks, calls.get() == 0, "follow-up chain waits for END");
+                    begin(server);
+                    end(server, scheduler);
+                    check(checks, calls.get() == 1000 && maximum.get() == 1,
+                            "follow-ups drain without recursive submit");
+                    long before = scheduler.metrics().chargedNanos();
+                    try (var outer = scheduler.account()) {
+                        clock.addAndGet(MS);
+                        try (var inner = scheduler.account()) { clock.addAndGet(2 * MS); }
+                    }
+                    check(checks, scheduler.metrics().chargedNanos() - before == 3 * MS,
+                            "nested accounting measures union once");
+                    begin(server);
+                    scheduler.finishTickEnvelope(false);
+                    var abnormal = task(scheduler, clock, 0);
+                    ready(scheduler);
+                    field("readyDispatchQueued").setBoolean(scheduler, true);
+                    check(checks, !abnormal.isDone(), "abnormal envelope disables ready window");
+                    begin(server);
+                    end(server, scheduler);
+                    check(checks, abnormal.isDone() && scheduler.metrics().pendingRequests() == 0,
+                            "valid END restores progress and leaves queue empty");
+                }
+                Files.writeString(Path.of(System.getProperty("an.production.output"), "budget-controls.json"),
+                        new GsonBuilder().setPrettyPrinting().create().toJson(Map.of(
+                                "passed", true, "mode", "no-budget", "passes", 2, "checks", checks)));
+                System.out.println("PRODUCTION_NO_BUDGET_CONTROLS " + checks.size() + " passed; passes=2");
+            } finally {
+                var cancel = NavigationScheduler.class.getDeclaredMethod("cancelAll");
+                cancel.setAccessible(true);
+                cancel.invoke(scheduler);
+                for (var entry : saved.entrySet()) entry.getKey().set(scheduler, entry.getValue());
+                System.arraycopy(stops, 0, field("stopCounts").get(scheduler), 0, stops.length);
+                System.arraycopy(cursors, 0, field("dimensionCursors").get(scheduler), 0, cursors.length);
+                dimensions.clear();
+                dimensions.addAll(previousDimensions);
+            }
+        }
     }
 
     private static final class Parking implements ResumableSearch<Integer> {
