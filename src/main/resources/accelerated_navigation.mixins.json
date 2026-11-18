@@ -1,0 +1,37 @@
+{
+  "required": true,
+  "package": "com.scarasol.acceleratednavigation.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "accelerated_navigation.refmap.json",
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "minVersion": "0.8",
+  "mixins": [
+    "ServerNavigationBudgetMixin",
+    "ChunkSerializerTopologyMixin",
+    "LevelChunkTopologyMixin",
+    "LevelChunkSectionTopologyMixin",
+    "ProtoChunkTopologyMixin",
+    "NavigationAccess",
+    "AutomaticNavigationMixin",
+    "GroundNavigationMixin",
+    "FlyingNavigationMixin",
+    "NavigationGoalMixin",
+    "NavigationMeleeMixin",
+    "NavigationBehaviorMixin",
+    "NavigationSinkMixin",
+    "NavigationPoiMixin",
+    "WallNavigationAccess",
+    "WallNavigationMixin",
+    "NativeNavigationSearchMixin",
+    "NavigationRegionMixin",
+    "NeighborStateMixin",
+    "NeighborPaletteMixin",
+    "NeighborContainerMixin",
+    "WalkNeighborSafetyMixin",
+    "NativeNodeCacheMixin",
+    "NativeWalkedDistanceMixin"
+  ],
+  "client": []
+}

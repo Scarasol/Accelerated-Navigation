@@ -1,0 +1,1611 @@
+package com.scarasol.acceleratednavigation.topology;
+
+import com.google.gson.stream.JsonWriter;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import net.minecraft.core.Direction;
+import net.minecraft.core.SectionPos;
+import net.minecraft.util.BitStorage;
+import net.minecraft.util.SimpleBitStorage;
+import net.minecraft.util.ZeroBitStorage;
+import org.jetbrains.annotations.Nullable;
+
+import java.io.IOException;
+import java.lang.ref.WeakReference;
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.Objects;
+import java.util.WeakHashMap;
+import java.util.function.Consumer;
+import java.util.function.ObjIntConsumer;
+
+/** One immutable macro traversal view for a section generation and normalized geometry. */
+public final class BaseClusterTopology {
+
+    public static final int SIDE = 16;
+    public static final int CELL_COUNT = SIDE * SIDE * SIDE;
+    static final int PACKED_FACT_BYTES = CELL_COUNT / 2;
+    static final int FACTS_ALGORITHM_VERSION = 7;
+    public static final int VOLUME_OPEN = 1;
+    public static final int GROUND_OPEN = 1 << 1;
+    public static final int FLUID = 1 << 2;
+    public static final int EXACT_REQUIRED = 1 << 3;
+
+    private static final int VALID_FLAGS = VOLUME_OPEN | GROUND_OPEN | FLUID | EXACT_REQUIRED;
+    static final int MAX_STRUCTURAL_STEP = 1;
+    static final int MAX_STRUCTURAL_JUMP = 3;
+    static final int MAX_STRUCTURAL_DROP = 4;
+    private static final int CENTER_HALO_INDEX = 13;
+    private static final int EXTENDED_MIN = -8;
+    private static final int EXTENDED_SIDE = SIDE * 2;
+    private static final int PRISM_LAYERS = SIDE + 1;
+    private static final int SEALED_SIDE = SIDE + 2;
+
+    private final SectionPos section;
+    private final long revision;
+    private final long sourceFingerprint;
+    private final GeometryKey geometry;
+    private final BitStorage componentLabels;
+    private final int baseLabel;
+    private final long[] componentMetadata;
+    private final int[] outgoingOffsets;
+    private final int[] outgoingTargets;
+    private final long[] outgoingCapabilityMasks;
+    private final float[] outgoingLowerBounds;
+    private final byte[] haloOffsets;
+    private final long[] haloRevisions;
+    private final long[] haloFingerprints;
+    private final BuildInput boundaryFacts;
+    private final BoundaryPortBits portBits;
+    BoundaryPortBits portBits() { return portBits; }
+    private final long signature;
+    private final int retainedBytes;
+    private volatile IncomingEdges incomingEdges;
+
+    private BaseClusterTopology(SectionPos section,
+                                long revision,
+                                long sourceFingerprint,
+                                GeometryKey geometry,
+                                BitStorage componentLabels,
+                                int baseLabel,
+                                long[] componentMetadata,
+                                int[] outgoingOffsets,
+                                int[] outgoingTargets,
+                                long[] outgoingCapabilityMasks,
+                                float[] outgoingLowerBounds,
+                                byte[] haloOffsets,
+                                long[] haloRevisions,
+                                long[] haloFingerprints,
+                                BuildInput boundaryFacts, BoundaryPortBits portBits) {
+        this.section = Objects.requireNonNull(section, "section");
+        this.revision = revision;
+        this.sourceFingerprint = sourceFingerprint;
+        this.geometry = Objects.requireNonNull(geometry, "geometry");
+        this.componentLabels = Objects.requireNonNull(componentLabels, "componentLabels");
+        this.baseLabel = baseLabel;
+        this.componentMetadata = componentMetadata;
+        this.outgoingOffsets = outgoingOffsets;
+        this.outgoingTargets = outgoingTargets;
+        this.outgoingCapabilityMasks = outgoingCapabilityMasks;
+        this.outgoingLowerBounds = outgoingLowerBounds;
+        this.haloOffsets = haloOffsets;
+        this.haloRevisions = haloRevisions;
+        this.haloFingerprints = haloFingerprints;
+        this.boundaryFacts = Objects.requireNonNull(boundaryFacts, "boundaryFacts");
+        this.portBits = portBits;
+        this.signature = signature(section, revision, sourceFingerprint, geometry,
+                haloOffsets, haloRevisions, haloFingerprints);
+        this.retainedBytes = 128 + componentLabels.getRaw().length * Long.BYTES
+                + componentMetadata.length * Long.BYTES
+                + (outgoingOffsets.length + outgoingTargets.length) * Integer.BYTES
+                + outgoingCapabilityMasks.length * Long.BYTES
+                + outgoingLowerBounds.length * Float.BYTES
+                + haloOffsets.length + (haloRevisions.length + haloFingerprints.length) * Long.BYTES
+                + boundaryFacts.referenceBytes() + (portBits == null ? 0 : portBits.retainedBytes())
+                + IncomingEdges.reservedBytes(componentCount(), outgoingTargets.length);
+        validate();
+    }
+
+    public static BaseClusterTopology build(SectionPos section,
+                                            long revision,
+                                            BuildInput input,
+                                            GeometryKey geometry,
+                                            BuildScratch scratch) {
+        Objects.requireNonNull(input, "input");
+        Objects.requireNonNull(geometry, "geometry");
+        Objects.requireNonNull(scratch, "scratch").reset();
+        deriveLegalAnchors(input, geometry, scratch);
+        int componentCount = labelComponents(input, geometry, scratch);
+        BitStorage labels = compactLabels(scratch.labels, componentCount);
+        int uniformLabel = uniformLabel(scratch.labels);
+        int baseLabel = uniformLabel < 0 ? 0 : uniformLabel;
+        long[] metadata = Arrays.copyOf(scratch.componentMetadata, componentCount);
+        PrimitiveEdges edges = geometry.channel() == Channel.GROUND
+                ? buildGroundEdges(input, geometry, scratch, componentCount)
+                : PrimitiveEdges.empty(componentCount);
+        BuildInput boundaryFacts = input.boundarySnapshot(geometry, scratch.haloUsed);
+        HaloStamps stamps = input.usedStamps(scratch.haloUsed);
+        return new BaseClusterTopology(
+                section,
+                revision,
+                input.center().fingerprint(),
+                geometry,
+                labels,
+                baseLabel,
+                metadata,
+                edges.offsets,
+                edges.targets,
+                edges.capabilities,
+                edges.lowerBounds,
+                stamps.offsets,
+                stamps.revisions,
+                stamps.fingerprints,
+                boundaryFacts, geometry.channel() == Channel.GROUND ? new BoundaryPortBits(scratch.legalMask) : null
+        );
+    }
+
+    public SectionPos section() {
+        return section;
+    }
+
+    public long revision() {
+        return revision;
+    }
+
+    public long sourceFingerprint() {
+        return sourceFingerprint;
+    }
+
+    public GeometryKey geometry() {
+        return geometry;
+    }
+
+    BuildInput boundaryFacts() {
+        return boundaryFacts;
+    }
+
+    static boolean boundaryHaloRequired(GeometryKey geometry, int dx, int dy, int dz) {
+        return (dx | dy | dz) != 0 && Math.abs(dx) <= 1 && Math.abs(dy) <= 1 && Math.abs(dz) <= 1
+                && (geometry.width() > 1.0F || dx == 0 || dz == 0);
+    }
+
+    public int componentCount() {
+        return componentMetadata.length;
+    }
+
+    public int componentAt(int x, int y, int z) {
+        if (!inBounds(x, y, z)) {
+            return -1;
+        }
+        int label = baseLabel + componentLabels.get(cellIndex(x, y, z));
+        return label == 0 ? -1 : label - 1;
+    }
+
+    public int componentAnchorCell(int componentId) {
+        return (int) metadata(componentId) & 0xfff;
+    }
+
+    boolean mayExit(int componentId, SectionPos target, MovementKey movement) {
+        return mayConnect(componentId, target, movement, false);
+    }
+
+    boolean mayEnter(int componentId, SectionPos source, MovementKey movement) {
+        return mayConnect(componentId, source, movement, true);
+    }
+
+    private boolean mayConnect(int componentId, SectionPos neighbor, MovementKey movement, boolean incoming) {
+        long bounds = metadata(componentId);
+        int dx = neighbor.x() - section.x();
+        int dy = neighbor.y() - section.y();
+        int dz = neighbor.z() - section.z();
+        int horizontal = Math.abs(dx) + Math.abs(dz);
+        if (horizontal > 1 || Math.abs(dy) > 1 || (horizontal == 0 && dy == 0)) return false;
+        boolean volume = geometry.channel() == Channel.VOLUME;
+        if (volume && horizontal + Math.abs(dy) != 1) return false;
+        int reach = volume ? 1 : movement.jumpClass() + 1;
+        int up = volume ? 1 : movement.maxStep();
+        int down = volume ? 1 : movement.maxDrop();
+        return overlapsSection((int) (bounds >>> 12) & 15, (int) (bounds >>> 24) & 15,
+                reach, reach, dx)
+                && overlapsSection((int) (bounds >>> 16) & 15, (int) (bounds >>> 28) & 15,
+                incoming ? up : down, incoming ? down : up, dy)
+                && overlapsSection((int) (bounds >>> 20) & 15, (int) (bounds >>> 32) & 15,
+                reach, reach, dz);
+    }
+
+    private static boolean overlapsSection(int min, int max, int negative, int positive, int delta) {
+        int targetMin = delta * SIDE;
+        return min - negative < targetMin + SIDE && max + positive >= targetMin;
+    }
+
+    public int localEdgeStart(int componentId) {
+        metadata(componentId);
+        return outgoingOffsets[componentId];
+    }
+
+    public int localEdgeEnd(int componentId) {
+        metadata(componentId);
+        return outgoingOffsets[componentId + 1];
+    }
+
+    public int localEdgeTarget(int edge) {
+        return outgoingTargets[edge];
+    }
+
+    public long localEdgeCapabilities(int edge) {
+        return outgoingCapabilityMasks[edge];
+    }
+
+    public float localEdgeLowerBound(int edge) {
+        return outgoingLowerBounds[edge];
+    }
+
+    public boolean localEdgeSupports(int edge, MovementKey movement) {
+        return (outgoingCapabilityMasks[edge] & movement.capabilityMask()) != 0L;
+    }
+
+    IncomingEdges incomingEdges() {
+        IncomingEdges ready = incomingEdges;
+        if (ready == null) {
+            synchronized (this) {
+                ready = incomingEdges;
+                if (ready == null) {
+                    ready = IncomingEdges.build(outgoingOffsets, outgoingTargets, componentCount());
+                    incomingEdges = ready;
+                }
+            }
+        }
+        return ready;
+    }
+
+    public int haloStampCount() {
+        return haloOffsets.length;
+    }
+
+    public byte haloOffset(int index) {
+        return haloOffsets[index];
+    }
+
+    public long haloRevision(int index) {
+        return haloRevisions[index];
+    }
+
+    public long haloFingerprint(int index) {
+        return haloFingerprints[index];
+    }
+
+    /** Writes every primitive needed to reconstruct this derived graph without world access. */
+    void writeSnapshot(JsonWriter json) throws IOException {
+        json.beginObject();
+        json.name("section").beginArray().value(section.x()).value(section.y()).value(section.z()).endArray();
+        json.name("revision").value(revision);
+        json.name("sourceFingerprintHex").value(Long.toUnsignedString(sourceFingerprint, 16));
+        json.name("signatureHex").value(Long.toUnsignedString(signature, 16));
+        json.name("geometry").beginObject();
+        json.name("channel").value(geometry.channel().name());
+        json.name("widthCells").value(geometry.widthCells());
+        json.name("heightCells").value(geometry.heightCells());
+        json.name("width").value(geometry.width());
+        json.name("height").value(geometry.height());
+        json.name("acceptsFluid").value(geometry.acceptsFluid());
+        json.name("canOpenDoors").value(geometry.canOpenDoors());
+        json.endObject();
+        json.name("baseLabel").value(baseLabel);
+        json.name("labelCellOrder").value("(y << 8) | (z << 4) | x");
+        json.name("componentLabelValues").beginArray();
+        for (int cell = 0; cell < CELL_COUNT; cell++) json.value(componentLabels.get(cell));
+        json.endArray();
+        json.name("componentMetadataHex").beginArray();
+        for (long value : componentMetadata) json.value(Long.toUnsignedString(value, 16));
+        json.endArray();
+        json.name("outgoingOffsets").beginArray();
+        for (int value : outgoingOffsets) json.value(value);
+        json.endArray();
+        json.name("outgoingTargets").beginArray();
+        for (int value : outgoingTargets) json.value(value);
+        json.endArray();
+        json.name("outgoingCapabilityMasksHex").beginArray();
+        for (long value : outgoingCapabilityMasks) json.value(Long.toUnsignedString(value, 16));
+        json.endArray();
+        json.name("outgoingLowerBoundBitsHex").beginArray();
+        for (float value : outgoingLowerBounds) {
+            json.value(Integer.toUnsignedString(Float.floatToRawIntBits(value), 16));
+        }
+        json.endArray();
+        json.name("halo").beginArray();
+        for (int index = 0; index < haloOffsets.length; index++) {
+            json.beginObject();
+            json.name("offset").value(Byte.toUnsignedInt(haloOffsets[index]));
+            json.name("revision").value(haloRevisions[index]);
+            json.name("fingerprintHex").value(Long.toUnsignedString(haloFingerprints[index], 16));
+            json.endObject();
+        }
+        json.endArray();
+        json.endObject();
+    }
+    public int retainedBytes() {
+        return retainedBytes;
+    }
+
+    long signature() {
+        return signature;
+    }
+
+    private long metadata(int componentId) {
+        if (componentId < 0 || componentId >= componentMetadata.length) {
+            throw new IndexOutOfBoundsException("unknown component " + componentId);
+        }
+        return componentMetadata[componentId];
+    }
+
+    private static void deriveLegalAnchors(BuildInput input,
+                                           GeometryKey geometry,
+                                           BuildScratch scratch) {
+        scratch.rawRows.fill(input, geometry, scratch);
+
+        int alignments = (geometry.widthCells() & 1) == 0 ? 4 : 1;
+        for (int alignment = 0; alignment < alignments; alignment++) {
+            int minX = minimumFootprintOffset(geometry.widthCells(), alignment & 1);
+            int minZ = minimumFootprintOffset(geometry.widthCells(), alignment >>> 1);
+            for (int y = 0; y < PRISM_LAYERS; y++) {
+                erodeRows(geometry, scratch, y, minX, false);
+                appendErodedLayer(scratch.prismMask, scratch.erodedRows,
+                        y, minZ, geometry.widthCells());
+            }
+            if (geometry.channel() == Channel.GROUND) {
+                for (int y = 0; y < SIDE; y++) {
+                    erodeRows(geometry, scratch, y, minX, true);
+                    appendErodedLayer(scratch.legalMask, scratch.erodedRows,
+                            y, minZ, geometry.widthCells());
+                }
+            }
+        }
+        if (geometry.channel() == Channel.VOLUME) {
+            System.arraycopy(scratch.prismMask, 0, scratch.legalMask, 0,
+                    scratch.legalMask.length);
+        }
+        if (geometry.widthCells() == 1 && geometry.heightCells() == 1) {
+            removeSealedCells(input, geometry, scratch);
+        }
+    }
+
+    /**
+     * Bits 1..16 represent the center section x coordinates; bits 0 and 17 are
+     * the west/east halo. The row grid uses the same one-cell shell for y and z.
+     */
+    private static void removeSealedCells(BuildInput input,
+                                          GeometryKey geometry,
+                                          BuildScratch scratch) {
+        input.populateFullCollisionRows(geometry, scratch);
+        for (int y = 0; y < SIDE; y++) {
+            for (int z = 0; z < SIDE; z++) {
+                int row = (y + 1) * SEALED_SIDE + z + 1;
+                int full = scratch.fullCollisionRows[row];
+                int sealed = (full << 1) & (full >>> 1)
+                        & scratch.fullCollisionRows[row - 1]
+                        & scratch.fullCollisionRows[row + 1]
+                        & scratch.fullCollisionRows[row - SEALED_SIDE]
+                        & scratch.fullCollisionRows[row + SEALED_SIDE];
+                int word = (y << 2) + (z >>> 2);
+                int shift = (z & 3) << 4;
+                int legal = (int) (scratch.legalMask[word] >>> shift) & 0xffff;
+                int sealedAnchors = (sealed >>> 1) & legal & 0xffff;
+                scratch.legalMask[word] &= ~((long) sealedAnchors << shift);
+            }
+        }
+    }
+
+    private static int minimumFootprintOffset(int width, int positiveEvenAlignment) {
+        return (width & 1) == 1 ? -(width >>> 1) : -(width >>> 1) + positiveEvenAlignment;
+    }
+
+    private static void erodeRows(GeometryKey geometry,
+                                  BuildScratch scratch,
+                                  int anchorY,
+                                  int minX,
+                                  boolean ground) {
+        for (int row = 0; row < EXTENDED_SIDE; row++) {
+            int open = -1;
+            for (int dy = 0; dy < geometry.heightCells(); dy++) {
+                open &= scratch.volumeRows[(anchorY + dy) * EXTENDED_SIDE + row];
+            }
+            if (ground) open &= scratch.groundRows[anchorY * EXTENDED_SIDE + row];
+            int anchors = 0xffff;
+            for (int dx = 0; dx < geometry.widthCells(); dx++) {
+                anchors &= open >>> (minX + dx - EXTENDED_MIN);
+            }
+            scratch.erodedRows[row] = anchors & 0xffff;
+        }
+    }
+
+    private static void appendErodedLayer(long[] destination,
+                                          int[] rows,
+                                          int y,
+                                          int minZ,
+                                          int width) {
+        int layer = y << 2;
+        for (int z = 0; z < SIDE; z++) {
+            int anchors = 0xffff;
+            for (int dz = 0; dz < width; dz++) {
+                anchors &= rows[z + minZ + dz - EXTENDED_MIN];
+            }
+            destination[layer + (z >>> 2)] |= (long) anchors << ((z & 3) << 4);
+        }
+    }
+
+    private static int labelComponents(BuildInput input, GeometryKey geometry, BuildScratch scratch) {
+        BoundaryGeometry collision = input.hasDoors ? new BoundaryGeometry(input) : null;
+        int[] starts = scratch.runStarts, ends = scratch.runEnds, parent = scratch.queue;
+        for (int row = 0; row < 256; row++) {
+            int legal = runLegal(scratch.legalMask, row);
+            int east = legal & (legal >>> 1), y = row >>> 4, z = row & 15;
+            if (collision != null) {
+                int passed = 0;
+                for (int remaining = east; remaining != 0; remaining &= remaining - 1) {
+                    int x = Integer.numberOfTrailingZeros(remaining);
+                    if (input.doorMoveOpen(x,y,z,Direction.EAST,1,0,geometry,collision)) passed |= 1 << x;
+                }
+                east = passed;
+            }
+            starts[row] = legal & ~(east << 1); ends[row] = legal & ~east;
+            int first = starts[row];
+            while (first != 0) {
+                int x = Integer.numberOfTrailingZeros(first);
+                first &= first - 1;
+                int root = row * 16 + x; parent[root] = root;
+            }
+        }
+        for (int row = 0; row < 256; row++) {
+            int legal = runLegal(scratch.legalMask,row), y = row >>> 4, z = row & 15;
+            if (z < 15) {
+                int allowed = legal & runLegal(scratch.legalMask,row + 1);
+                joinRuns(scratch,row,row + 1,allowed,input,geometry,collision);
+            }
+            if (geometry.channel() == Channel.VOLUME && y < 15)
+                joinRuns(scratch,row,row + 16,legal & runLegal(scratch.legalMask,row + 16),
+                        input,geometry,null);
+        }
+        // Save every run root before parent storage becomes the component-ID table.
+        for (int row = 0; row < 256; row++) {
+            for (int remaining = starts[row]; remaining != 0; remaining &= remaining - 1) {
+                int cell = row * 16 + Integer.numberOfTrailingZeros(remaining);
+                scratch.labels[cell] = (char)(runRoot(parent,cell) + 1);
+            }
+        }
+        int componentCount = 0;
+        for (int row = 0; row < 256; row++) {
+            for (int remaining = starts[row]; remaining != 0; remaining &= remaining - 1) {
+                int cell = row * 16 + Integer.numberOfTrailingZeros(remaining);
+                if (scratch.labels[cell] == cell + 1) {
+                    parent[cell] = ++componentCount;
+                    scratch.componentMetadata[componentCount - 1] = cell | 15L << 12 | 15L << 16 | 15L << 20;
+                }
+            }
+        }
+        for (int row = 0; row < 256; row++) {
+            int first = starts[row], last = ends[row], y = row >>> 4, z = row & 15;
+            while (first != 0) {
+                int x = Integer.numberOfTrailingZeros(first), end = Integer.numberOfTrailingZeros(last);
+                first &= first - 1; last &= last - 1;
+                int component = parent[scratch.labels[row * 16 + x] - 1] - 1;
+                Arrays.fill(scratch.labels,row * 16 + x,row * 16 + end + 1,(char)(component + 1));
+                long old = scratch.componentMetadata[component];
+                scratch.componentMetadata[component] = (old & 4095)
+                        | (long)Math.min((int)(old >>> 12) & 15,x) << 12
+                        | (long)Math.min((int)(old >>> 16) & 15,y) << 16
+                        | (long)Math.min((int)(old >>> 20) & 15,z) << 20
+                        | (long)Math.max((int)(old >>> 24) & 15,end) << 24
+                        | (long)Math.max((int)(old >>> 28) & 15,y) << 28
+                        | (long)Math.max((int)(old >>> 32) & 15,z) << 32;
+            }
+        }
+        return componentCount;
+    }
+
+    private static int runLegal(long[] legal,int row) {
+        return (int)(legal[row >>> 2] >>> ((row & 3) * 16)) & 0xffff;
+    }
+    private static int runRoot(int[] parent,int node) {
+        while (parent[node] != node) {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        return node;
+    }
+    private static void joinRuns(BuildScratch scratch,int row,int other,int allowed,
+                                 BuildInput input,GeometryKey geometry,BoundaryGeometry collision) {
+        while (allowed != 0) {
+            int x = Integer.numberOfTrailingZeros(allowed), prefix = (1 << (x + 1)) - 1;
+            int a = 31 - Integer.numberOfLeadingZeros(scratch.runStarts[row] & prefix);
+            int b = 31 - Integer.numberOfLeadingZeros(scratch.runStarts[other] & prefix);
+            int endA = Integer.numberOfTrailingZeros(scratch.runEnds[row] & (0xffff << x));
+            int endB = Integer.numberOfTrailingZeros(scratch.runEnds[other] & (0xffff << x));
+            int end = Math.min(endA,endB);
+            a = runRoot(scratch.queue,row * 16 + a); b = runRoot(scratch.queue,other * 16 + b);
+            if (a != b) {
+                boolean connected = collision == null;
+                // One passable crossing joins this pair of internally connected runs.
+                for (int remaining = allowed & ((1 << (end + 1)) - 1);
+                     !connected && remaining != 0; remaining &= remaining - 1) {
+                    int crossing = Integer.numberOfTrailingZeros(remaining);
+                    connected = input.doorMoveOpen(crossing,row >>> 4,row & 15,
+                            Direction.SOUTH,1,0,geometry,collision);
+                }
+                if (connected) scratch.queue[Math.max(a,b)] = Math.min(a,b);
+            }
+            allowed &= 0xffff << (end + 1);
+        }
+    }
+
+    private static PrimitiveEdges buildGroundEdges(BuildInput input,
+                                                    GeometryKey geometry,
+                                                    BuildScratch scratch,
+                                                    int componentCount) {
+        if (componentCount <= 1) return PrimitiveEdges.empty(componentCount);
+        Long2LongOpenHashMap merged = scratch.edgeMap;
+        BoundaryGeometry collision = input.hasDoors ? new BoundaryGeometry(input) : null;
+        for (int cell = 0; cell < CELL_COUNT; cell++) {
+            int encoded = scratch.labels[cell];
+            if (encoded == 0) {
+                continue;
+            }
+            int from = encoded - 1;
+            int x = x(cell);
+            int y = y(cell);
+            int z = z(cell);
+            for (Direction direction : HORIZONTAL_DIRECTIONS) {
+                for (int horizontal = 1; horizontal <= MAX_STRUCTURAL_JUMP; horizontal++) {
+                    int nx = x + direction.getStepX() * horizontal;
+                    int nz = z + direction.getStepZ() * horizontal;
+                    if (nx < 0 || nx >= SIDE || nz < 0 || nz >= SIDE) {
+                        break;
+                    }
+                    for (int dy = -MAX_STRUCTURAL_DROP; dy <= MAX_STRUCTURAL_STEP; dy++) {
+                        int ny = y + dy;
+                        if (ny < 0 || ny >= SIDE) {
+                            continue;
+                        }
+                        int targetLabel = scratch.labels[cellIndex(nx, ny, nz)];
+                        if (targetLabel == 0 || targetLabel - 1 == from) {
+                            continue;
+                        }
+                        int jumpClass = horizontal - 1;
+                        int requiredStep = Math.max(0, dy);
+                        int requiredDrop = Math.max(0, -dy);
+                        if (!movementEnvelopeOpen(
+                                x,
+                                y,
+                                z,
+                                direction,
+                                horizontal,
+                                dy,
+                                scratch
+                        )) {
+                            continue;
+                        }
+                        if (collision != null && !input.doorMoveOpen(
+                                x, y, z, direction, horizontal, dy, geometry, collision)) continue;
+                        long capabilityMask = supportingCapabilities(
+                                requiredStep,
+                                jumpClass,
+                                requiredDrop
+                        );
+                        if (capabilityMask == 0L) {
+                            continue;
+                        }
+                        int target = targetLabel - 1;
+                        long key = ((long) from << 32) | Integer.toUnsignedLong(target);
+                        float cost = (float) Math.sqrt(horizontal * horizontal + dy * dy);
+                        long old = merged.getOrDefault(key, 0L);
+                        long capabilities = (old & 0x3fff_ffffL) | capabilityMask;
+                        float oldCost = old == 0L
+                                ? Float.POSITIVE_INFINITY
+                                : Float.intBitsToFloat((int) (old >>> 32));
+                        merged.put(key,
+                                ((long) Float.floatToRawIntBits(Math.min(oldCost, cost)) << 32)
+                                        | capabilities);
+                    }
+                }
+            }
+        }
+        long[] keys = merged.keySet().toLongArray();
+        Arrays.sort(keys);
+        int[] offsets = new int[componentCount + 1];
+        for (long key : keys) {
+            offsets[(int) (key >>> 32) + 1]++;
+        }
+        for (int index = 1; index < offsets.length; index++) {
+            offsets[index] += offsets[index - 1];
+        }
+        int[] targets = new int[keys.length];
+        long[] capabilities = new long[keys.length];
+        float[] lowerBounds = new float[keys.length];
+        for (int index = 0; index < keys.length; index++) {
+            long key = keys[index];
+            long value = merged.get(key);
+            targets[index] = (int) key;
+            capabilities[index] = value & 0x3fff_ffffL;
+            lowerBounds[index] = Float.intBitsToFloat((int) (value >>> 32));
+        }
+        return new PrimitiveEdges(offsets, targets, capabilities, lowerBounds);
+    }
+
+    static boolean movementEnvelopeOpen(int x,
+                                                int y,
+                                                int z,
+                                                Direction direction,
+                                                int horizontal,
+                                                int dy,
+                                                BuildScratch scratch) {
+        if (dy < 0) {
+            int landingX = x + direction.getStepX() * horizontal;
+            int landingZ = z + direction.getStepZ() * horizontal;
+            for (int shaftY = y - 1; shaftY > y + dy; shaftY--) {
+                if (!prismOpen(landingX, shaftY, landingZ, scratch)) {
+                    return false;
+                }
+            }
+        }
+        for (int distance = 1; distance < horizontal; distance++) {
+            int intermediateY = y + Math.floorDiv(dy * distance, horizontal);
+            int intermediateX = x + direction.getStepX() * distance;
+            int intermediateZ = z + direction.getStepZ() * distance;
+            if (!prismOpen(intermediateX, intermediateY, intermediateZ, scratch)
+                    && !prismOpen(intermediateX, intermediateY + 1, intermediateZ, scratch)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean prismOpen(int anchorX,
+                                     int anchorY,
+                                     int anchorZ,
+                                     BuildScratch scratch) {
+        if (!inBounds(anchorX, 0, anchorZ) || anchorY < 0 || anchorY >= PRISM_LAYERS) return false;
+        int cell = (anchorY << 8) | (anchorZ << 4) | anchorX;
+        return isSet(scratch.prismMask, cell);
+    }
+
+    static long supportingCapabilities(int step, int jumpClass, int drop) {
+        long result = 0L;
+        for (int candidateStep = step; candidateStep <= MAX_STRUCTURAL_STEP; candidateStep++) {
+            for (int candidateJump = jumpClass; candidateJump < 3; candidateJump++) {
+                for (int candidateDrop = drop; candidateDrop <= MAX_STRUCTURAL_DROP; candidateDrop++) {
+                    result |= 1L << new MovementKey(
+                            candidateStep,
+                            candidateJump,
+                            candidateDrop
+                    ).capabilityBit();
+                }
+            }
+        }
+        return result;
+    }
+
+    private static BitStorage compactLabels(char[] labels, int componentCount) {
+        int uniform = uniformLabel(labels);
+        if (uniform >= 0) {
+            return new ZeroBitStorage(CELL_COUNT);
+        }
+        int bits = Integer.SIZE - Integer.numberOfLeadingZeros(componentCount);
+        BitStorage packed = new SimpleBitStorage(bits, CELL_COUNT);
+        for (int cell = 0; cell < CELL_COUNT; cell++) {
+            packed.set(cell, labels[cell]);
+        }
+        return packed;
+    }
+
+    private static int uniformLabel(char[] labels) {
+        int first = labels[0];
+        for (int cell = 1; cell < labels.length; cell++) {
+            if (labels[cell] != first) {
+                return -1;
+            }
+        }
+        return first;
+    }
+
+    private void validate() {
+        if (componentLabels.getSize() != CELL_COUNT
+                || outgoingOffsets.length != componentMetadata.length + 1
+                || outgoingTargets.length != outgoingCapabilityMasks.length
+                || outgoingTargets.length != outgoingLowerBounds.length
+                || haloOffsets.length != haloRevisions.length
+                || haloOffsets.length != haloFingerprints.length) {
+            throw new IllegalArgumentException("inconsistent primitive topology arrays");
+        }
+        for (int edge = 0; edge < outgoingTargets.length; edge++) {
+            if (outgoingTargets[edge] < 0 || outgoingTargets[edge] >= componentMetadata.length
+                    || outgoingCapabilityMasks[edge] == 0L
+                    || !Float.isFinite(outgoingLowerBounds[edge])
+                    || outgoingLowerBounds[edge] < 0.0F) {
+                throw new IllegalArgumentException("invalid local topology edge");
+            }
+        }
+    }
+
+    private static boolean isSet(long[] mask, int cell) {
+        return (mask[cell >>> 6] & (1L << cell)) != 0L;
+    }
+
+    private static boolean inBounds(int x, int y, int z) {
+        return (x | y | z) >= 0 && x < SIDE && y < SIDE && z < SIDE;
+    }
+
+    public static int cellIndex(int x, int y, int z) {
+        if (!inBounds(x, y, z)) {
+            throw new IndexOutOfBoundsException("cell coordinates must be in [0, 15]");
+        }
+        return (y << 8) | (z << 4) | x;
+    }
+
+    public static int x(int cell) {
+        return cell & 15;
+    }
+
+    public static int y(int cell) {
+        return (cell >>> 8) & 15;
+    }
+
+    public static int z(int cell) {
+        return (cell >>> 4) & 15;
+    }
+
+    private static final Direction[] HORIZONTAL_DIRECTIONS = {
+            Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST
+    };
+
+    public enum Channel {
+        GROUND,
+        VOLUME
+    }
+
+    public record GeometryKey(Channel channel,
+                              int widthCells,
+                              int heightCells,
+                              float width,
+                              float height,
+                              boolean acceptsFluid,
+                              boolean canOpenDoors) {
+        public GeometryKey {
+            Objects.requireNonNull(channel, "channel");
+            if (widthCells < 1 || widthCells > SIDE || heightCells < 1 || heightCells > SIDE) {
+                throw new IllegalArgumentException("unsupported macro geometry");
+            }
+            if (!Float.isFinite(width) || width <= 0.0F
+                    || !Float.isFinite(height) || height <= 0.0F) {
+                throw new IllegalArgumentException("invalid physical macro geometry");
+            }
+        }
+    }
+
+    public record MovementKey(int maxStep, int jumpClass, int maxDrop) {
+        public MovementKey {
+            if (maxStep < 0 || maxStep > MAX_STRUCTURAL_STEP
+                    || jumpClass < 0 || jumpClass > 2
+                    || maxDrop < 0 || maxDrop > MAX_STRUCTURAL_DROP) {
+                throw new IllegalArgumentException("unsupported macro movement");
+            }
+        }
+
+        public int capabilityBit() {
+            return (maxStep * 3 + jumpClass) * 5 + maxDrop;
+        }
+
+        public long capabilityMask() {
+            return 1L << capabilityBit();
+        }
+    }
+
+    public record TraversalProfile(float width,
+                                   float height,
+                                   int maxStep,
+                                   int maxJump,
+                                   int maxDrop,
+                                   boolean acceptsFluid,
+                                   boolean canOpenDoors) {
+        public static final TraversalProfile DEFAULT_GROUND =
+                new TraversalProfile(0.6F, 1.95F, 1, 0, 3, false, false);
+
+        public TraversalProfile {
+            if (!Float.isFinite(width) || width <= 0.0F
+                    || !Float.isFinite(height) || height <= 0.0F
+                    || maxStep < 0 || maxStep > MAX_STRUCTURAL_STEP
+                    || maxJump < 0 || maxJump > MAX_STRUCTURAL_JUMP
+                    || maxDrop < 0 || maxDrop > MAX_STRUCTURAL_DROP) {
+                throw new IllegalArgumentException("invalid traversal profile");
+            }
+        }
+
+        public GeometryKey geometry(Channel channel) {
+            int widthCells = (int) Math.ceil(width);
+            int heightCells = (int) Math.ceil(height);
+            return new GeometryKey(channel, widthCells, heightCells, width, height, acceptsFluid, canOpenDoors);
+        }
+
+        public MovementKey movement(Channel channel) {
+            if (channel == Channel.VOLUME) {
+                return new MovementKey(0, 0, 0);
+            }
+            int jumpClass = maxJump <= 1 ? 0 : maxJump - 1;
+            return new MovementKey(maxStep, jumpClass, maxDrop);
+        }
+    }
+
+    /** Immutable facts and sparse loaded-neighbour stamps supplied to the worker. */
+    static final class BuildInput {
+        private final PackedFacts center;
+        private final byte[] offsets;
+        private final PackedFacts[] facts;
+        private final long[] revisions;
+        private final long[] fingerprints;
+        private final boolean hasDoors;
+        private final int airSlots;
+
+        BuildInput(PackedFacts center,
+                   byte[] offsets,
+                   PackedFacts[] facts,
+                   long[] revisions,
+                   long[] fingerprints) {
+            this.center = Objects.requireNonNull(center, "center");
+            this.offsets = offsets.clone();
+            this.facts = facts.clone();
+            this.revisions = revisions.clone();
+            this.fingerprints = fingerprints.clone();
+            this.hasDoors = center.geometry().hasDoors()
+                    || Arrays.stream(facts).anyMatch(f -> f.geometry().hasDoors());
+            if (offsets.length != facts.length || offsets.length != revisions.length
+                    || offsets.length != fingerprints.length || offsets.length > 26) {
+                throw new IllegalArgumentException("inconsistent halo facts");
+            }
+            int previous = -1;
+            for (byte encoded : this.offsets) {
+                int value = Byte.toUnsignedInt(encoded);
+                if (value == CENTER_HALO_INDEX || value <= previous || value > 26) {
+                    throw new IllegalArgumentException("halo offsets must be unique and sorted");
+                }
+                previous = value;
+            }
+            int air = center == PackedFacts.allAir() ? 1 : 0;
+            for (int index = 0; index < this.facts.length; index++) {
+                if (this.facts[index] == PackedFacts.allAir()) air |= 1 << (index + 1);
+            }
+            this.airSlots = (air & (air >>> 1)) == 0 ? 0 : air;
+        }
+
+        static BuildInput center(PackedFacts facts) {
+            return new BuildInput(facts, new byte[0], new PackedFacts[0], new long[0], new long[0]);
+        }
+
+        PackedFacts center() {
+            return center;
+        }
+
+        @Nullable
+        PackedFacts atSection(int dx, int dy, int dz) {
+            if ((dx | dy | dz) == 0) return center;
+            if (Math.abs(dx) > 1 || Math.abs(dy) > 1 || Math.abs(dz) > 1) return null;
+            int index = Arrays.binarySearch(offsets, (byte) haloIndex(dx, dy, dz));
+            return index < 0 ? null : facts[index];
+        }
+
+        long revisionAtSection(int dx, int dy, int dz, long centerRevision) {
+            if ((dx | dy | dz) == 0) return centerRevision;
+            int index = Arrays.binarySearch(offsets, (byte) haloIndex(dx, dy, dz));
+            if (index < 0) throw new IllegalArgumentException("missing geometry revision");
+            return revisions[index];
+        }
+
+        void visitFacts(Consumer<PackedFacts> consumer) {
+            consumer.accept(center);
+            for (PackedFacts fact : facts) consumer.accept(fact);
+        }
+
+        boolean hasFactRuns() {
+            return airSlots != 0;
+        }
+
+        void visitFactRuns(ObjIntConsumer<PackedFacts> consumer) {
+            if (airSlots == 0) {
+                consumer.accept(center, 1);
+                for (PackedFacts fact : facts) consumer.accept(fact, 1);
+                return;
+            }
+            for (int slot = 0; slot <= facts.length;) {
+                int shifted = airSlots >>> slot;
+                if ((shifted & 1) != 0) {
+                    int count = Integer.numberOfTrailingZeros(~shifted);
+                    consumer.accept(PackedFacts.allAir(), count);
+                    slot += count;
+                } else {
+                    consumer.accept(slot == 0 ? center : facts[slot - 1], 1);
+                    slot++;
+                }
+            }
+        }
+
+        BuildInput withFacts(PackedFacts replacementCenter, Map<Integer, PackedFacts> replacements) {
+            PackedFacts[] next = facts.clone();
+            long[] nextFingerprints = fingerprints.clone();
+            for (int index = 0; index < offsets.length; index++) {
+                next[index] = Objects.requireNonNull(replacements.get(Byte.toUnsignedInt(offsets[index])));
+                nextFingerprints[index] = next[index].fingerprint();
+            }
+            return new BuildInput(replacementCenter, offsets, next, revisions, nextFingerprints);
+        }
+
+        int referenceBytes() {
+            return 136 + offsets.length + facts.length * Long.BYTES
+                    + (revisions.length + fingerprints.length) * Long.BYTES;
+        }
+
+        private BuildInput boundarySnapshot(GeometryKey geometry, boolean[] used) {
+            byte[] selectedOffsets = new byte[offsets.length];
+            PackedFacts[] selectedFacts = new PackedFacts[facts.length];
+            long[] selectedRevisions = new long[revisions.length];
+            long[] selectedFingerprints = new long[fingerprints.length];
+            int count = 0;
+            for (int index = 0; index < offsets.length; index++) {
+                int code = Byte.toUnsignedInt(offsets[index]);
+                if (!boundaryHaloRequired(geometry, haloX(code), haloY(code), haloZ(code))) continue;
+                used[index] = true;
+                selectedOffsets[count] = offsets[index];
+                selectedFacts[count] = facts[index];
+                selectedRevisions[count] = revisions[index];
+                selectedFingerprints[count++] = fingerprints[index];
+            }
+            return new BuildInput(center, Arrays.copyOf(selectedOffsets, count),
+                    Arrays.copyOf(selectedFacts, count), Arrays.copyOf(selectedRevisions, count),
+                    Arrays.copyOf(selectedFingerprints, count));
+        }
+
+        int flags(int x, int y, int z, BuildScratch scratch) {
+            int sectionX = Math.floorDiv(x, SIDE);
+            int sectionY = Math.floorDiv(y, SIDE);
+            int sectionZ = Math.floorDiv(z, SIDE);
+            if (sectionX == 0 && sectionY == 0 && sectionZ == 0) {
+                int flags = center.flags(cellIndex(x, y, z));
+                if (y == 0 && (flags & VOLUME_OPEN) != 0) {
+                    int lowerIndex = Arrays.binarySearch(offsets,
+                            (byte) haloIndex(0, -1, 0));
+                    if (lowerIndex >= 0) {
+                        scratch.haloUsed[lowerIndex] = true;
+                        int below = facts[lowerIndex].flags(cellIndex(x, SIDE - 1, z));
+                        if ((below & VOLUME_OPEN) == 0 || (below & EXACT_REQUIRED) != 0) {
+                            flags |= GROUND_OPEN;
+                        }
+                    }
+                }
+                return flags;
+            }
+            if (Math.abs(sectionX) > 1 || Math.abs(sectionY) > 1 || Math.abs(sectionZ) > 1) {
+                return 0;
+            }
+            int encoded = haloIndex(sectionX, sectionY, sectionZ);
+            int index = Arrays.binarySearch(offsets, (byte) encoded);
+            if (index < 0) {
+                return 0;
+            }
+            scratch.haloUsed[index] = true;
+            return facts[index].flags(cellIndex(
+                    Math.floorMod(x, SIDE),
+                    Math.floorMod(y, SIDE),
+                    Math.floorMod(z, SIDE)
+            ));
+        }
+
+        boolean groundOpen(int x, int y, int z, int currentFlags, GeometryKey body, BuildScratch scratch) {
+            if (!body.canOpenDoors() || !hasDoors) return (currentFlags & GROUND_OPEN) != 0;
+            PackedFacts current = sourceFacts(x, y, z, scratch);
+            boolean door = current != null && current.geometry().hasDoors() && current.geometry().shape(cellIndex(
+                    Math.floorMod(x,16),Math.floorMod(y,16),Math.floorMod(z,16))).openableDoor();
+            int belowFlags = flags(x, y-1, z, scratch);
+            PackedFacts below = (y & 15) != 0 ? current : sourceFacts(x, y-1, z, scratch);
+            boolean belowDoor = below != null && below.geometry().hasDoors() && below.geometry().shape(cellIndex(
+                    Math.floorMod(x,16),Math.floorMod(y-1,16),Math.floorMod(z,16))).openableDoor();
+            if (belowDoor) return false;
+            if (!door) return (currentFlags & GROUND_OPEN) != 0;
+            return below != null && ((belowFlags & VOLUME_OPEN) == 0 || (belowFlags & EXACT_REQUIRED) != 0);
+        }
+
+        boolean doorMoveOpen(int x, int y, int z, Direction direction, int distance, int dy,
+                             GeometryKey body, BoundaryGeometry collision) {
+            double half = body.width()*.5;
+            int x2=x+direction.getStepX()*distance, z2=z+direction.getStepZ()*distance;
+            int minX=(int)Math.floor(Math.min(x,x2)+.5-half), maxX=(int)Math.ceil(Math.max(x,x2)+.5+half)-1;
+            int minZ=(int)Math.floor(Math.min(z,z2)+.5-half), maxZ=(int)Math.ceil(Math.max(z,z2)+.5+half)-1;
+            int minY=Math.min(y,y+dy), maxY=(int)Math.ceil(Math.max(y,y+dy)+(distance>1?1:0)+body.height())-1;
+            for(int cy=minY;cy<=maxY;cy++) for(int cz=minZ;cz<=maxZ;cz++) for(int cx=minX;cx<=maxX;cx++) {
+                PackedFacts fact=sourceFacts(cx,cy,cz,null);
+                if(fact!=null && fact.geometry().hasDoors() && fact.geometry().shape(cellIndex(Math.floorMod(cx,16),Math.floorMod(cy,16),Math.floorMod(cz,16))).isDoor())
+                    return collision.open(body,x,y,z,direction,distance,dy);
+            }
+            return true;
+        }
+
+        boolean volumeOpen(int x,
+                           int y,
+                           int z,
+                           GeometryKey geometry,
+                           BuildScratch scratch) {
+            int flags = flags(x, y, z, scratch);
+            if ((flags & VOLUME_OPEN) == 0) return false;
+            PackedFacts source = sourceFacts(x, y, z, scratch);
+            if (source == null || (flags & EXACT_REQUIRED) == 0) return true;
+            SectionGeometry sectionGeometry = source.geometry();
+            if (sectionGeometry == null) return false;
+            return !sectionGeometry.occupied(cellIndex(
+                    Math.floorMod(x, SIDE),
+                    Math.floorMod(y, SIDE),
+                    Math.floorMod(z, SIDE)
+            ), geometry.width(), geometry.height(), geometry.canOpenDoors());
+        }
+
+        @Nullable
+        private PackedFacts sourceFacts(int x, int y, int z, BuildScratch scratch) {
+            int sectionX = Math.floorDiv(x, SIDE);
+            int sectionY = Math.floorDiv(y, SIDE);
+            int sectionZ = Math.floorDiv(z, SIDE);
+            if (sectionX == 0 && sectionY == 0 && sectionZ == 0) return center;
+            if (Math.abs(sectionX) > 1 || Math.abs(sectionY) > 1 || Math.abs(sectionZ) > 1) {
+                return null;
+            }
+            int encoded = haloIndex(sectionX, sectionY, sectionZ);
+            int index = Arrays.binarySearch(offsets, (byte) encoded);
+            return index < 0 ? null : facts[index];
+        }
+
+        private void populateFullCollisionRows(GeometryKey geometry,
+                                               BuildScratch scratch) {
+            for (int y = 0; y < SIDE; y++) {
+                for (int z = 0; z < SIDE; z++) {
+                    int full = 0;
+                    for (int x = -1; x <= SIDE; x++) {
+                        if (!volumeOpen(x, y, z, geometry, scratch)) {
+                            full |= 1 << (x + 1);
+                        }
+                    }
+                    scratch.fullCollisionRows[(y + 1) * SEALED_SIDE + z + 1] = full << 1;
+                }
+            }
+            for (Direction face : Direction.values()) {
+                copyFullCollisionFace(face, geometry, scratch);
+            }
+        }
+
+        private void copyFullCollisionFace(Direction face,
+                                           GeometryKey geometry,
+                                           BuildScratch scratch) {
+            int index = Arrays.binarySearch(offsets, (byte) haloIndex(
+                    face.getStepX(), face.getStepY(), face.getStepZ()
+            ));
+            if (index < 0) {
+                return;
+            }
+            scratch.haloUsed[index] = true;
+            PackedFacts source = facts[index];
+            for (int first = 0; first < SIDE; first++) {
+                for (int second = 0; second < SIDE; second++) {
+                    int sourceX;
+                    int sourceY;
+                    int sourceZ;
+                    int targetX;
+                    int targetY;
+                    int targetZ;
+                    switch (face.getAxis()) {
+                        case X -> {
+                            sourceX = face == Direction.WEST ? SIDE - 1 : 0;
+                            sourceY = first;
+                            sourceZ = second;
+                            targetX = face == Direction.WEST ? -1 : SIDE;
+                            targetY = first;
+                            targetZ = second;
+                        }
+                        case Y -> {
+                            sourceX = first;
+                            sourceY = face == Direction.DOWN ? SIDE - 1 : 0;
+                            sourceZ = second;
+                            targetX = first;
+                            targetY = face == Direction.DOWN ? -1 : SIDE;
+                            targetZ = second;
+                        }
+                        case Z -> {
+                            sourceX = first;
+                            sourceY = second;
+                            sourceZ = face == Direction.NORTH ? SIDE - 1 : 0;
+                            targetX = first;
+                            targetY = second;
+                            targetZ = face == Direction.NORTH ? -1 : SIDE;
+                        }
+                        default -> throw new IllegalStateException("unknown direction axis");
+                    }
+                    if (!sourceFlagsOpen(source, sourceX, sourceY, sourceZ, geometry, scratch)) {
+                        scratch.fullCollisionRows[(targetY + 1) * SEALED_SIDE + targetZ + 1]
+                                |= 1 << (targetX + 1);
+                    }
+                }
+            }
+        }
+
+        private boolean sourceFlagsOpen(PackedFacts source,
+                                        int x,
+                                        int y,
+                                        int z,
+                                        GeometryKey geometry,
+                                        BuildScratch scratch) {
+            int flags = source.flags(cellIndex(x, y, z));
+            if ((flags & VOLUME_OPEN) == 0) return false;
+            if ((flags & EXACT_REQUIRED) == 0) return true;
+            SectionGeometry sectionGeometry = source.geometry();
+            return sectionGeometry != null
+                    && !sectionGeometry.occupied(cellIndex(x, y, z),
+                    geometry.width(), geometry.height(), geometry.canOpenDoors());
+        }
+
+        HaloStamps usedStamps(boolean[] used) {
+            int count = 0;
+            for (int index = 0; index < offsets.length; index++) {
+                if (used[index]) count++;
+            }
+            byte[] usedOffsets = new byte[count];
+            long[] usedRevisions = new long[count];
+            long[] usedFingerprints = new long[count];
+            int cursor = 0;
+            for (int index = 0; index < offsets.length; index++) {
+                if (!used[index]) continue;
+                usedOffsets[cursor] = offsets[index];
+                usedRevisions[cursor] = revisions[index];
+                usedFingerprints[cursor] = fingerprints[index];
+                cursor++;
+            }
+            return new HaloStamps(usedOffsets, usedRevisions, usedFingerprints);
+        }
+
+    }
+
+    /** Reused by the single topology worker; never retained by a published graph. */
+    static final class BuildScratch {
+        private static final int MAX_PARENT_NODES = CELL_COUNT * 8;
+        private final RawRows rawRows = new RawRows();
+        private final char[] labels = new char[CELL_COUNT];
+        private final int[] queue = new int[CELL_COUNT];
+        private final int[] runStarts = new int[256], runEnds = new int[256];
+        private final long[] componentMetadata = new long[CELL_COUNT];
+        private final long[] legalMask = new long[CELL_COUNT / Long.SIZE];
+        private final long[] prismMask = new long[PRISM_LAYERS * SIDE * SIDE / Long.SIZE];
+        private final int[] volumeRows = new int[(SIDE * 2) * EXTENDED_SIDE];
+        private final int[] groundRows = new int[SIDE * EXTENDED_SIDE];
+        private final int[] erodedRows = new int[EXTENDED_SIDE];
+        private final int[] fullCollisionRows = new int[SEALED_SIDE * SEALED_SIDE];
+        private final boolean[] haloUsed = new boolean[26];
+        private final Long2LongOpenHashMap edgeMap = new Long2LongOpenHashMap();
+        final int[] parentCounts = new int[MAX_PARENT_NODES + 1];
+        final int[] parentCursors = new int[MAX_PARENT_NODES + 1];
+        final int[] parentOrder = new int[MAX_PARENT_NODES];
+        final int[] parentStackNodes = new int[MAX_PARENT_NODES];
+        final int[] parentStackEdges = new int[MAX_PARENT_NODES];
+        final int[] parentComponents = new int[MAX_PARENT_NODES];
+        final boolean[] parentVisited = new boolean[MAX_PARENT_NODES];
+
+        long[] localPrismMask() {
+            return prismMask;
+        }
+
+        private void reset() {
+            Arrays.fill(labels, (char) 0);
+            Arrays.fill(legalMask, 0L);
+            Arrays.fill(prismMask, 0L);
+            Arrays.fill(volumeRows, 0);
+            Arrays.fill(groundRows, 0);
+            Arrays.fill(fullCollisionRows, 0);
+            Arrays.fill(haloUsed, false);
+            edgeMap.clear();
+        }
+
+        synchronized void clearCachedRows() {
+            rawRows.clear();
+        }
+
+        int retainedBytes() {
+            return labels.length * Character.BYTES + (queue.length + runStarts.length + runEnds.length) * Integer.BYTES
+                    + componentMetadata.length * Long.BYTES
+                    + (legalMask.length + prismMask.length) * Long.BYTES
+                    + (volumeRows.length + groundRows.length + erodedRows.length
+                    + fullCollisionRows.length) * Integer.BYTES
+                    + haloUsed.length + (parentCounts.length + parentCursors.length
+                    + parentOrder.length + parentStackNodes.length + parentStackEdges.length
+                    + parentComponents.length) * Integer.BYTES + parentVisited.length
+                    + rawRows.retainedBytes();
+        }
+    }
+
+    /** Shared only by the serial build permit; entries contain no source or body references. */
+    private static final class RawRows {
+        private static final int MAX_SOURCES = 64;
+        // PackedFacts is final and inherits Object equality, so weak keys use source identity.
+        private final WeakHashMap<PackedFacts, Rows> rows = new WeakHashMap<>();
+        private final ArrayDeque<WeakReference<PackedFacts>> order = new ArrayDeque<>();
+
+        private static final class Rows {
+            private final long[] values = new long[SIDE * SIDE];
+            private final long[] ready = new long[SIDE * SIDE / Long.SIZE];
+        }
+
+        private void clear() {
+            rows.clear();
+            order.clear();
+        }
+
+        private int retainedBytes() {
+            return 1024 + rows.size() * 2304;
+        }
+
+        private static long compact(long word) {
+            long value = word & 0x1111111111111111L;
+            value = (value | value >>> 3) & 0x0303030303030303L;
+            value = (value | value >>> 6) & 0x000F000F000F000FL;
+            value = (value | value >>> 12) & 0x000000FF000000FFL;
+            return (value | value >>> 24) & 0xffffL;
+        }
+
+        private long row(PackedFacts source, int y, int z) {
+            Rows entry = rows.get(source);
+            if (entry == null) {
+                while (!order.isEmpty()
+                        && (order.peekFirst().get() == null || order.size() >= MAX_SOURCES)) {
+                    PackedFacts removed = order.removeFirst().get();
+                    if (removed != null) rows.remove(removed);
+                }
+                entry = new Rows();
+                rows.put(source, entry);
+                order.addLast(new WeakReference<>(source));
+            }
+            int index = (y << 4) | z;
+            if ((entry.ready[index >>> 6] & (1L << index)) == 0) {
+                long packed = source.packedRow(index);
+                entry.values[index] = compact(packed) | compact(packed >>> 1) << 16
+                        | compact(packed >>> 2) << 32 | compact(packed >>> 3) << 48;
+                entry.ready[index >>> 6] |= 1L << index;
+            }
+            return entry.values[index];
+        }
+
+        private void fill(BuildInput input, GeometryKey body, BuildScratch scratch) {
+            int width = body.widthCells();
+            int minimum = -(width >>> 1);
+            int maximum = minimum + ((width & 1) == 0 ? 1 : 0) + width - 1;
+            int maxY = SIDE + body.heightCells() - (body.channel() == Channel.GROUND ? 1 : 2);
+            boolean doorGround = input.hasDoors && body.canOpenDoors();
+            for (int y = 0; y <= maxY; y++) {
+                for (int z = minimum; z <= SIDE - 1 + maximum; z++) {
+                    int volume = 0;
+                    int ground = 0;
+                    int sy = Math.floorDiv(y, SIDE);
+                    int sz = Math.floorDiv(z, SIDE);
+                    for (int sx = Math.floorDiv(minimum, SIDE);
+                         sx <= Math.floorDiv(SIDE - 1 + maximum, SIDE); sx++) {
+                        int from = Math.max(minimum, sx * SIDE);
+                        int to = Math.min(SIDE - 1 + maximum, sx * SIDE + SIDE - 1);
+                        int localMask = ((1 << (to - from + 1)) - 1) << Math.floorMod(from, SIDE);
+                        PackedFacts source;
+                        if ((sx | sy | sz) == 0) {
+                            source = input.center;
+                        } else {
+                            int index = Arrays.binarySearch(input.offsets, (byte) haloIndex(sx, sy, sz));
+                            if (index < 0) {
+                                // groundOpen can still read an already loaded halo below a missing section.
+                                if (!doorGround || y >= SIDE) continue;
+                                source = null;
+                            } else {
+                                scratch.haloUsed[index] = true;
+                                source = input.facts[index];
+                            }
+                        }
+                        long raw = source == null ? 0 : row(source, y & 15, z & 15);
+                        int v = (int) raw & 0xffff;
+                        int g = (int) (raw >>> 16) & 0xffff;
+                        int fluid = (int) (raw >>> 32) & 0xffff;
+                        int exact = (int) (raw >>> 48) & 0xffff;
+                        // Match flags(): only center y=0 infers ground support from the lower halo.
+                        if ((sx | sy | sz) == 0 && y == 0 && (v & localMask) != 0) {
+                            int lower = Arrays.binarySearch(input.offsets, (byte) haloIndex(0, -1, 0));
+                            if (lower >= 0) {
+                                scratch.haloUsed[lower] = true;
+                                long below = row(input.facts[lower], SIDE - 1, z);
+                                g |= v & (~(int) below | (int) (below >>> 48));
+                            }
+                        }
+                        int accepted = localMask & (body.acceptsFluid() ? 0xffff : ~fluid);
+                        if (doorGround && y < SIDE) {
+                            int adjusted = 0;
+                            for (int pending = accepted; pending != 0; pending &= pending - 1) {
+                                int x = Integer.numberOfTrailingZeros(pending);
+                                int flags = ((v >>> x) & 1) * VOLUME_OPEN
+                                        | ((g >>> x) & 1) * GROUND_OPEN
+                                        | ((fluid >>> x) & 1) * FLUID
+                                        | ((exact >>> x) & 1) * EXACT_REQUIRED;
+                                if (input.groundOpen(sx * SIDE + x, y, z, flags, body, scratch)) {
+                                    adjusted |= 1 << x;
+                                }
+                            }
+                            g = adjusted;
+                        }
+                        v &= accepted;
+                        g &= accepted;
+                        for (int pending = v & exact; pending != 0; pending &= pending - 1) {
+                            int x = Integer.numberOfTrailingZeros(pending);
+                            if (!input.volumeOpen(sx * SIDE + x, y, z, body, scratch)) v &= ~(1 << x);
+                        }
+                        int shift = sx * SIDE - EXTENDED_MIN;
+                        volume |= shift >= 0 ? v << shift : v >>> -shift;
+                        ground |= shift >= 0 ? g << shift : g >>> -shift;
+                    }
+                    scratch.volumeRows[y * EXTENDED_SIDE + z - EXTENDED_MIN] = volume;
+                    if (y < SIDE) scratch.groundRows[y * EXTENDED_SIDE + z - EXTENDED_MIN] = ground;
+                }
+            }
+        }
+    }
+
+    /** Compact persistent form of the four structural flags for each cell. */
+    static final class PackedFacts {
+        private static final PackedFacts ALL_AIR = createAllAir();
+        private final byte[] data;
+        private final int uniformFlags;
+        private final long fingerprint;
+        private final SectionGeometry geometryFacts;
+
+        private PackedFacts(byte[] data,
+                            int uniformFlags,
+                            long fingerprint,
+                            SectionGeometry geometryFacts) {
+            this.data = data;
+            this.uniformFlags = uniformFlags;
+            this.fingerprint = fingerprint;
+            this.geometryFacts = Objects.requireNonNull(geometryFacts, "geometryFacts");
+        }
+
+        static PackedFacts fromBytes(byte[] packed) {
+            Objects.requireNonNull(packed, "packed");
+            if (packed.length != PACKED_FACT_BYTES) {
+                throw new IllegalArgumentException("packed facts must contain exactly 2048 bytes");
+            }
+            byte[] cells = new byte[CELL_COUNT];
+            for (int cell = 0; cell < CELL_COUNT; cell++) {
+                int value = Byte.toUnsignedInt(packed[cell >>> 1]);
+                cells[cell] = (byte) ((cell & 1) == 0 ? value & VALID_FLAGS : value >>> 4);
+            }
+            return fromBytes(packed, SectionGeometry.fromFlags(cells));
+        }
+
+        static PackedFacts fromBytes(byte[] packed, SectionGeometry geometry) {
+            Objects.requireNonNull(packed, "packed");
+            Objects.requireNonNull(geometry, "geometry");
+            if (packed.length != PACKED_FACT_BYTES) {
+                throw new IllegalArgumentException("packed facts must contain exactly 2048 bytes");
+            }
+            byte[] copy = packed.clone();
+            return new PackedFacts(copy, -1,
+                    fingerprintPacked(copy) ^ Long.rotateLeft(geometry.fingerprint(), 17),
+                    geometry);
+        }
+
+        static PackedFacts allAir() {
+            return ALL_AIR;
+        }
+
+        PackedFacts independentIdentity() {
+            return new PackedFacts(data, uniformFlags, fingerprint, geometryFacts);
+        }
+
+        private static PackedFacts createAllAir() {
+            byte[] cells = new byte[CELL_COUNT];
+            Arrays.fill(cells, (byte) VOLUME_OPEN);
+            return new PackedFacts(null, VOLUME_OPEN, fingerprintCells(cells),
+                    SectionGeometry.allAir());
+        }
+
+        static PackedFacts fromCells(byte[] cells) {
+            Objects.requireNonNull(cells, "cells");
+            if (cells.length != CELL_COUNT) {
+                throw new IllegalArgumentException("facts must contain exactly 4096 cells");
+            }
+            return fromCells(cells, fingerprintCells(cells), SectionGeometry.fromFlags(cells));
+        }
+
+        static PackedFacts fromCells(byte[] cells, SectionGeometry geometry) {
+            Objects.requireNonNull(cells, "cells");
+            Objects.requireNonNull(geometry, "geometry");
+            if (cells.length != CELL_COUNT) {
+                throw new IllegalArgumentException("facts must contain exactly 4096 cells");
+            }
+            return fromCells(cells, fingerprintCells(cells), geometry);
+        }
+
+        private static PackedFacts fromCells(byte[] cells,
+                                             long fingerprint,
+                                             SectionGeometry geometry) {
+            byte[] packed = new byte[PACKED_FACT_BYTES];
+            for (int cell = 0; cell < CELL_COUNT; cell += 2) {
+                packed[cell >>> 1] = (byte) ((cells[cell] & VALID_FLAGS)
+                        | ((cells[cell + 1] & VALID_FLAGS) << 4));
+            }
+            long combined = fingerprint ^ Long.rotateLeft(geometry.fingerprint(), 17);
+            return new PackedFacts(packed, -1, combined, geometry);
+        }
+
+        private long packedRow(int row) {
+            if (uniformFlags >= 0) return 0x1111111111111111L * uniformFlags;
+            int offset = row << 3;
+            long packed = 0L;
+            for (int index = 0; index < Long.BYTES; index++) {
+                packed |= (long) Byte.toUnsignedInt(data[offset + index]) << (index * Byte.SIZE);
+            }
+            return packed;
+        }
+
+        int flags(int cell) {
+            if (uniformFlags >= 0) {
+                return uniformFlags;
+            }
+            int packed = Byte.toUnsignedInt(data[cell >>> 1]);
+            return (cell & 1) == 0 ? packed & VALID_FLAGS : packed >>> 4;
+        }
+
+        byte[] bytes() {
+            if (data != null) {
+                return data.clone();
+            }
+            byte packed = (byte) (uniformFlags | (uniformFlags << 4));
+            byte[] expanded = new byte[PACKED_FACT_BYTES];
+            Arrays.fill(expanded, packed);
+            return expanded;
+        }
+
+        byte[] cells() {
+            byte[] cells = new byte[CELL_COUNT];
+            if (uniformFlags >= 0) {
+                Arrays.fill(cells, (byte) uniformFlags);
+                return cells;
+            }
+            for (int cell = 0; cell < CELL_COUNT; cell++) {
+                cells[cell] = (byte) flags(cell);
+            }
+            return cells;
+        }
+
+        PackedFacts withChanges(Map<Integer, Byte> changes) {
+            Objects.requireNonNull(changes, "changes");
+            if (changes.isEmpty()) {
+                return this;
+            }
+            byte[] cells = cells();
+            boolean changed = false;
+            for (Map.Entry<Integer, Byte> entry : changes.entrySet()) {
+                int cell = entry.getKey();
+                int flags = Byte.toUnsignedInt(entry.getValue());
+                if (cell < 0 || cell >= CELL_COUNT) {
+                    throw new IllegalArgumentException("cell index is outside the section");
+                }
+                if ((flags & ~VALID_FLAGS) != 0) {
+                    throw new IllegalArgumentException("cell contains unknown fact flags");
+                }
+                if (cells[cell] != (byte) flags) {
+                    cells[cell] = (byte) flags;
+                    changed = true;
+                }
+            }
+            return changed ? fromCells(cells) : this;
+        }
+
+        boolean contentEquals(PackedFacts other) {
+            Objects.requireNonNull(other, "other");
+            if (this == other) {
+                return true;
+            }
+            if (fingerprint != other.fingerprint) {
+                return false;
+            }
+            if (!geometryFacts.contentEquals(other.geometryFacts)) {
+                return false;
+            }
+            for (int cell = 0; cell < CELL_COUNT; cell++) {
+                if (flags(cell) != other.flags(cell)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        long fingerprint() {
+            return fingerprint;
+        }
+
+        SectionGeometry geometry() {
+            return geometryFacts;
+        }
+
+        int retainedBytes() {
+            return (data == null ? 32 : 32 + data.length) + geometryFacts.retainedBytes();
+        }
+
+    }
+
+    private static long fingerprintCells(byte[] cells) {
+        long hash = 0xcbf29ce484222325L;
+        for (byte cell : cells) {
+            if ((cell & ~VALID_FLAGS) != 0) {
+                throw new IllegalArgumentException("snapshot contains unknown cell flags");
+            }
+            hash ^= Byte.toUnsignedInt(cell);
+            hash *= 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    private static long fingerprintPacked(byte[] data) {
+        long hash = 0xcbf29ce484222325L;
+        for (byte packed : data) {
+            int value = Byte.toUnsignedInt(packed);
+            hash ^= value & VALID_FLAGS;
+            hash *= 0x100000001b3L;
+            hash ^= value >>> 4;
+            hash *= 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    private static long signature(SectionPos section,
+                                  long revision,
+                                  long fingerprint,
+                                  GeometryKey geometry,
+                                  byte[] offsets,
+                                  long[] revisions,
+                                  long[] fingerprints) {
+        long hash = 0xcbf29ce484222325L;
+        hash = (hash ^ section.asLong()) * 0x100000001b3L;
+        hash = (hash ^ revision) * 0x100000001b3L;
+        hash = (hash ^ fingerprint) * 0x100000001b3L;
+        hash = (hash ^ geometry.hashCode()) * 0x100000001b3L;
+        for (int index = 0; index < offsets.length; index++) {
+            hash = (hash ^ Byte.toUnsignedInt(offsets[index])) * 0x100000001b3L;
+            hash = (hash ^ revisions[index]) * 0x100000001b3L;
+            hash = (hash ^ fingerprints[index]) * 0x100000001b3L;
+        }
+        return hash;
+    }
+
+    static int haloIndex(int x, int y, int z) {
+        return (x + 1) * 9 + (y + 1) * 3 + z + 1;
+    }
+
+    static int haloX(int encoded) {
+        return encoded / 9 - 1;
+    }
+
+    static int haloY(int encoded) {
+        return encoded / 3 % 3 - 1;
+    }
+
+    static int haloZ(int encoded) {
+        return encoded % 3 - 1;
+    }
+
+    private record PrimitiveEdges(int[] offsets,
+                                  int[] targets,
+                                  long[] capabilities,
+                                  float[] lowerBounds) {
+        private static PrimitiveEdges empty(int componentCount) {
+            return new PrimitiveEdges(
+                    new int[componentCount + 1],
+                    new int[0],
+                    new long[0],
+                    new float[0]
+            );
+        }
+    }
+
+    private record HaloStamps(byte[] offsets, long[] revisions, long[] fingerprints) {
+    }
+}
