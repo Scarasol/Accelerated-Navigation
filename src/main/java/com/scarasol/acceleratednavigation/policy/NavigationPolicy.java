@@ -1,0 +1,81 @@
+package com.scarasol.acceleratednavigation.policy;
+
+import com.scarasol.acceleratednavigation.AcceleratedNavigation;
+import com.scarasol.acceleratednavigation.configuration.CommonConfig;
+import com.scarasol.acceleratednavigation.api.TimeSlicedPathNavigation;
+import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.player.Player;
+import net.minecraftforge.common.ForgeConfigSpec;
+import net.minecraftforge.registries.ForgeRegistries;
+
+import java.util.HashSet;
+import java.util.Set;
+
+/** Resolves routing policy without knowing or invoking a pathfinding backend. */
+public final class NavigationPolicy {
+
+    private static final double NEARBY_PLAYER_RANGE = 32.0D;
+    private static final Set<String> WARNED_IDS = new HashSet<>();
+
+    public static final ForgeConfigSpec CONFIG_SPEC = CommonConfig.SPEC;
+
+    private static volatile Set<ResourceLocation> bypassEntityIds = Set.of();
+
+    private NavigationPolicy() {
+    }
+
+    public static boolean automaticEnabled() { return CommonConfig.AUTOMATIC_NAVIGATION.get(); }
+
+    public static SchedulingMode modeFor(Mob mob) {
+        ResourceLocation entityId = ForgeRegistries.ENTITY_TYPES.getKey(mob.getType());
+        if (entityId != null && bypassEntityIds.contains(entityId)) {
+            return SchedulingMode.BYPASS;
+        }
+        return mob.getNavigation() instanceof TimeSlicedPathNavigation
+                ? SchedulingMode.STRICT
+                : SchedulingMode.SOFT;
+    }
+
+    public static NavigationScheduler.Priority priorityFor(Mob mob) {
+        LivingEntity target = mob.getTarget();
+        if (target instanceof Player) {
+            return NavigationScheduler.Priority.PLAYER_PURSUIT;
+        }
+        if (mob.level().getNearestPlayer(mob, NEARBY_PLAYER_RANGE) != null) {
+            return NavigationScheduler.Priority.PLAYER_NEARBY;
+        }
+        if (target != null || !mob.getNavigation().isDone()) {
+            return NavigationScheduler.Priority.ACTIVE;
+        }
+        return NavigationScheduler.Priority.BACKGROUND;
+    }
+
+    public static void reloadBypassIds() {
+        Set<ResourceLocation> resolved = new HashSet<>();
+        for (String configuredId : CommonConfig.BYPASS_ENTITY_IDS.get()) {
+            ResourceLocation id = ResourceLocation.tryParse(configuredId);
+            if (id != null && ForgeRegistries.ENTITY_TYPES.containsKey(id)) {
+                resolved.add(id);
+                continue;
+            }
+            synchronized (WARNED_IDS) {
+                if (WARNED_IDS.add(configuredId)) {
+                    AcceleratedNavigation.LOGGER.warn(
+                            "Ignoring unknown bypass entity ID '{}' in accelerated-navigation-common.toml",
+                            configuredId
+                    );
+                }
+            }
+        }
+        bypassEntityIds = Set.copyOf(resolved);
+    }
+
+    public enum SchedulingMode {
+        BYPASS,
+        STRICT,
+        SOFT
+    }
+}
