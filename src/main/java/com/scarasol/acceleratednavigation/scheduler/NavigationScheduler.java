@@ -71,10 +71,11 @@ public final class NavigationScheduler {
     private StopReason stopReason = StopReason.NO_END;
     private final long[] stopCounts = new long[StopReason.values().length];
     private TickSample lastTick;
+    private final String experimentOutput = System.getProperty("an.production.output");
     private long experimentOriginNanos;
     private long experimentDrains;
     private long experimentSteps;
-    private final long[] experimentSpans = new long[3 * 65_536];
+    private final long[] experimentSpans = experimentOutput == null ? null : new long[3 * 65_536];
     private int experimentSpanCount;
     private boolean experimentSpanOverflow;
 
@@ -116,10 +117,12 @@ public final class NavigationScheduler {
         if (scheduler != null) {
             scheduler.closed = true;
             scheduler.cancelAll();
-            AcceleratedNavigation.LOGGER.debug(
-                    "AN_SCHEDULER_EXPERIMENT variant=U drains={} steps={}",
-                    scheduler.experimentDrains, scheduler.experimentSteps);
-            scheduler.writeExperimentSpans();
+            if (scheduler.experimentSpans != null) {
+                AcceleratedNavigation.LOGGER.debug(
+                        "AN_SCHEDULER_EXPERIMENT variant=U drains={} steps={}",
+                        scheduler.experimentDrains, scheduler.experimentSteps);
+                scheduler.writeExperimentSpans();
+            }
         }
     }
 
@@ -248,7 +251,7 @@ public final class NavigationScheduler {
         readyWindowValid = false;
         Objects.requireNonNull(haveTime, "haveTime");
         tickStartedNanos = clock.getAsLong();
-        experimentOriginNanos = tickStartedNanos;
+        if (experimentSpans != null) experimentOriginNanos = tickStartedNanos;
         chargeAtStart = totalAccounted(tickStartedNanos);
         outsideNavigationNanos = Math.max(0L, chargeAtStart - previousChargeAtEnd);
         inEnvelope = true;
@@ -340,8 +343,9 @@ public final class NavigationScheduler {
             return;
         }
         draining = true;
-        long experimentStarted = clock.getAsLong();
-        experimentDrains++;
+        boolean sampleExperiment = experimentSpans != null;
+        long experimentStarted = sampleExperiment ? clock.getAsLong() : 0L;
+        if (sampleExperiment) experimentDrains++;
         try {
             while (!closed && !pending.isEmpty()) {
                 QueuedSearch<?> request = takeNext(clock.getAsLong());
@@ -358,7 +362,7 @@ public final class NavigationScheduler {
                 }
 
                 long sliceStarted = clock.getAsLong();
-                experimentSteps++;
+                if (sampleExperiment) experimentSteps++;
                 ResumableSearch.Status status;
                 try {
                     status = Objects.requireNonNull(
@@ -416,7 +420,7 @@ public final class NavigationScheduler {
             }
             stopReason = pending.isEmpty() ? StopReason.EMPTY : StopReason.DEPENDENCY;
         } finally {
-            recordExperimentSpan(experimentOriginNanos, experimentStarted, clock.getAsLong());
+            if (sampleExperiment) recordExperimentSpan(experimentOriginNanos, experimentStarted, clock.getAsLong());
             draining = false;
         }
     }
@@ -431,8 +435,6 @@ public final class NavigationScheduler {
     }
 
     private void writeExperimentSpans() {
-        String output = System.getProperty("an.production.output");
-        if (output == null) return;
         StringBuilder json = new StringBuilder("{\"variant\":\"U\",\"overflow\":")
                 .append(experimentSpanOverflow).append(",\"spans\":[");
         for (int i = 0; i < experimentSpanCount; i++) {
@@ -443,7 +445,7 @@ public final class NavigationScheduler {
                     .append(experimentSpans[offset + 2]).append(']');
         }
         try {
-            java.nio.file.Files.writeString(java.nio.file.Path.of(output, "scheduler-spans.json"),
+            java.nio.file.Files.writeString(java.nio.file.Path.of(experimentOutput, "scheduler-spans.json"),
                     json.append("]}").toString());
         } catch (java.io.IOException failure) {
             throw new java.io.UncheckedIOException(failure);

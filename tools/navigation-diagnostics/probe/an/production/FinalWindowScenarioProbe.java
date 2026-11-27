@@ -133,7 +133,6 @@ public final class FinalWindowScenarioProbe {
         row.addProperty("queryId",request.queryId.toString());row.addProperty("last",(boolean)field(work,"last"));
         row.addProperty("window",field(work,"window")!=null);
         row.addProperty("pendingWindow",field(work,"pendingWindow")!=null);
-        row.addProperty("shared",field(work,"sharedCandidate")!=null);
         row.addProperty("serverTick",server.getTickCount());
         row.add("account",gson.toJsonTree(scheduler.metrics()));
         row.addProperty("range",range);row.addProperty("requestedRange",request.intent.range());

@@ -23,6 +23,7 @@ public final class NavigationRequestPath extends Path {
     private final List<Node> nodes;
     private BlockPos target;
     private boolean selected;
+    boolean exhaustedNaturally;
     public State state = State.PENDING;
     public boolean adopted;
     public boolean nativeBackend, nativeReachable;
@@ -53,6 +54,8 @@ public final class NavigationRequestPath extends Path {
         return state == State.SUCCEEDED || state == State.EXHAUSTED || state == State.FAILED || state == State.CANCELLED
                 || state == State.UNAVAILABLE || state == State.UNREACHABLE;
     }
+
+    public boolean exhaustedNaturally() { return exhaustedNaturally; }
 
     public void select(BlockPos target) {
         this.target = target.immutable();

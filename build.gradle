@@ -276,14 +276,14 @@ tasks.register('verifyWorkerAlgorithms', JavaExec) {
     mainClass = 'com.scarasol.acceleratednavigation.topology.WorkerAlgorithmContracts'
 }
 
-tasks.register('verifySharedStages', JavaExec) {
+tasks.register('verifyGroundNavigation', JavaExec) {
     group = 'verification'
-    description = 'Checks shared stage selection against an independent suffix oracle and Base components.'
+    description = 'Checks current ground topology components, native reach limits and endpoint tolerance.'
     dependsOn tasks.named('testClasses')
     classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.scarasol.acceleratednavigation.topology.SharedStageContracts'
+    mainClass = 'com.scarasol.acceleratednavigation.topology.GroundNavigationContracts'
 }
 
 tasks.named('check').configure {
-    dependsOn tasks.named('verifyCoreContracts'), tasks.named('verifyWorkerAlgorithms'), tasks.named('verifySharedStages')
+    dependsOn tasks.named('verifyCoreContracts'), tasks.named('verifyWorkerAlgorithms'), tasks.named('verifyGroundNavigation')
 }

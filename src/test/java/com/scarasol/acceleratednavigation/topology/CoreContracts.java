@@ -29,6 +29,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class CoreContracts {
+    private static TopologyWorkerRuntime runtime(TopologyWorkerRuntime.FactDemandListener demands,
+            java.util.function.Consumer<TopologyWorkerRuntime.FactDecision> decisions) {
+        return new TopologyWorkerRuntime(demands, decisions);
+    }
+
     private CoreContracts() {
     }
 
@@ -101,7 +106,8 @@ public final class CoreContracts {
         graphCaptureKeepsStructureAndMarksMissingSections();
         geometryFactsBlockPartialShapeAndRoundTrip();
         reverseContracts();
-        System.out.println("Core contracts: 9 passed");
+        runtimeReusesOnlyCurrentCompletedAndInFlight();
+        System.out.println("Core contracts: 10 passed");
     }
 
     private static void reverseContracts() throws Exception {
@@ -219,7 +225,7 @@ public final class CoreContracts {
                 new ResourceLocation("minecraft:dimension"), new ResourceLocation("navigation:test"));
         SectionPos pending = SectionPos.of(5, 0, 0);
         CountDownLatch demanded = new CountDownLatch(1);
-        TopologyWorkerRuntime runtime = new TopologyWorkerRuntime(
+        TopologyWorkerRuntime runtime = runtime(
                 (key, identity, delta) -> {
                     if (delta > 0 && key.section().equals(pending)) demanded.countDown();
                 },
@@ -259,11 +265,12 @@ public final class CoreContracts {
                     start, edges, destination, null, 0).get(10, TimeUnit.SECONDS)) {
                 require(window.contains(goal) && window.candidates.contains(goal), "original snapshot window lost boundary target");
             }
-            require(request(runtime, dimension, goal, start).corridor() == null,
+            requireNoComplete(request(runtime, dimension, goal, start), start,
                     "reverse query invented an uphill route for a one-way drop");
             publishFacts(runtime, dimension, target, 2L, groundFacts());
-            require(request(runtime, dimension, start, goal).corridor() == null,
-                    "version update reused the stale incoming boundary or completed corridor");
+            var stale = request(runtime, dimension, start, goal);
+            require(!stale.completedFromCache(), "version update reported a completed cache hit");
+            requireNoComplete(stale, goal, "version update reused the stale boundary or completed corridor");
             try (var window = GroundSegmentWindow.capture(runtime, result.corridor(),
                     BaseClusterTopology.TraversalProfile.DEFAULT_GROUND, NavigationScheduler.Priority.PLAYER_PURSUIT,
                     start, edges, destination, null, 0).get(10, TimeUnit.SECONDS)) {
@@ -278,14 +285,25 @@ public final class CoreContracts {
             require(request(runtime, dimension, start, start).corridor().cost() == 0.0F,
                     "same-component reverse query did not restore zero-cost memberships");
 
-            publishFacts(runtime, dimension, SectionPos.of(0, 0, 1), 1L,
+            // Keep the isolated drop distinct from a search with unavailable neighboring facts.
+            SectionPos interiorSection = SectionPos.of(0, 0, 4);
+            for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
+                if (dx != 0 || dy != 0 || dz != 0) {
+                    publishFacts(runtime, dimension, SectionPos.of(dx, dy, interiorSection.z() + dz), 1L,
+                            BaseClusterTopology.PackedFacts.allAir());
+                }
+            }
+            BlockPos high = new BlockPos(2, 4, 72), low = new BlockPos(3, 1, 72);
+            publishFacts(runtime, dimension, interiorSection, 1L,
                     groundFacts(new BlockPos(2, 4, 8), new BlockPos(3, 1, 8)));
-            TopologyWorkerRuntime.WorkerResult interior = request(runtime, dimension,
-                    new BlockPos(3, 1, 24), new BlockPos(2, 4, 24));
-            require(interior.corridor() == null
-                            && interior.progress().failure() == MacroSearch.Failure.NO_STRUCTURAL_ROUTE
-                            && interior.progress().dependencyWaits() == 0,
-                    "impossible incoming sections were treated as unknown dependencies");
+            var warmed = request(runtime, dimension, low, low);
+            requireFullEndpoints(warmed, low, low);
+            TopologyWorkerRuntime.WorkerResult interior = request(runtime, dimension, low, high);
+            requireNoComplete(interior, high, "interior query invented an uphill route");
+            require(interior.progress().failure() == MacroSearch.Failure.NO_STRUCTURAL_ROUTE
+                            && interior.progress().pendingDependencies() == 0,
+                    "known disconnected terrain was treated as unknown or left dependencies pending: "
+                            + interior.progress());
 
             runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
                     new TopologyWorkerRuntime.ClusterKey(dimension, pending), 1L, 0L, 1L,
@@ -310,6 +328,71 @@ public final class CoreContracts {
                         && stopped.logicalRequests() == 0 && stopped.physicalSearches() == 0
                         && stopped.baseCache().retainedBytes() == 0,
                 "reverse runtime retained requests, dependencies, pins or cache after closing");
+    }
+
+    private static void requireNoComplete(TopologyWorkerRuntime.WorkerResult result, BlockPos goal, String message) {
+        var corridor = result.corridor();
+        require(corridor == null || corridor.partial()
+                        && !corridor.endpoints().get(corridor.endpoints().size() - 1).anchor().equals(goal),
+                message + ": " + result.progress().failure());
+    }
+
+    private static void runtimeReusesOnlyCurrentCompletedAndInFlight() throws Exception {
+        var keyFactory = ResourceKey.class.getDeclaredMethod("create", ResourceLocation.class, ResourceLocation.class);
+        keyFactory.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        ResourceKey<Level> dimension = (ResourceKey<Level>) keyFactory.invoke(null,
+                new ResourceLocation("minecraft:dimension"), new ResourceLocation("navigation:reuse"));
+        SectionPos section = SectionPos.of(0, 0, 0);
+        var runtime = runtime((key, identity, delta) -> {}, ignored -> {});
+        BlockPos start = new BlockPos(3, 1, 7), goal = new BlockPos(12, 1, 7);
+        try {
+            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                    new TopologyWorkerRuntime.ClusterKey(dimension, section), 1, 0, 1,
+                    TopologyWorkerRuntime.FactState.PENDING, null, Map.of()));
+            var a = runtime.requestMacroQuery(dimension, start, goal, BaseClusterTopology.Channel.GROUND,
+                    BaseClusterTopology.TraversalProfile.DEFAULT_GROUND, NavigationScheduler.Priority.ACTIVE);
+            var b = runtime.requestMacroQuery(dimension, start, goal, BaseClusterTopology.Channel.GROUND,
+                    BaseClusterTopology.TraversalProfile.DEFAULT_GROUND, NavigationScheduler.Priority.ACTIVE);
+            awaitEvents(runtime);
+            var pending = runtime.metrics();
+            require(!a.future().isDone() && !b.future().isDone() && pending.logicalRequests() == 2
+                            && pending.endpointResolutions() == 1 && pending.physicalSearchesStarted() == 0,
+                    "two pending requests did not join one real endpoint flight: " + pending);
+            publishFacts(runtime, dimension, section, 1, Fixtures.fromFlags("line", Fixtures.flat()).input().center());
+            var first = a.future().get(10, TimeUnit.SECONDS);
+            var second = b.future().get(10, TimeUnit.SECONDS);
+            var joined = runtime.metrics();
+            require(!first.completedFromCache() && !second.completedFromCache()
+                            && joined.physicalSearchesStarted() == 1 && joined.physicalSearchesSucceeded() == 1,
+                    "uncached followers did not share one physical search: " + joined);
+            requireFullEndpoints(first, start, goal);
+            requireFullEndpoints(second, start, goal);
+            BlockPos shiftedStart = start.south(), shiftedGoal = goal.south();
+            var replay = request(runtime, dimension, shiftedStart, shiftedGoal);
+            requireFullEndpoints(replay, shiftedStart, shiftedGoal);
+            var replayed = runtime.metrics();
+            require(replay.completedFromCache() && replayed.physicalSearchesStarted() == joined.physicalSearchesStarted()
+                            && replayed.completedCacheHits() == joined.completedCacheHits() + 1,
+                    "current complete replay started a new physical search");
+            publishFacts(runtime, dimension, section, 2, BaseClusterTopology.PackedFacts.allAir());
+            var obsolete = request(runtime, dimension, shiftedStart, shiftedGoal);
+            requireNoComplete(obsolete, shiftedGoal, "invalidated corridor was incorrectly reused");
+            require(!obsolete.completedFromCache()
+                            && runtime.metrics().completedCacheHits() == replayed.completedCacheHits(),
+                    "stale version was counted as a completed reuse");
+            System.out.println("Macro reuse: 2 logical / 1 pending resolve / 1 physical; shifted replay adds 0 physical; stale hit adds 0.");
+        } finally {
+            require(runtime.awaitStopped(10, TimeUnit.SECONDS), "reuse runtime workers did not stop");
+        }
+        require(runtime.metrics().activeReferences() == 0, "reuse runtime retained references after close");
+    }
+
+    private static void requireFullEndpoints(TopologyWorkerRuntime.WorkerResult result, BlockPos start, BlockPos goal) {
+        var corridor = result.corridor();
+        require(corridor != null && !corridor.partial() && corridor.endpoints().get(0).anchor().equals(start)
+                        && corridor.endpoints().get(corridor.endpoints().size() - 1).anchor().equals(goal),
+                "complete corridor did not materialize submitted endpoints");
     }
 
     private static TopologyWorkerRuntime.WorkerResult request(TopologyWorkerRuntime runtime,
@@ -461,7 +544,7 @@ public final class CoreContracts {
         @SuppressWarnings("unchecked")
         ResourceKey<Level> dimension = (ResourceKey<Level>) keyFactory.invoke(null,
                 new ResourceLocation("minecraft:dimension"), new ResourceLocation("navigation:geometry"));
-        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {},
+        var runtime = runtime((key, identity, delta) -> {},
                 decision -> { throw new AssertionError("unexpected geometry persistence request"); });
         SectionPos west = SectionPos.of(0, 0, 0), east = SectionPos.of(1, 0, 0);
         BlockPos start = new BlockPos(15, 4, 8), goal = new BlockPos(16, 4, 8);
@@ -470,13 +553,11 @@ public final class CoreContracts {
         try {
             publishFacts(runtime, dimension, west, 1, closed);
             publishFacts(runtime, dimension, east, 1, target);
-            require(request(runtime, dimension, start, goal).corridor() == null,
-                    "real runtime crossed a closed door");
+            requireNoComplete(request(runtime, dimension, start, goal), goal, "real runtime crossed a closed door");
             try (var original = runtime.requestBaseGraph(dimension, west, closedBody()).get(10, TimeUnit.SECONDS)) {
                 int component = original.topology().componentAt(15, 4, 8);
                 publishFacts(runtime, dimension, west, 2, open);
-                require(request(runtime, dimension, start, goal).corridor() != null,
-                        "real runtime failed to rebuild the open door");
+                requireFullEndpoints(request(runtime, dimension, start, goal), start, goal);
                 try (var changed = runtime.requestBaseGraph(dimension, west, closedBody()).get(10, TimeUnit.SECONDS)) {
                     require(!original.current() && changed.current()
                                     && changed.topology().componentAt(15, 4, 8) == component,
@@ -490,9 +571,12 @@ public final class CoreContracts {
                     }
                 }
             }
+            requireFullEndpoints(request(runtime, dimension, start, goal), start, goal);
+            require(request(runtime, dimension, start, goal).completedFromCache(), "open door did not cache its corridor");
             publishFacts(runtime, dimension, west, 3, closed);
-            require(request(runtime, dimension, start, goal).corridor() == null,
-                    "completed corridor or incoming boundary reused the open-door geometry");
+            var closedAgain = request(runtime, dimension, start, goal);
+            requireNoComplete(closedAgain, goal, "completed corridor or incoming boundary reused the open-door geometry");
+            require(!closedAgain.completedFromCache(), "closed door reused the open-door cache");
             var view = runtime.requestBaseGraph(dimension, west, closedBody()).get(10, TimeUnit.SECONDS);
             view.close();view.close();
             require(!view.current(), "closed export snapshot remained live");
@@ -545,7 +629,7 @@ public final class CoreContracts {
         var facts = groundFacts(floor);
         var owner = new java.util.concurrent.atomic.AtomicReference<TopologyWorkerRuntime>();
         var restored = java.util.concurrent.ConcurrentHashMap.<SectionPos>newKeySet();
-        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {
+        var runtime = runtime((key, identity, delta) -> {
             if (delta > 0 && restored.add(key.section()))
                 publishFacts(owner.get(), dimension, key.section(), 1, facts);
         }, decision -> { throw new AssertionError("unexpected persistence request"); });
@@ -581,7 +665,7 @@ public final class CoreContracts {
         var dimension = lifecycleDimension();
         SectionPos center = SectionPos.of(0, 0, 0), halo = SectionPos.of(1, 1, 0);
         CountDownLatch demanded = new CountDownLatch(1);
-        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {
+        var runtime = runtime((key, identity, delta) -> {
             if (delta > 0 && key.section().equals(halo)) demanded.countDown();
         },
                 decision -> { throw new AssertionError("unexpected persistence request"); });
@@ -621,7 +705,7 @@ public final class CoreContracts {
         var dimension = lifecycleDimension();
         SectionPos center = SectionPos.of(0, 0, 0), halo = SectionPos.of(1, 1, 0);
         CountDownLatch demanded = new CountDownLatch(1);
-        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {
+        var runtime = runtime((key, identity, delta) -> {
             if (delta > 0 && key.section().equals(halo)) demanded.countDown();
         },
                 decision -> { throw new AssertionError("unexpected persistence request"); });
@@ -655,7 +739,7 @@ public final class CoreContracts {
 
     private static void runtimeParentRefreshesStaleBoundaryChildren() throws Exception {
         var dimension = lifecycleDimension();
-        var runtime = new TopologyWorkerRuntime((key, identity, delta) -> {},
+        var runtime = runtime((key, identity, delta) -> {},
                 decision -> { throw new AssertionError("unexpected persistence request"); });
         SectionPos halo = SectionPos.of(1, 1, -1);
         BlockPos[] floor = new BlockPos[256];

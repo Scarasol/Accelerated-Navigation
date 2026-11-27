@@ -64,9 +64,6 @@ public final class TimelineScenarioProbe {
     private long started, ready, submitted, closed, nextSample;
     private Measurements.Snapshot initialCost, finalCost;
     private Object topologyBefore, topologyAfter;
-    private Object sharedBefore,sharedAfter;
-    private long sharedRequestsBefore,sharedSegmentsBefore,sharedFallbacksBefore;
-    private long sharedRequestsAfter,sharedSegmentsAfter,sharedFallbacksAfter;
     private Method metrics;
     private boolean closing, done, submittedScene;
     private String failure="";
@@ -213,10 +210,6 @@ public final class TimelineScenarioProbe {
                 Trace.trial=index+1;
                 Trace.clock();
                 topologyBefore=metrics.invoke(TopologyService.forServer(server));
-                sharedBefore=TopologyService.forServer(server).sharedTopologyMetrics();
-                sharedRequestsBefore=service.sharedSectionRequests();
-                sharedSegmentsBefore=service.sharedSectionSegments();
-                sharedFallbacksBefore=service.sharedSectionFallbacks();
                 initialCost=Measurements.snapshot();submitted=System.nanoTime();submittedScene=true;
                 for(Actor actor:actors) {
                     if(AutomaticNavigationBridge.enabled(actor.mob.getNavigation())==vanilla)
@@ -292,10 +285,6 @@ public final class TimelineScenarioProbe {
             if(actors.stream().allMatch(a->a.terminal!=0&&ticks-a.terminalTick>=10)) {
                 closed=System.nanoTime();finalCost=Measurements.snapshot();
                 topologyAfter=metrics.invoke(TopologyService.forServer(server));
-                sharedAfter=TopologyService.forServer(server).sharedTopologyMetrics();
-                sharedRequestsAfter=service.sharedSectionRequests();
-                sharedSegmentsAfter=service.sharedSectionSegments();
-                sharedFallbacksAfter=service.sharedSectionFallbacks();
                 closeTick=ticks;Trace.clock();Trace.trial=0;
             }
         }catch(Throwable error){abort(error);}
@@ -318,9 +307,6 @@ public final class TimelineScenarioProbe {
         row.add("costStart",gson.toJsonTree(initialCost));row.add("costEnd",gson.toJsonTree(finalCost));
         row.add("costSamples",costSamples.deepCopy());
         row.add("topologyBefore",gson.toJsonTree(topologyBefore));row.add("topologyAfter",gson.toJsonTree(topologyAfter));
-        row.add("sharedRuntimeBefore",gson.toJsonTree(sharedBefore));row.add("sharedRuntimeAfter",gson.toJsonTree(sharedAfter));
-        row.add("sharedDelta",gson.toJsonTree(Map.of("requests",sharedRequestsAfter-sharedRequestsBefore,
-                "segments",sharedSegmentsAfter-sharedSegmentsBefore,"fallbacks",sharedFallbacksAfter-sharedFallbacksBefore)));
         JsonArray all=new JsonArray();
         for(Actor actor:actors) {
             JsonObject a=new JsonObject();

@@ -166,7 +166,7 @@ final class NavigationCommand {
                 session.movement = SegmentedNavigationService.forServer(level.getServer())
                         .active(actor.getNavigation());
                 if (!accepted || session.movement == null) throw new IllegalStateException("实体导航未接受请求");
-                player.sendSystemMessage(Component.literal("详细寻路已启动：永久发光、速度 V 的成年尸壳从 A 点行走至 B 点，到达后移除。"));
+                player.sendSystemMessage(Component.literal("详细寻路已启动：永久发光、速度 V 的成年尸壳沿找到的路线行走，结束后移除。"));
                 return 1;
             }
             TopologyService.MacroRequest request = TopologyService.forServer(level.getServer())
@@ -242,11 +242,16 @@ final class NavigationCommand {
             return;
         }
         session.points = sampleCorridor(corridor);
-        report(server, session, "SUCCESS", null, elapsedNanos);
+        report(server, session, corridor.partial() ? "PARTIAL_" + corridor.partialFailure() : "SUCCESS",
+                null, elapsedNanos);
         session.displayUntilNanos = System.nanoTime() + DISPLAY_NANOS;
         ServerPlayer player = server.getPlayerList().getPlayer(session.owner);
         if (player != null && player.level().dimension() == session.dimension) {
-            player.sendSystemMessage(Component.literal("粒子用直线连接宏观走廊端点（最多 4096 个采样点），非逐格可走路线；附近路段刷新一分钟。"
+            player.sendSystemMessage(Component.literal((corridor.partial()
+                    ? "仅展示部分走廊，止于 " + corridor.endpoints().get(corridor.endpoints().size() - 1).anchor()
+                            .toShortString() + "，未到达指定终点。"
+                    : "")
+                    + "粒子用直线连接宏观走廊端点（最多 4096 个采样点），非逐格可走路线；附近路段刷新一分钟。"
                     + (corridor.endpoints().size() > MAX_POINTS ? "走廊端点过多，粒子已抽样。" : "")));
             refresh(server, session, player);
             session.nextRefreshTick = server.getTickCount() + REFRESH_TICKS;
@@ -269,6 +274,7 @@ final class NavigationCommand {
                 }
             } else if (session.actor != null) {
                 String result = null;
+                BlockPos partialStop = null;
                 ServerLevel level = server.getLevel(session.dimension);
                 if (session.actor.isRemoved() || !session.actor.isAlive()
                         || session.actor.level() != level) {
@@ -276,14 +282,20 @@ final class NavigationCommand {
                 } else if (level == null || !level.isPositionEntityTicking(session.actor.blockPosition())) {
                     result = "FAILED_UNAVAILABLE_CHUNK";
                 } else if (session.movement.terminal()) {
-                    result = session.movement.state == NavigationRequestPath.State.SUCCEEDED
-                            ? "SUCCESS" : session.movement.state == NavigationRequestPath.State.CANCELLED
-                            ? "CANCELLED" : "FAILED_" + session.movement.state;
+                    BlockPos feet = session.actor.blockPosition();
+                    result = switch (session.movement.state) {
+                        case SUCCEEDED -> "SUCCESS";
+                        case CANCELLED -> "CANCELLED";
+                        case EXHAUSTED -> session.movement.exhaustedNaturally() && !feet.equals(session.start)
+                                ? "PARTIAL" : "FAILED_EXHAUSTED";
+                        default -> "FAILED_" + session.movement.state;
+                    };
+                    if ("PARTIAL".equals(result)) partialStop = feet;
                 }
                 if (result != null) {
                     iterator.remove();
                     cancel(session);
-                    report(server, session, result, null, now - session.startedNanos);
+                    report(server, session, result, null, now - session.startedNanos, partialStop);
                 }
             } else if (session.request == null) {
                 if (now >= session.displayUntilNanos) {
@@ -311,16 +323,23 @@ final class NavigationCommand {
 
     private static void report(MinecraftServer server, Session session, String result,
                                Throwable failure, long elapsedNanos) {
+        report(server, session, result, failure, elapsedNanos, null);
+    }
+
+    private static void report(MinecraftServer server, Session session, String result,
+                               Throwable failure, long elapsedNanos, BlockPos partialStop) {
         long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(Math.max(0L, elapsedNanos));
-        AcceleratedNavigation.LOGGER.info("Navigation {} owner={} dimension={} start={} goal={} canOpenDoors={} result={} elapsedMs={}",
+        AcceleratedNavigation.LOGGER.info("Navigation {} owner={} dimension={} start={} goal={} canOpenDoors={} result={} elapsedMs={}{}",
                 session.detailed ? "entity execution" : "macro query", session.owner, session.dimension.location(),
-                session.start, session.goal, session.canOpenDoors, result, elapsedMillis);
+                session.start, session.goal, session.canOpenDoors, result, elapsedMillis,
+                partialStop == null ? "" : " stop=" + partialStop);
         if (failure != null && !(failure instanceof CancellationException)) {
             AcceleratedNavigation.LOGGER.warn("Navigation command failed for {}", session.owner, failure);
         }
         ServerPlayer player = server.getPlayerList().getPlayer(session.owner);
         if (player != null && player.level().dimension() == session.dimension) {
             player.sendSystemMessage(Component.literal((session.detailed ? "详细寻路" : "宏观寻路") + resultText(result)
+                    + (partialStop == null ? "" : "，停在 " + partialStop.toShortString())
                     + "；耗时 " + elapsedMillis + (session.detailed
                     ? " ms（提交到实体执行终态，生物已移除）。" : " ms（提交到查询终态，不含粒子展示）。")));
         }
@@ -329,16 +348,20 @@ final class NavigationCommand {
     private static String resultText(String result) {
         return switch (result) {
             case "SUCCESS" -> "成功";
+            case "PARTIAL" -> "仅走完部分路线，未到达指定终点";
             case "CANCELLED_REPLACED" -> "已取消（被新请求替代）";
             case "CANCELLED_PLAYER_LEFT" -> "已取消（玩家离线或换维度）";
             case "CANCELLED_SERVER_STOPPING" -> "已取消（服务器停止）";
             case "CANCELLED" -> "已取消";
             case "ERROR" -> "异常失败（详见服务器日志）";
+            case "PARTIAL_NO_STRUCTURAL_ROUTE" -> "仅找到部分路线（未找到连到终点的宏观路线）";
+            case "PARTIAL_SEARCH_LIMIT_REACHED" -> "仅找到部分路线（达到搜索上限）";
+            case "PARTIAL_UNAVAILABLE_CHUNK" -> "仅找到部分路线（部分区块不可用）";
             case "FAILED_NO_STRUCTURAL_ROUTE" -> "失败（无宏观结构路线）";
             case "FAILED_SEARCH_LIMIT_REACHED" -> "失败（达到搜索上限）";
             case "FAILED_UNAVAILABLE_CHUNK" -> "失败（所需区块未加载）";
             case "FAILED_ENTITY_REMOVED" -> "失败（生物被移除、死亡或离开当前维度）";
-            case "FAILED_EXHAUSTED" -> "失败（原版部分路径已走完，未实际到达终点）";
+            case "FAILED_EXHAUSTED" -> "失败（路径已结束，未实际到达终点）";
             case "FAILED_UNAVAILABLE" -> "失败（路线、区块或导航输入不可用）";
             case "FAILED_UNREACHABLE" -> "失败（原版详细搜索无路径）";
             case "FAILED_FAILED" -> "失败（实体执行或有限恢复未完成）";

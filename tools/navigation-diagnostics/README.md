@@ -58,7 +58,7 @@ node tools/navigation-diagnostics/compare-controls.mjs BEFORE/controls-analysis.
 
 ## 入口与恢复覆盖
 
-`coverage` 包含实体追踪/三次漂移、自然GoalSelector、真实村民Brain、三种多目标查询采用时机、accuracy=0共享资格控制、外部legacy查询后移动、真实AcquirePoi、发布后改块及受控失速。
+`coverage` 包含实体追踪/三次漂移、自然GoalSelector、真实村民Brain、三种多目标查询采用时机、`accuracy=0` 原目标查询及采用、外部legacy查询后移动、真实AcquirePoi、发布后改块及受控失速。旧同区段锚点资格只见于冻结历史记录；当前地面分段不按 `accuracy` 分流共享。
 
 ```powershell
 ./tools/navigation-diagnostics/run.ps1 -Build .tmp/my-timeline/build -Output .tmp/my-timeline/coverage -Suite coverage -Jfr

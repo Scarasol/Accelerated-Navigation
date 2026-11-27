@@ -1,6 +1,7 @@
 package com.scarasol.acceleratednavigation.policy;
 
 import com.scarasol.acceleratednavigation.AcceleratedNavigation;
+import com.scarasol.acceleratednavigation.configuration.CommonConfig;
 import com.scarasol.acceleratednavigation.api.TimeSlicedPathNavigation;
 import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import net.minecraft.resources.ResourceLocation;
@@ -11,36 +12,22 @@ import net.minecraftforge.common.ForgeConfigSpec;
 import net.minecraftforge.registries.ForgeRegistries;
 
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 
 /** Resolves routing policy without knowing or invoking a pathfinding backend. */
 public final class NavigationPolicy {
 
     private static final double NEARBY_PLAYER_RANGE = 32.0D;
-    private static final ForgeConfigSpec.ConfigValue<List<? extends String>> BYPASS_ENTITY_IDS;
-    private static final ForgeConfigSpec.BooleanValue AUTOMATIC_NAVIGATION;
     private static final Set<String> WARNED_IDS = new HashSet<>();
 
-    public static final ForgeConfigSpec CONFIG_SPEC;
+    public static final ForgeConfigSpec CONFIG_SPEC = CommonConfig.SPEC;
 
     private static volatile Set<ResourceLocation> bypassEntityIds = Set.of();
-
-    static {
-        ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
-        AUTOMATIC_NAVIGATION = builder
-                .comment("Automatically schedule supported vanilla navigation intents; bypassEntityIds retain vanilla behavior.")
-                .define("automaticNavigation", true);
-        BYPASS_ENTITY_IDS = builder
-                .comment("Exact entity type registry IDs that retain original navigation without scheduling.")
-                .defineListAllowEmpty("bypassEntityIds", List.<String>of(), value -> value instanceof String);
-        CONFIG_SPEC = builder.build();
-    }
 
     private NavigationPolicy() {
     }
 
-    public static boolean automaticEnabled() { return AUTOMATIC_NAVIGATION.get(); }
+    public static boolean automaticEnabled() { return CommonConfig.AUTOMATIC_NAVIGATION.get(); }
 
     public static SchedulingMode modeFor(Mob mob) {
         ResourceLocation entityId = ForgeRegistries.ENTITY_TYPES.getKey(mob.getType());
@@ -68,7 +55,7 @@ public final class NavigationPolicy {
 
     public static void reloadBypassIds() {
         Set<ResourceLocation> resolved = new HashSet<>();
-        for (String configuredId : BYPASS_ENTITY_IDS.get()) {
+        for (String configuredId : CommonConfig.BYPASS_ENTITY_IDS.get()) {
             ResourceLocation id = ResourceLocation.tryParse(configuredId);
             if (id != null && ForgeRegistries.ENTITY_TYPES.containsKey(id)) {
                 resolved.add(id);

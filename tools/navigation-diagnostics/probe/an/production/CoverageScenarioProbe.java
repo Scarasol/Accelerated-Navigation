@@ -38,12 +38,12 @@ public final class CoverageScenarioProbe {
     private record Scene(String name,int distance,int count,String kind) {}
     private static final List<String> NAMES=List.of("entity-stationary","entity-drift","ai-goalselector",
             "brain-walk-target","query-only-multi","query-ready-adopt-multi","query-pending-adopt-multi",
-            "shared-cold1","shared-warm1","shared-accuracy0","legacy-createpath-move","poi-acquire","dynamic-block","native-stuck-recovery",
-            "shared-accuracy1","shared-boundary1","shared-neighbor1","shared-obstacle1",
-            "shared-drift1","shared-cancel1","shared-replace1","shared-range4","shared-range12",
-            "shared-dynamic1","shared-pending-cancel1","shared-pending-replace1","shared-timeout1",
-            "shared-low-budget0","shared-anchor-drift0",
-            "shared-query-only-multi","shared-query-ready-adopt-multi","shared-query-pending-adopt-multi");
+            "ground-cold1","ground-warm1","ground-accuracy0","legacy-createpath-move","poi-acquire","dynamic-block","native-stuck-recovery",
+            "ground-accuracy1","ground-boundary1","ground-neighbor1","ground-obstacle1",
+            "ground-drift1","ground-cancel1","ground-replace1","ground-range4","ground-range12",
+            "ground-dynamic1","ground-pending-cancel1","ground-pending-replace1",
+            "ground-low-budget0","ground-target-drift0",
+            "ground-query-only-multi","ground-query-ready-adopt-multi","ground-query-pending-adopt-multi");
     public static final class ProbeHusk extends Husk {
         boolean frozen;
         ProbeHusk(ServerLevel level) {
@@ -88,18 +88,15 @@ public final class CoverageScenarioProbe {
     private JsonArray samples,observations,actions;
     private Measurements.Snapshot before,after;
     private Object topologyBefore,topologyAfter;
-    private Object sharedRuntimeBefore,threadCostsBefore;
-    private Object sharedHooks,previousSharedHook;
-    private Field sharedHookField;
+    private Object threadCostsBefore;
     private int index=-1,tick,prepareTick,submitTick,terminalTick,drifts;
     private long started,ready,submitted,submitEnd,closed,firstMove,arrival,intentArrival,terminal,nextSample,queryReady,adoptedAt;
     private boolean closing,done,accepted,submittedScene,actionTaken;
-    private long sharedRequestsBefore,sharedSegmentsBefore,sharedFallbacksBefore;
     private String state="PENDING",failure="",lastObservation="";
 
     CoverageScenarioProbe() {
-        for(String name:NAMES)scenes.add(new Scene(name,name.startsWith("shared-")
-                ?name.equals("shared-boundary1")?11:8:name.equals("entity-drift")?48:28,1,name));
+        for(String name:NAMES)scenes.add(new Scene(name,name.startsWith("ground-")
+                ?name.equals("ground-boundary1")?11:8:name.equals("entity-drift")?48:28,1,name));
         String filter=System.getProperty("an.trace.scene","");
         if(!filter.isEmpty()) {
             Set<String> selected=new HashSet<>(Arrays.asList(filter.split(",")));
@@ -178,9 +175,9 @@ public final class CoverageScenarioProbe {
         submittedScene=accepted=actionTaken=false;drifts=0;
         ready=submitted=submitEnd=closed=firstMove=arrival=intentArrival=terminal=queryReady=adoptedAt=0;
         terminalTick=0;state="PENDING";lastObservation="";
-        start=new BlockPos(kind().equals("shared-anchor-drift0")?-124:-156,81,-159);
+        start=new BlockPos(kind().equals("ground-target-drift0")?-124:-156,81,-159);
         goal=start.offset(scenes.get(index).distance,0,0);
-        if(kind().startsWith("shared-"))goal=start.offset(kind().equals("shared-boundary1")?11:8,0,0);
+        if(kind().startsWith("ground-"))goal=start.offset(kind().equals("ground-boundary1")?11:8,0,0);
         mob=spawn(kind().equals("brain-walk-target")||kind().equals("poi-acquire")
                 ?new ProbeVillager(level):new ProbeHusk(level),start);
         if(mob instanceof Villager villager) {
@@ -189,14 +186,14 @@ public final class CoverageScenarioProbe {
             villager.getBrain().setActiveActivityIfPossible(Activity.CORE);
         }
         initial=mob.position();
-        if(kind().startsWith("entity-")||kind().equals("ai-goalselector")||kind().equals("shared-drift1")
-                ||kind().equals("shared-anchor-drift0")) {
+        if(kind().startsWith("entity-")||kind().equals("ai-goalselector")||kind().equals("ground-drift1")
+                ||kind().equals("ground-target-drift0")) {
             target=spawn(new ProbeHusk(level),goal);target.setNoAi(true);
-            if(kind().equals("shared-anchor-drift0"))
+            if(kind().equals("ground-target-drift0"))
                 target.setPos(goal.getX()+.9,target.getY(),target.getZ());
         }
-        if(kind().equals("shared-neighbor1")||kind().equals("shared-obstacle1")) {
-            BlockPos obstacle=kind().equals("shared-neighbor1")?goal:start.offset(4,0,0);
+        if(kind().equals("ground-neighbor1")||kind().equals("ground-obstacle1")) {
+            BlockPos obstacle=kind().equals("ground-neighbor1")?goal:start.offset(4,0,0);
             for(int y=0;y<3;y++) {
                 BlockPos point=obstacle.above(y);level.setBlock(point,Blocks.STONE.defaultBlockState(),3);changed.add(point);
             }
@@ -211,31 +208,6 @@ public final class CoverageScenarioProbe {
         }
         PerformanceSearchTelemetry.ACTORS.put(mob,searches);
         PublicationTelemetry.ACTORS.put(mob.getNavigation(),publication);
-        if(kind().equals("shared-timeout1")||kind().equals("shared-anchor-drift0")) {
-            try {
-                sharedHooks=Trace.field(Trace.field(TopologyService.forServer(server),"runtime"),"shared");
-                sharedHookField=sharedHooks.getClass().getDeclaredField("hook");sharedHookField.setAccessible(true);
-                previousSharedHook=sharedHookField.get(sharedHooks);
-                var once=new java.util.concurrent.atomic.AtomicBoolean();
-                sharedHookField.set(sharedHooks,Proxy.newProxyInstance(sharedHookField.getType().getClassLoader(),
-                        new Class<?>[]{sharedHookField.getType()},(proxy,method,args)-> {
-                            if(method.getName().equals("enter")&&args[0].equals("before-query")&&once.compareAndSet(false,true)) {
-                                if(kind().equals("shared-timeout1"))
-                                    throw new java.util.concurrent.TimeoutException("controlled shared query timeout");
-                                var moved=new java.util.concurrent.CompletableFuture<Void>();
-                                server.execute(()-> {
-                                    target.setPos(target.getX()+1,target.getY(),target.getZ());
-                                    goal=target.blockPosition();
-                                    action("target-moved-before-shared-result",Map.of("target",goal.toString(),
-                                            "position",List.of(target.getX(),target.getY(),target.getZ())));
-                                    moved.complete(null);
-                                });
-                                moved.get(5,java.util.concurrent.TimeUnit.SECONDS);
-                            }
-                            return null;
-                        }));
-            } catch(ReflectiveOperationException error) {throw new IllegalStateException(error);}
-        }
         prepareTick=tick;System.out.println("TIMELINE_PREPARE "+index+" "+kind());
     }
     private void action(String name,Object detail) {
@@ -259,7 +231,7 @@ public final class CoverageScenarioProbe {
         var nav=mob.getNavigation();
         if(!AutomaticNavigationBridge.enabled(nav))throw new IllegalStateException("Wrong backend");
         switch(kind()) {
-            case "shared-low-budget0" -> {
+            case "ground-low-budget0" -> {
                 int limit=nativeVisitLimit(nav);
                 float multiplier=6.25f/limit;
                 action("controlled-native-visit-limit",Map.of("maxVisitedNodes",limit,"visitedMultiplier",multiplier));
@@ -267,19 +239,22 @@ public final class CoverageScenarioProbe {
                         NavigationCapabilities.capture(mob));
                 accepted=service.move(nav,intent,this,0,1);
             }
-            case "shared-anchor-drift0" -> {
+            case "ground-target-drift0" -> {
                 NavigationIntent intent=new NavigationIntent(Set.of(goal),target,false,8,false,0,35,1,
                         NavigationCapabilities.capture(mob));
                 accepted=service.move(nav,intent,this,0,1);
+                target.setPos(target.getX()+1,target.getY(),target.getZ());
+                goal=target.blockPosition();drifts++;
+                action("target-drift",List.of(target.getX(),target.getY(),target.getZ()));
             }
-            case "entity-stationary","entity-drift","shared-drift1" -> accepted=nav.moveTo(target,1);
-            case "shared-neighbor1" -> {
+            case "entity-stationary","entity-drift","ground-drift1" -> accepted=nav.moveTo(target,1);
+            case "ground-neighbor1" -> {
                 NavigationIntent intent=new NavigationIntent(Set.of(goal),null,false,8,false,1,35,1,
                         NavigationCapabilities.capture(mob));
                 accepted=service.move(nav,intent,this,0,1);
             }
-            case "shared-range4","shared-range12" -> {
-                int range=kind().equals("shared-range4")?4:12;
+            case "ground-range4","ground-range12" -> {
+                int range=kind().equals("ground-range4")?4:12;
                 NavigationIntent intent=AutomaticNavigationBridge.intent(nav,Set.of(goal),null,true,8,false,1,range);
                 accepted=AutomaticNavigationBridge.move(nav,intent,1);
             }
@@ -297,18 +272,18 @@ public final class CoverageScenarioProbe {
                 var behavior=AcquirePoi.create(type->type.is(PoiTypes.FISHERMAN),MemoryModuleType.JOB_SITE,false,Optional.empty());
                 villager.getBrain().addActivity(Activity.CORE,0,ImmutableList.of(behavior));accepted=true;
             }
-            case "query-only-multi","query-ready-adopt-multi","query-pending-adopt-multi","shared-accuracy0",
-                    "shared-query-only-multi","shared-query-ready-adopt-multi","shared-query-pending-adopt-multi" -> {
+            case "query-only-multi","query-ready-adopt-multi","query-pending-adopt-multi","ground-accuracy0",
+                    "ground-query-only-multi","ground-query-ready-adopt-multi","ground-query-pending-adopt-multi" -> {
                 controller=new MeleeAttackGoal((ProbeHusk)mob,1,true);
-                Set<BlockPos> targets=kind().equals("shared-accuracy0")?Set.of(goal)
-                        :kind().startsWith("shared-query-")
+                Set<BlockPos> targets=kind().equals("ground-accuracy0")?Set.of(goal)
+                        :kind().startsWith("ground-query-")
                             ?new LinkedHashSet<>(List.of(goal,start.offset(9,0,1),start.offset(10,0,2)))
                         :new LinkedHashSet<>(List.of(goal,start.offset(18,0,1),start.offset(24,0,2)));
                 query=AutomaticNavigationBridge.delegate(controller,0,"TICK",()->nav.createPath(targets,0));
                 accepted=query instanceof NavigationRequestPath;
                 if(query instanceof NavigationRequestPath request)add(request);
                 if(accepted&&(kind().equals("query-pending-adopt-multi")
-                        ||kind().equals("shared-query-pending-adopt-multi")||kind().equals("shared-accuracy0"))) {
+                        ||kind().equals("ground-query-pending-adopt-multi")||kind().equals("ground-accuracy0"))) {
                     accepted=nav.moveTo(query,1);adoptedAt=System.nanoTime();
                 }
                 action("query-created",Map.of("targets",targets.toString(),"pending",query instanceof NavigationRequestPath request
@@ -322,9 +297,9 @@ public final class CoverageScenarioProbe {
             default -> accepted=nav.moveTo(goal.getX()+.5,goal.getY(),goal.getZ()+.5,1);
         }
         track();
-        if(kind().equals("shared-pending-cancel1")) {
+        if(kind().equals("ground-pending-cancel1")) {
             nav.stop();action("cancel-pending",true);
-        } else if(kind().equals("shared-pending-replace1")) {
+        } else if(kind().equals("ground-pending-replace1")) {
             goal=start.offset(6,0,2);
             boolean replacement=nav.moveTo(goal.getX()+.5,goal.getY(),goal.getZ()+.5,1);
             if(!replacement)throw new IllegalStateException("Pending replacement rejected");
@@ -339,10 +314,6 @@ public final class CoverageScenarioProbe {
             long now=System.nanoTime();
             if(!submittedScene&&ready!=0&&now-ready>=30_000_000_000L&&now-started>=30_000_000_000L) {
                 Trace.trial=index+1;Trace.clock();topologyBefore=metrics.invoke(TopologyService.forServer(server));
-                sharedRequestsBefore=service.sharedSectionRequests();
-                sharedSegmentsBefore=service.sharedSectionSegments();
-                sharedFallbacksBefore=service.sharedSectionFallbacks();
-                sharedRuntimeBefore=TopologyService.forServer(server).sharedTopologyMetrics();
                 threadCostsBefore=threadCosts();
                 before=Measurements.snapshot();submitted=System.nanoTime();submitTick=tick;submittedScene=true;
                 submit();submitEnd=System.nanoTime();nextSample=submitted+100_000_000L;
@@ -354,14 +325,14 @@ public final class CoverageScenarioProbe {
                 target.setPos(target.getX()+4,target.getY(),target.getZ());goal=target.blockPosition();drifts++;
                 action("target-drift",List.of(target.getX(),target.getY(),target.getZ()));
             }
-            if(kind().equals("shared-drift1")&&drifts==0&&publication.firstReadyNanos!=0) {
+            if(kind().equals("ground-drift1")&&drifts==0&&publication.firstReadyNanos!=0) {
                 target.setPos(target.getX()+4,target.getY(),target.getZ());goal=target.blockPosition();drifts++;
                 action("target-drift",List.of(target.getX(),target.getY(),target.getZ()));
             }
-            if((kind().equals("shared-cancel1")||kind().equals("shared-replace1"))
+            if((kind().equals("ground-cancel1")||kind().equals("ground-replace1"))
                     &&!actionTaken&&publication.firstReadyNanos!=0) {
                 actionTaken=true;
-                if(kind().equals("shared-cancel1")) {mob.getNavigation().stop();action("cancel-published",true);}
+                if(kind().equals("ground-cancel1")) {mob.getNavigation().stop();action("cancel-published",true);}
                 else {
                     goal=start.offset(6,0,2);
                     boolean replacement=mob.getNavigation().moveTo(goal.getX()+.5,goal.getY(),goal.getZ()+.5,1);
@@ -371,11 +342,11 @@ public final class CoverageScenarioProbe {
             }
             if(query instanceof NavigationRequestPath request&&request.state==NavigationRequestPath.State.REACHABLE&&queryReady==0) {
                 queryReady=System.nanoTime();goal=request.getTarget();action("query-ready",request.getTarget().toString());
-                if(kind().equals("query-ready-adopt-multi")||kind().equals("shared-query-ready-adopt-multi")) {
+                if(kind().equals("query-ready-adopt-multi")||kind().equals("ground-query-ready-adopt-multi")) {
                     accepted=mob.getNavigation().moveTo(query,1);adoptedAt=System.nanoTime();action("ready-adopt",accepted);
                 }
             }
-            if((kind().equals("dynamic-block")||kind().equals("shared-dynamic1"))
+            if((kind().equals("dynamic-block")||kind().equals("ground-dynamic1"))
                     &&!actionTaken&&publication.firstReadyNanos!=0&&latest!=null&&latest.getNodeCount()>3) {
                 for(int n=1;n<Math.min(4,latest.getNodeCount());n++) {
                     BlockPos point=latest.getNode(n).asBlockPos();
@@ -420,7 +391,6 @@ public final class CoverageScenarioProbe {
             Object value=Trace.field(work,name);
             row.add(name,name.equals("segmentEntry")?new JsonPrimitive(value!=null):gson.toJsonTree(value));
         }
-        if(work!=null)row.add("sharedMergeRejected",gson.toJsonTree(optionalField(work,"sharedMergeRejected")));
         observations.add(row);
     }
     @SubscribeEvent(priority=EventPriority.LOWEST) public void end(TickEvent.ServerTickEvent event) {
@@ -440,7 +410,7 @@ public final class CoverageScenarioProbe {
             if(now>=nextSample) {samples.add(gson.toJsonTree(Measurements.snapshot()));nextSample=now+100_000_000L;}
             if(firstMove==0&&mob.position().distanceTo(initial)>.05)firstMove=now;
             if(latest!=null&&latest.adopted)goal=latest.getTarget();
-            if(!kind().equals("poi-acquire")&&!kind().equals("query-only-multi")&&!kind().equals("shared-query-only-multi")
+            if(!kind().equals("poi-acquire")&&!kind().equals("query-only-multi")&&!kind().equals("ground-query-only-multi")
                     &&mob.blockPosition().distManhattan(goal)<=1&&arrival==0)arrival=now;
             if(latest!=null&&latest.adopted&&intentArrival==0
                     &&mob.blockPosition().distManhattan(goal)<=latest.intent.accuracy())intentArrival=now;
@@ -448,7 +418,7 @@ public final class CoverageScenarioProbe {
                 if(!accepted)state="REJECTED";
                 else if(kind().equals("poi-acquire")&&((Villager)mob).getBrain().hasMemoryValue(MemoryModuleType.JOB_SITE)) {
                     state="POI_SELECTED";action("poi-ticket",((Villager)mob).getBrain().getMemory(MemoryModuleType.JOB_SITE).get().pos().toString());
-                } else if((kind().equals("query-only-multi")||kind().equals("shared-query-only-multi"))
+                } else if((kind().equals("query-only-multi")||kind().equals("ground-query-only-multi"))
                         &&query instanceof NavigationRequestPath request
                         &&(request.state==NavigationRequestPath.State.REACHABLE||request.state==NavigationRequestPath.State.UNREACHABLE)) {
                     state="QUERY_"+request.state.name();
@@ -470,14 +440,8 @@ public final class CoverageScenarioProbe {
         row.add("costStart",gson.toJsonTree(before));row.add("costEnd",gson.toJsonTree(after));row.add("costSamples",samples);
         row.add("topologyBefore",gson.toJsonTree(topologyBefore));row.add("topologyAfter",gson.toJsonTree(topologyAfter));
         row.add("observations",observations);row.add("actions",actions);
-        row.add("sharedRuntimeBefore",gson.toJsonTree(sharedRuntimeBefore));
-        row.add("sharedRuntimeAfter",gson.toJsonTree(TopologyService.forServer(server).sharedTopologyMetrics()));
         row.add("javaThreadCostsBefore",gson.toJsonTree(threadCostsBefore));
         row.add("javaThreadCostsAfter",gson.toJsonTree(threadCosts()));
-        row.add("sharedDelta",gson.toJsonTree(Map.of(
-                "requests",service.sharedSectionRequests()-sharedRequestsBefore,
-                "segments",service.sharedSectionSegments()-sharedSegmentsBefore,
-                "fallbacks",service.sharedSectionFallbacks()-sharedFallbacksBefore)));
         JsonObject a=new JsonObject();a.addProperty("tile",0);a.addProperty("slot",0);a.addProperty("kind",kind());
         a.add("start",gson.toJsonTree(List.of(start.getX(),start.getY(),start.getZ())));
         a.add("goal",gson.toJsonTree(List.of(goal.getX(),goal.getY(),goal.getZ())));
@@ -509,10 +473,6 @@ public final class CoverageScenarioProbe {
         for(NavigationRequestPath request:requests)service.consume(request);
         PerformanceSearchTelemetry.ACTORS.remove(mob);PublicationTelemetry.ACTORS.remove(mob.getNavigation());
         mob.discard();if(target!=null)target.discard();mob=null;
-        if(sharedHookField!=null) {
-            sharedHookField.set(sharedHooks,previousSharedHook);
-            sharedHookField=null;sharedHooks=previousSharedHook=null;
-        }
         for(BlockPos point:changed) {level.getPoiManager().remove(point);level.setBlock(point,Blocks.AIR.defaultBlockState(),3);}
         System.out.println("TIMELINE_FINISH "+index+" "+kind()+" "+state);
         write();if(index+1==scenes.size()) {done=true;stop();}
@@ -521,7 +481,7 @@ public final class CoverageScenarioProbe {
         JsonObject root=new JsonObject();root.addProperty("schema","NAVIGATION_TIMELINE_V1");
         root.addProperty("diagnostic",true);root.addProperty("deepTrace",Trace.ENABLED);root.addProperty("vanillaSameRuntime",false);
         root.addProperty("complete",done);root.addProperty("failure",failure);root.addProperty("coverageScope","controlled entry census");
-        root.addProperty("coverageProbeRevision",6);
+        root.addProperty("coverageProbeRevision",7);
         root.add("scenes",gson.toJsonTree(scenes));root.add("trials",rows);Files.writeString(output.resolve("timeline.json"),gson.toJson(root));
         FailureSearchTelemetry.write(output);
     }

@@ -87,8 +87,8 @@ public final class ProductionNavigationProbe {
     public ProductionNavigationProbe() {
         PerformanceTickTelemetry.register();
         Object probe=Boolean.getBoolean("an.production.coldTopology")
-                ? new ColdTopologyProbe() : Boolean.getBoolean("an.production.sharedTopology")
-                ? new SharedTopologyProductionProbe() : Boolean.getBoolean("an.production.tickBoundaryLoad")
+                ? new ColdTopologyProbe() : Boolean.getBoolean("an.production.groundTopology")
+                ? new GroundNavigationProductionProbe() : Boolean.getBoolean("an.production.tickBoundaryLoad")
                 ? new TickBoundaryLoadProbe() : Boolean.getBoolean("an.production.partialReplay")
                 ? new PartialReplayProbe() : Boolean.getBoolean("an.production.waitBoundaries")
                 ? new HandoffWaitBoundaryProbe() : Boolean.getBoolean("an.production.performanceComparison")

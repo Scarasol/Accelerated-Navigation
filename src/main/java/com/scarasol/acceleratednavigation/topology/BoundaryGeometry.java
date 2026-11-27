@@ -62,6 +62,26 @@ final class BoundaryGeometry {
         return geometry;
     }
 
+    // Both supported bodies fit within the swept column width. Any openable door in
+    // the target's sweep requires the ordinary collision calculation with doors closed.
+    boolean needsDoorCheck(BaseClusterTopology.GeometryKey body, int x, int y, int z,
+                           Direction direction, int distance, int dy) {
+        int endX = x + direction.getStepX() * distance;
+        int endZ = z + direction.getStepZ() * distance;
+        int minY = y + Math.min(0, dy);
+        int maxY = y + Math.max(0, dy) + (distance > 1 ? 1 : 0) + (int) Math.ceil(body.height()) - 1;
+        for (int cy = minY; cy <= maxY; cy++) {
+            for (int cz = Math.min(z, endZ); cz <= Math.max(z, endZ); cz++) {
+                for (int cx = Math.min(x, endX); cx <= Math.max(x, endX); cx++) {
+                    SectionGeometry geometry = at(cx, cy, cz);
+                    if (geometry == null || (geometry.hasDoors() && geometry.shape(
+                            BaseClusterTopology.cellIndex(cx & 15, cy & 15, cz & 15)).openableDoor())) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     boolean open(BaseClusterTopology.GeometryKey body, int x, int y, int z,
                  Direction direction, int distance, int dy) {
         boolean xAxis = direction.getAxis() == Direction.Axis.X || distance == 0;
@@ -90,7 +110,7 @@ final class BoundaryGeometry {
                     int cx = rowStart - first + localX;
                     SectionGeometry.Shape shape = geometry.shape(BaseClusterTopology.cellIndex(
                             cx & 15, cy & 15, cz & 15));
-                    if (body.canOpenDoors() && shape.openableDoor()) continue;
+                    if (shape.openableDoor() && body.canOpenDoors()) continue;
                     for (int box = 0; box < shape.coordinateCount(); box += 6) {
                         double aS = (xAxis ? cx : cz) + shape.coordinate(box + (xAxis ? 0 : 2)) / 16.;
                         double bS = (xAxis ? cx : cz) + shape.coordinate(box + (xAxis ? 3 : 5)) / 16.;

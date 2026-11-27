@@ -55,11 +55,6 @@ public final class ColdTopologyProbe {
         checks.add(Map.of("name",name,"passed",passed,"detail",detail));
         if(!passed)throw new AssertionError(name+": "+detail);
     }
-    private Map<?,?> sharedMetrics() {
-        try{return (Map<?,?>)TopologyService.class.getMethod("sharedTopologyMetrics").invoke(topology);}
-        catch(NoSuchMethodException baseline){return Map.of("available",false);}
-        catch(ReflectiveOperationException error){throw new IllegalStateException(error);}
-    }
     private static Object field(Object value,String name) throws ReflectiveOperationException {
         var member=value.getClass().getDeclaredField(name);member.setAccessible(true);return member.get(value);
     }
@@ -125,7 +120,7 @@ public final class ColdTopologyProbe {
                 if(ticks<30)return;
                 check("actor settled",actor.onGround()&&actor.blockPosition().equals(new BlockPos(3,81,7)),actor.position());
                 check("adapter enabled",AutomaticNavigationBridge.enabled(actor.getNavigation()),"formal automatic");
-                result.put("sharedBefore",sharedMetrics());result.put("workerBefore",workerMetrics());
+                result.put("workerBefore",workerMetrics());
                 result.put("preSubmitTelemetry",ColdTopologyTelemetry.snapshot());
                 var intent=AutomaticNavigationBridge.movementIntent(actor.getNavigation(),goal,null,0);
                 result.put("profile",intent.capabilities().profile().toString());
@@ -149,7 +144,7 @@ public final class ColdTopologyProbe {
                 check("actual returned path endpoint",request.getEndNode()!=null,request.getNodeCount());
                 result.put("firstPathNodes",request.getNodeCount());result.put("firstPathCanReach",request.canReach());
                 result.put("firstPathEnd",request.getEndNode().asBlockPos().toString());
-                result.put("requestStateAtFirstPath",request.state);result.put("sharedAfter",sharedMetrics());
+                result.put("requestStateAtFirstPath",request.state);
                 result.put("workerAtFirstPath",workerMetrics());result.put("navigation",service.metrics());
                 finish(null);return;
             }

@@ -2,6 +2,7 @@ package com.scarasol.acceleratednavigation;
 
 import com.mojang.logging.LogUtils;
 import com.scarasol.acceleratednavigation.policy.NavigationPolicy;
+import com.scarasol.acceleratednavigation.configuration.CommonConfig;
 import com.scarasol.acceleratednavigation.scheduler.NavigationScheduler;
 import com.scarasol.acceleratednavigation.topology.TopologyService;
 import com.scarasol.acceleratednavigation.navigation.SegmentedNavigationService;
@@ -29,7 +30,7 @@ public final class AcceleratedNavigation {
     public AcceleratedNavigation() {
         ModLoadingContext.get().registerConfig(
                 ModConfig.Type.COMMON,
-                NavigationPolicy.CONFIG_SPEC,
+                CommonConfig.SPEC,
                 "accelerated-navigation-common.toml"
         );
 
@@ -78,8 +79,11 @@ public final class AcceleratedNavigation {
     }
 
     private void onServerStopped(ServerStoppedEvent event) {
-        TopologyService.shutdown(event.getServer());
-        NavigationScheduler.shutdown(event.getServer());
+        try {
+            TopologyService.shutdown(event.getServer());
+        } finally {
+            NavigationScheduler.shutdown(event.getServer());
+        }
     }
 
     private void onChunkUnload(ChunkEvent.Unload event) {

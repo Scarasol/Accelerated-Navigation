@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)][ValidatePattern('^[a-z0-9-]+$')][string]$Run,
-    [ValidateSet('lifecycle','speed','boundaries','wait','tick-load','replay','shared','cold')][string]$Probe = 'lifecycle',
+    [ValidateSet('lifecycle','speed','boundaries','wait','tick-load','replay','ground','cold')][string]$Probe = 'lifecycle',
     [string]$ProductionJar = 'build/libs/accelerated_navigation-0.1.0-all.jar',
     [string]$ProbeJar = 'build/reobfProductionProbeJar/output.jar',
     [string]$ReplaySource,
@@ -40,7 +40,7 @@ if ($Probe -in @('lifecycle','speed','boundaries')) {
     Copy-Item -LiteralPath (Join-Path $taskWorkspace '.tmp/segment-execution-validation-20261012/stages.json') -Destination (Join-Path $taskRunPath 'stages.json')
     Copy-Item -LiteralPath (Join-Path $taskWorkspace '.tmp/navigation-command-entity-20261013/server-speed/mods/lostcities.jar') -Destination (Join-Path $taskRunPath 'mods/lostcities.jar')
 }
-$taskProperties = if ($Probe -in @('shared','cold')) {
+$taskProperties = if ($Probe -in @('ground','cold')) {
     'tools/benchmark/shared-server.properties'
 } elseif ($Probe -in @('lifecycle','speed','boundaries')) {
     '.tmp/segment-landing-fix-20261012/resources/server.properties'
@@ -54,7 +54,7 @@ $taskOptions = @{
     lifecycle='-Dan.production.routeStart=0'; speed='-Dan.production.speedDiagnosis=true';
     boundaries='-Dan.production.handoffBoundaries=true'; wait='-Dan.production.waitBoundaries=true';
     'tick-load'='-Dan.production.tickBoundaryLoad=true'; replay='-Dan.production.partialReplay=true';
-    shared='-Dan.production.sharedTopology=true'
+    ground='-Dan.production.groundTopology=true'
     cold='-Dan.production.coldTopology=true'
 }
 $env:MOD_CLASSES = $null
@@ -96,7 +96,7 @@ foreach ($taskInput in $taskInputs) {
 if ($taskTimedOut -or $taskProcess.ExitCode -ne 0) { throw 'Verification execution failed; evidence retained' }
 $taskResultName = switch ($Probe) {
     lifecycle {'result.json'}; wait {'wait-boundaries.json'}; 'tick-load' {'tick-boundary-load.json'}
-    replay {'partial-replay.json'}; shared {'shared-production.json'}; cold {'cold-topology.json'}; default {'diagnosis.json'}
+    replay {'partial-replay.json'}; ground {'ground-production.json'}; cold {'cold-topology.json'}; default {'diagnosis.json'}
 }
 $taskResult = Get-Content -LiteralPath (Join-Path $taskRunPath $taskResultName) -Raw | ConvertFrom-Json
 if ($taskResult.failed) { throw ('Verification failed: ' + $taskResult.failure) }

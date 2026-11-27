@@ -12,9 +12,6 @@ public abstract class ShortNativeLifecycleMixin {
     @Inject(method="requestMacroQuery",at=@At("HEAD"),remap=false,require=1)
     private void macro(CallbackInfoReturnable<?> callback) { ShortNativeScenarioProbe.macro(); }
 
-    @Inject(method="requestSharedSection",at=@At("HEAD"),remap=false,require=1)
-    private void shared(CallbackInfoReturnable<?> callback) { ShortNativeScenarioProbe.shared(); }
-
     @Inject(method="prepareGroundWindow",at=@At("HEAD"),remap=false,require=1)
     private void window(CallbackInfoReturnable<?> callback) { ShortNativeScenarioProbe.window(); }
 }

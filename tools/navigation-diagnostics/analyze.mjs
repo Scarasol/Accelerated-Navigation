@@ -35,6 +35,8 @@ export const coverageScenes=['entity-stationary','entity-drift','ai-goalselector
   'shared-dynamic1','shared-pending-cancel1','shared-pending-replace1','shared-timeout1',
   'shared-low-budget0','shared-anchor-drift0',
   'shared-query-only-multi','shared-query-ready-adopt-multi','shared-query-pending-adopt-multi'];
+export const currentCoverageScenes=coverageScenes.filter(name=>name!=='shared-timeout1')
+  .map(name=>name.replace('shared-anchor-drift0','shared-target-drift0').replace(/^shared-/,'ground-'));
 export function qualificationReasons(accuracy, width, height, start, goal) {
   const reasons=[];
   if(accuracy!==0)reasons.push('accuracy');
@@ -103,7 +105,7 @@ export function analyze(directory) {
     burst:['warmup8','warmup28','burst8','burst28'],
     supplement:['doorway8-known-slots','super304','ai-melee-query-adopt'],
     closure:['super304-cold','super304-warm'],
-    coverage:coverageScenes,
+    coverage:result.coverageProbeRevision>=7?currentCoverageScenes:coverageScenes,
     failures:[8,28].flatMap(d=>[`wall${d}-all`,`door${d}-all`,`wall${d}-reverse`,`door${d}-reverse`])
       .concat(['explicit-range4','explicit-range12','cancel-pending','cancel-published','replace-pending'])
   }[launch.suite];

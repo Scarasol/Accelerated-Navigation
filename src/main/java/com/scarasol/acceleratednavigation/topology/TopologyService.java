@@ -51,7 +51,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
-import java.util.function.BooleanSupplier;
 
 /** Server-thread owner of basic facts, persistence, recovery and caller publication. */
 public final class TopologyService {
@@ -93,8 +92,6 @@ public final class TopologyService {
             new LinkedHashSet<>();
     private final LinkedHashSet<LoadedSection> changedSections = new LinkedHashSet<>();
     private final Map<RequestKey, MacroRequest> macroRequests = new HashMap<>();
-    private final Set<CompletableFuture<SharedSectionCandidate>> sharedRequests =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
     private ExecutorService graphCaptureExecutor;
     private CompletableFuture<GraphCaptureResult> graphCapture;
     private final Object factDemandLock = new Object();
@@ -121,6 +118,7 @@ public final class TopologyService {
 
     private TopologyService(MinecraftServer server) {
         this.server = Objects.requireNonNull(server, "server");
+        requireServerThread();
         TopologyStore opened = null;
         try {
             opened = new TopologyStore(server.getWorldPath(LevelResource.ROOT)
@@ -301,52 +299,6 @@ public final class TopologyService {
         return GroundSegmentWindow.capture(runtime,corridor,profile,priority,actual,edges,destination,reachTarget,accuracy);
     }
 
-    public CompletableFuture<SharedSectionCandidate> requestSharedSection(ServerLevel level,
-            BaseClusterTopology.TraversalProfile profile, BlockPos start, BlockPos goal,
-            BooleanSupplier interested, long expiresNanos) {
-        requireServerThread();
-        if (!isAvailable() || level.getServer() != server)
-            return CompletableFuture.failedFuture(new RejectedExecutionException("topology service unavailable"));
-        if (!SharedSectionCandidate.supports(profile, start, goal, 0))
-            return CompletableFuture.failedFuture(
-                    new SharedSectionCandidate.UnsupportedInputException("unsupported shared section scope"));
-        if (sharedRequests.size() >= MAX_MACRO_REQUESTS)
-            return CompletableFuture.failedFuture(
-                    new SharedSectionCandidate.AdmissionRejectedException("shared publication request cap"));
-        SectionPos section = SectionPos.of(start);
-        var query = new SharedRows.Query(profile.geometry(BaseClusterTopology.Channel.GROUND),
-                profile.movement(BaseClusterTopology.Channel.GROUND), BaseClusterTopology.cellIndex(Math.floorMod(start.getX(),16),
-                Math.floorMod(start.getY(),16),Math.floorMod(start.getZ(),16)),
-                BaseClusterTopology.cellIndex(Math.floorMod(goal.getX(),16),
-                Math.floorMod(goal.getY(),16),Math.floorMod(goal.getZ(),16)),4096);
-        var source = runtime.shared.request(level.dimension(),section,query,interested,expiresNanos);
-        var result = new CompletableFuture<SharedSectionCandidate>();
-        sharedRequests.add(result);
-        result.whenComplete((value,failure) -> {
-            sharedRequests.remove(result);
-            if (result.isCancelled()) source.cancel(false);
-        });
-        source.whenComplete((value,failure) -> queueServer(() -> {
-            if (result.isDone()) return;
-            try {
-                if (failure != null) result.completeExceptionally(failure);
-                else if (value == null) result.completeExceptionally(new IllegalStateException("missing shared result"));
-                else if (!isAvailable() || !interested.getAsBoolean() || !value.current()
-                        || System.nanoTime() >= expiresNanos)
-                    result.completeExceptionally(new CancellationException("shared candidate obsolete before publication"));
-                else result.complete(new SharedSectionCandidate(section,value));
-            } catch (Throwable publicationFailure) {
-                result.completeExceptionally(publicationFailure);
-            }
-        }));
-        return result;
-    }
-
-    public Map<String, Long> sharedTopologyMetrics() {
-        requireServerThread();
-        return runtime.shared.metrics();
-    }
-
     /** Diagnostic export of the current default-ground base graphs. */
     public CompletableFuture<GraphCaptureResult> captureBaseGraphs(ServerLevel level,
                                                                     Vec3 center, int distance) {
@@ -507,9 +459,10 @@ public final class TopologyService {
 
     private void unloadChunk(ServerLevel level, ChunkAccess access) {
         requireServerThread();
-        LoadedChunk loaded = loadedChunks.remove(
-                new ChunkKey(level.dimension(), access.getPos().toLong()));
-        if (loaded != null) unloadChunk(loaded);
+        ChunkKey key = new ChunkKey(level.dimension(), access.getPos().toLong());
+        LoadedChunk loaded = loadedChunks.get(key);
+        if (loaded == null || loaded.chunk != access) return;
+        if (loadedChunks.remove(key, loaded)) unloadChunk(loaded);
     }
 
     private void unloadChunk(LoadedChunk loaded) {
@@ -519,7 +472,7 @@ public final class TopologyService {
             ordinaryRecovery.remove(section.key);
             changedSections.remove(section);
             loadedSections.remove(section.key, section);
-            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+            publishSection(new TopologyWorkerRuntime.SectionEvent(
                     section.key, loaded.identity, section.version, section.version,
                     TopologyWorkerRuntime.FactState.UNLOADED, null, Map.of()));
         }
@@ -580,7 +533,7 @@ public final class TopologyService {
                 || recoveryQueued(section)) return;
         if (section.recoveryAttempted) {
             section.persistenceUnavailable = true;
-            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+            publishSection(new TopologyWorkerRuntime.SectionEvent(
                     section.key, section.chunk.identity, section.version, section.version,
                     TopologyWorkerRuntime.FactState.PERSISTENCE_UNAVAILABLE, null, Map.of()));
             return;
@@ -711,7 +664,7 @@ public final class TopologyService {
             if (failure instanceof ThreadDeath fatal) throw fatal;
             section.recoveryFailed = true;
             failedRecoveries++;
-            runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+            publishSection(new TopologyWorkerRuntime.SectionEvent(
                     section.key, section.chunk.identity, section.version, section.version,
                     TopologyWorkerRuntime.FactState.RECOVERY_FAILED, null, Map.of()));
             AcceleratedNavigation.LOGGER.error("Could not recover macro facts for {}", key, failure);
@@ -899,7 +852,7 @@ public final class TopologyService {
                 if (failure instanceof ThreadDeath fatal) throw fatal;
                 section.recoveryFailed = true;
                 failedRecoveries++;
-                runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+                publishSection(new TopologyWorkerRuntime.SectionEvent(
                         section.key, section.chunk.identity, section.version, section.version,
                         TopologyWorkerRuntime.FactState.RECOVERY_FAILED, null, Map.of()));
                 AcceleratedNavigation.LOGGER.error(
@@ -911,21 +864,21 @@ public final class TopologyService {
 
     private void publishPending(LoadedSection section) {
         if (!isAvailable()) return;
-        runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+        publishSection(new TopologyWorkerRuntime.SectionEvent(
                 section.key, section.chunk.identity, section.version, section.version,
                 TopologyWorkerRuntime.FactState.PENDING, null, Map.of()));
     }
 
     private void publishFull(LoadedSection section, BaseClusterTopology.PackedFacts facts) {
         if (!isAvailable()) return;
-        runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+        publishSection(new TopologyWorkerRuntime.SectionEvent(
                 section.key, section.chunk.identity, section.version, section.version,
                 TopologyWorkerRuntime.FactState.AVAILABLE, facts, Map.of()));
     }
 
     private void writeFull(LoadedSection section, BaseClusterTopology.PackedFacts facts) {
         if (!isAvailable()) return;
-        runtime.publishSection(new TopologyWorkerRuntime.SectionEvent(
+        publishSection(new TopologyWorkerRuntime.SectionEvent(
                 section.key, section.chunk.identity, section.version, section.version,
                 TopologyWorkerRuntime.FactState.AVAILABLE, facts, Map.of(), true));
     }
@@ -968,6 +921,11 @@ public final class TopologyService {
             AcceleratedNavigation.LOGGER.warn("Could not accept macro facts for {}", decision.key(), failure);
             completePersistence(decision, decision.facts() != null, false);
         }
+    }
+
+    private void publishSection(TopologyWorkerRuntime.SectionEvent event) {
+        requireServerThread();
+        runtime.publishSection(event);
     }
 
     private void completePersistence(TopologyWorkerRuntime.FactDecision decision,
@@ -1056,8 +1014,6 @@ public final class TopologyService {
             else request.cancelOnServer();
         }
         macroRequests.clear();
-        for (var request : List.copyOf(sharedRequests)) request.cancel(false);
-        sharedRequests.clear();
         loadedChunks.values().forEach(loaded -> {
             ChunkFactsState state = loaded.carrier.acceleratedNavigation$factsState();
             if (unsupportedThreading.get()) state.loadedVersions(Map.of(), false);
@@ -1290,7 +1246,6 @@ public final class TopologyService {
             return completedStamps.stream().filter(stamp->!stamp.absent())
                     .map(stamp->stamp.key().section()).distinct().toList();
         }
-        /** Revalidates a completed proof before a deferred business consumer uses it. */
         public boolean current() {
             requireServerThread();
             return !stopped && !active && !future.isCompletedExceptionally()

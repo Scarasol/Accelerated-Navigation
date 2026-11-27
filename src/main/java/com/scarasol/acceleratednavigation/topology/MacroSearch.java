@@ -37,6 +37,9 @@ public final class MacroSearch {
     private Failure failure = Failure.NONE;
     private SectionPos blockedSection;
     private Corridor result;
+    private SearchNode closest;
+    private BlockPos closestPosition;
+    private double closestDistanceSquared = Double.POSITIVE_INFINITY;
     private boolean initialized;
     private boolean waitingForTopology;
     private long expansionWorkUnits;
@@ -83,7 +86,7 @@ public final class MacroSearch {
                 blockedSection = bestPendingSection();
                 return status;
             }
-            if (openSet.isEmpty()) {
+            if (openEmpty()) {
                 if (hasPendingDependencies()) {
                     waitingForTopology = true;
                     blockedSection = bestPendingSection();
@@ -106,6 +109,15 @@ public final class MacroSearch {
             if (!current.expansionStarted) {
                 current.expansionStarted = true;
                 expandedNodes++;
+                BlockPos candidate = graph.partialTarget(current.endpoint, closestDistanceSquared);
+                if (candidate != null) {
+                    double distance = candidate.distSqr(graph.goal().anchor());
+                    if (distance < closestDistanceSquared) {
+                        closest = current;
+                        closestPosition = candidate.immutable();
+                        closestDistanceSquared = distance;
+                    }
+                }
             }
 
             if (current.endpoint.id() == graph.goal().id()) {
@@ -122,6 +134,10 @@ public final class MacroSearch {
     private SearchNode popOpenNode() {
         return (SearchNode) openSet.pop();
     }
+
+    private boolean openEmpty() { return openSet.isEmpty(); }
+    private boolean inOpen(SearchNode node) { return node.inOpenSet(); }
+    private void insertOpen(SearchNode node) { openSet.insert(node); }
 
     public Status status() {
         return status;
@@ -236,7 +252,7 @@ public final class MacroSearch {
             node.completedExpansionParts |= parts;
             if (node.unavailableDependencies == null) node.unavailableDependencies = new HashMap<>();
             node.unavailableDependencies.put(dependency, reason);
-            if (node.pendingParts == null && !node.inOpenSet()) node.closed = true;
+            if (node.pendingParts == null && !inOpen(node)) node.closed = true;
         }
         waitingForTopology = false;
         blockedSection = null;
@@ -265,8 +281,8 @@ public final class MacroSearch {
                 continue;
             }
             node.closed = false;
-            if (!node.inOpenSet()) {
-                openSet.insert(node);
+            if (!inOpen(node)) {
+                insertOpen(node);
             }
             reexpandedBlockedNodes++;
             reopened = true;
@@ -291,7 +307,7 @@ public final class MacroSearch {
         if (!Float.isFinite(blockedKey)) {
             return false;
         }
-        if (openSet.isEmpty()) {
+        if (openEmpty()) {
             return true;
         }
         float readyKey = ((SearchNode) openSet.peek()).f;
@@ -344,6 +360,10 @@ public final class MacroSearch {
             }
         }
         maximumDegree = Math.max(maximumDegree, generatedThisExpansion);
+        finishExpansion(current);
+    }
+
+    private void finishExpansion(SearchNode current) {
         if (expansionBuffer.dependencyCount() != 0
                 || current.pendingParts != null) {
             registerBlocked(current, expansionBuffer);
@@ -453,14 +473,19 @@ public final class MacroSearch {
     }
 
     private Corridor trace(SearchNode goal) {
+        return trace(goal, null, Failure.NONE);
+    }
+
+    private Corridor trace(SearchNode goal, @Nullable Endpoint partialTarget, Failure partialFailure) {
         List<SearchNode> reversed = new ArrayList<>();
         for (SearchNode current = goal; current.previous != null; current = current.previous) {
             reversed.add(current);
         }
         Collections.reverse(reversed);
-        List<Endpoint> endpoints = new ArrayList<>(reversed.size() + 1);
+        int extra = partialTarget == null ? 0 : 1;
+        List<Endpoint> endpoints = new ArrayList<>(reversed.size() + 1 + extra);
         endpoints.add(graph.start());
-        List<Connection> connections = new ArrayList<>(reversed.size());
+        List<Connection> connections = new ArrayList<>(reversed.size() + extra);
         float cost = 0.0F;
         for (SearchNode node : reversed) {
             SearchNode previous = Objects.requireNonNull(node.previous);
@@ -480,7 +505,12 @@ public final class MacroSearch {
             endpoints.add(node.endpoint);
             cost += node.viaLowerBound;
         }
-        return new Corridor(endpoints, connections, cost);
+        if (partialTarget != null) {
+            endpoints.add(partialTarget);
+            connections.add(new Connection(Long.MIN_VALUE, goal.endpoint, partialTarget, 0.0F,
+                    MembershipTransition.INSTANCE));
+        }
+        return new Corridor(endpoints, connections, cost, Map.of(), partialFailure);
     }
 
     private static Transition materializeTransition(byte kind,
@@ -526,6 +556,11 @@ public final class MacroSearch {
         status = Status.FAILED;
         failure = Objects.requireNonNull(reason, "reason");
         result = null;
+        if (closest != null && (reason == Failure.NO_STRUCTURAL_ROUTE
+                || reason == Failure.SEARCH_LIMIT_REACHED || reason == Failure.UNAVAILABLE_CHUNK)) {
+            Endpoint target = new ExactEndpoint(graph.goal().id(), closestPosition, closest.endpoint.revision());
+            result = trace(closest, target, reason);
+        }
         return status;
     }
 
@@ -589,6 +624,11 @@ public final class MacroSearch {
         void expandInto(Endpoint from, ExpansionBuffer output);
 
         boolean revisionsValid();
+
+        @Nullable
+        default BlockPos partialTarget(Endpoint endpoint, double maximumDistanceSquared) {
+            return null;
+        }
 
         default float heuristic(Endpoint endpoint) {
             BlockPos from = endpoint.anchor();
@@ -963,7 +1003,14 @@ public final class MacroSearch {
     /** Immutable component membership in the world used by a completed macro search. */
     public static final class ComponentSnapshot {
         private final SectionPos section;
-        private final long[] cells = new long[BaseClusterTopology.CELL_COUNT / Long.SIZE];
+        private final long[] cells;
+
+        ComponentSnapshot(SectionPos section, long[] cells) {
+            this.section = Objects.requireNonNull(section, "section");
+            this.cells = new long[BaseClusterTopology.CELL_COUNT / Long.SIZE];
+            if (cells.length != this.cells.length) throw new IllegalArgumentException("Complete final membership required");
+            System.arraycopy(cells, 0, this.cells, 0, cells.length);
+        }
 
         ComponentSnapshot(ComponentEndpoint endpoint, BaseClusterTopology topology) {
             if (!topology.section().equals(endpoint.section()) || topology.signature() != endpoint.revision()
@@ -972,9 +1019,12 @@ public final class MacroSearch {
                 throw new IllegalArgumentException("component snapshot does not match endpoint");
             }
             section = endpoint.section();
-            for (int cell = 0; cell < BaseClusterTopology.CELL_COUNT; cell++) {
-                if (topology.componentAt(BaseClusterTopology.x(cell), BaseClusterTopology.y(cell),
-                        BaseClusterTopology.z(cell)) == endpoint.componentId()) cells[cell >>> 6] |= 1L << cell;
+            long[] shared = topology.sharedComponentCells(endpoint.componentId());
+            if (shared != null) {
+                cells = shared;
+            } else {
+                cells = new long[BaseClusterTopology.CELL_COUNT / Long.SIZE];
+                topology.captureComponentCells(endpoint.componentId(), cells);
             }
         }
 
@@ -987,14 +1037,19 @@ public final class MacroSearch {
     }
 
     public record Corridor(List<Endpoint> endpoints, List<Connection> connections, float cost,
-                           Map<ComponentEndpoint, ComponentSnapshot> components) {
+                           Map<ComponentEndpoint, ComponentSnapshot> components, Failure partialFailure) {
         public Corridor(List<Endpoint> endpoints, List<Connection> connections, float cost) {
-            this(endpoints, connections, cost, Map.of());
+            this(endpoints, connections, cost, Map.of(), Failure.NONE);
+        }
+        public Corridor(List<Endpoint> endpoints, List<Connection> connections, float cost,
+                        Map<ComponentEndpoint, ComponentSnapshot> components) {
+            this(endpoints, connections, cost, components, Failure.NONE);
         }
         public Corridor {
             endpoints = List.copyOf(endpoints);
             connections = List.copyOf(connections);
             components = Map.copyOf(components);
+            Objects.requireNonNull(partialFailure, "partialFailure");
             if (endpoints.size() != connections.size() + 1) {
                 throw new IllegalArgumentException("corridor endpoint count must be connection count plus one");
             }
@@ -1005,6 +1060,10 @@ public final class MacroSearch {
 
         public ComponentSnapshot component(ComponentEndpoint endpoint) {
             return Objects.requireNonNull(components.get(endpoint), "missing completed component snapshot");
+        }
+
+        public boolean partial() {
+            return partialFailure != Failure.NONE;
         }
     }
 

@@ -114,6 +114,21 @@ final class DoorContracts {
         try { SectionGeometry.read(new DataInputStream(new ByteArrayInputStream(broken))); }
         catch (IllegalArgumentException expected) { rejected = true; }
         check("invalid door box count rejected", rejected);
+        for (int axis = 0; axis < 3; axis++) {
+            int min = 5 + axis, max = min + 3;
+            for (int inversion = 0; inversion < 2; inversion++) {
+                byte[] invalidBox = bytes.clone();
+                invalidBox[min] = (byte) (invalidBox[max] + inversion);
+                if (invalidBox[min] > 16) {
+                    invalidBox[min] = 16;
+                    invalidBox[max] = 15;
+                }
+                rejected = false;
+                try { SectionGeometry.read(new DataInputStream(new ByteArrayInputStream(invalidBox))); }
+                catch (IllegalArgumentException expected) { rejected = true; }
+                check("invalid door box axis " + axis + " with inversion " + inversion + " rejected", rejected);
+            }
+        }
         var grid = new Grid(); grid.set(8, 4, 8, door(false, false, false));
         long before = TopologyService.sampleColumnFacts(grid, new BlockPos(8, 4, 8));
         grid.set(8, 4, 8, door(false, true, false));
@@ -249,10 +264,22 @@ final class DoorContracts {
             var wood = facts(room(false, false, false));
             for (int y = -1; y <= 1; y++) for (int z = -1; z <= 1; z++) for (int x = -1; x <= 1; x++)
                 publish(runtime, dimension, SectionPos.of(x, y, z), 1, (x | y | z) == 0 ? wood : BaseClusterTopology.PackedFacts.allAir());
-            for (boolean ability : new boolean[]{false, true, false, true}) check("runtime alternating capability " + ability,
-                    (query(runtime, dimension, ability).corridor() != null) == ability);
+            var goal = new BlockPos(12, 4, 8);
+            for (boolean ability : new boolean[]{false, true, false, true}) {
+                var result = query(runtime, dimension, ability);
+                var corridor = result.corridor();
+                boolean endsAtGoal = corridor != null
+                        && corridor.endpoints().get(corridor.endpoints().size() - 1).anchor().equals(goal);
+                check("runtime alternating capability " + ability, ability
+                        ? endsAtGoal && !corridor.partial()
+                        : corridor == null || corridor.partial() && !endsAtGoal && !result.completedFromCache());
+            }
             publish(runtime, dimension, SectionPos.of(0, 0, 0), 2, facts(room(false, true, false)));
-            check("semantic update invalidates enabled query", query(runtime, dimension, true).corridor() == null);
+            var changed = query(runtime, dimension, true);
+            var corridor = changed.corridor();
+            check("semantic update invalidates enabled query", !changed.completedFromCache()
+                    && (corridor == null || corridor.partial()
+                    && !corridor.endpoints().get(corridor.endpoints().size() - 1).anchor().equals(goal)));
         } finally { check("workers stop", runtime.awaitStopped(10, TimeUnit.SECONDS)); }
         var metrics = runtime.metrics();
         check("all door query resources released", metrics.activeReferences() == 0 && metrics.liveSearchDependencies() == 0

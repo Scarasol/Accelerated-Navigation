@@ -39,32 +39,6 @@ import java.util.function.Supplier;
 /** Owns worker-side derived topology, searches, and immutable publication state. */
 final class TopologyWorkerRuntime {
 
-    final RuntimeSharedTopology shared = new RuntimeSharedTopology(this);
-
-    void sharedTiming(boolean enabled) {
-        sharedTransition(() -> {
-            shared.timingEnabled = enabled;
-            taskExecutor.timingEnabled = enabled;
-            return null;
-        });
-    }
-    TopologyTaskExecutor.TaskTiming sharedTaskTiming() { return taskExecutor.currentTiming(); }
-    QueryScratch sharedQueryScratch() { return taskExecutor.currentQueryScratch(); }
-    Map<String, Long> sharedScratchMetrics() { return taskExecutor.scratchMetrics(); }
-    boolean sharedQueryMonitorHeld() { return taskExecutor.queryMonitorHeld(); }
-    <T> T sharedTransition(Supplier<T> command) { return runtimeTransition(false, command); }
-    boolean sharedStopping() { requireRuntimeLock(); return closed || stopRequested; }
-    void sharedAfter(Runnable work) { afterRuntimeLock(work); }
-    boolean sharedLockHeld() { return Thread.holdsLock(runtimeLock); }
-    <T> void sharedComplete(CompletableFuture<T> future, T value, Throwable failure) {
-        finishFuture(future, value, failure);
-    }
-    void submitSharedWork(Runnable work, Consumer<TopologyTaskExecutor.TaskHandle> accepted,
-                          Consumer<Throwable> rejected) {
-        submitOutsideRuntimeLock(() -> taskExecutor.submitSearch(NavigationScheduler.Priority.ACTIVE,
-                TopologyTaskExecutor.WorkKind.QUICK_SEARCH, work), accepted, rejected);
-    }
-
     private static final Direction[] DIRECTIONS = Direction.values();
     // One expansion can expose fourteen parent-boundary slots plus its two graph
     // dependencies.  This is a per-search live-wait limit, not a build quota.
@@ -77,6 +51,7 @@ final class TopologyWorkerRuntime {
     private static final int MAX_LOCAL_WITNESS_NODES = 512;
     private static final int MAX_FAST_SEARCH_NODES = 512;
     private static final int MAX_LONG_SEARCH_NODES = 256;
+    private static final int MAX_PRE_EXPANSION_REPREPARES = 2;
     private static final int MAX_PREWARM_ADMITTED = 8;
     // Approximate event-table metadata only; shared facts and requests are not counted twice.
     private static final long SECTION_EVENT_METADATA_BYTES = 96L;
@@ -492,8 +467,14 @@ final class TopologyWorkerRuntime {
     }
 
     void publishSection(SectionEvent event) {
-        boolean schedule;
-        synchronized (runtimeLock) {
+        runtimeTransition(false, () -> {
+            publishSectionLocked(event);
+            return null;
+        });
+    }
+
+    private void publishSectionLocked(SectionEvent event) {
+            requireRuntimeLock();
             if (closed || stopRequested) return;
             ClusterEntry entry = clusters.computeIfAbsent(event.key(), ClusterEntry::new);
             LatestFacts latest = entry.latest.get();
@@ -539,10 +520,10 @@ final class TopologyWorkerRuntime {
             // A correctness event has arrived; do not admit idle work until this
             // event and any state it coalesces with have been consumed.
             prewarmAllowed.set(false);
-            schedule = !eventTaskOutstanding;
-            if (schedule) eventTaskOutstanding = true;
-        }
-        if (schedule) scheduleEventTask();
+            if (!eventTaskOutstanding) {
+                eventTaskOutstanding = true;
+                afterRuntimeLock(this::scheduleEventTask);
+            }
     }
 
     private static boolean sameSectionEvent(@Nullable SectionEvent first,
@@ -841,7 +822,8 @@ final class TopologyWorkerRuntime {
                     || !pendingFactFeedback.isEmpty() || factClosingPending
                     || !pendingChunkUnloads.isEmpty() || !pendingRequestEvents.isEmpty()
                     || tickPending;
-            schedule = pending && !eventTaskOutstanding && !factClosingFinished;
+            schedule = pending && !eventTaskOutstanding
+                    && !factClosingFinished;
             if (schedule) eventTaskOutstanding = true;
         }
         if (schedule) scheduleEventTask();
@@ -1238,7 +1220,8 @@ final class TopologyWorkerRuntime {
             }
             clusters.clear();
             factClosingFinished = true;
-            if (pendingExecutorSubmissions == 0) afterRuntimeLock(taskExecutor::shutdown);
+            if (pendingExecutorSubmissions == 0)
+                afterRuntimeLock(taskExecutor::shutdown);
         });
     }
 
@@ -1351,9 +1334,22 @@ final class TopologyWorkerRuntime {
         ViewEntry view = entry.view(geometry);
         BaseClusterTopology ready = entry.topology(geometry);
         if (ready != null && ready.revision() == entry.revision) {
+            if(graphReuse.enabled()) {
+                graphReuse.mark("base.own",1);
+                graphReuse.baseChoice("OWN_GRAPH",dimension.location().toString(),section,ready.revision(),geometry,null);
+            }
             touchBase(view);
             if (waiter != null) waiter.complete(ready, null);
             return false;
+        }
+        if (view.demand == null && view.topology == null && waiter != null && !prewarm
+                && graphReuse.enabled() && GraphReuse.supported(geometry)) {
+            BaseClusterTopology shared = tryShareBase(entry, view);
+            if (shared != null) {
+                waiter.complete(shared, null);
+                evictBaseCache();
+                return false;
+            }
         }
         removeIdleBase(view);
         TopologyDemand demand = view.demand;
@@ -1522,15 +1518,17 @@ final class TopologyWorkerRuntime {
                                    SuperEntry expected,
                                    long attempt) {
         try {
-            BaseClusterTopology[] childSnapshot = runtimeTransition(
+            SuperBuildInput snapshot = runtimeTransition(
                     () -> beginSuperBuild(key, expected, attempt));
-            if (childSnapshot == null) return;
+            if (snapshot == null) return;
+            BaseClusterTopology[] childSnapshot = snapshot.children();
             SuperClusterTopology topology = SuperClusterTopology.build(
                     key.origin(),
                     childSnapshot,
                     key.geometry(),
                     key.movement(),
-                    buildScratch
+                    buildScratch,
+                    (a, b, face) -> resolveParentBoundary(key.dimension(), snapshot.boundaries(), a, b, face)
             );
             runRuntimeTransition(() -> publishSuperCluster(
                     key,
@@ -1547,9 +1545,9 @@ final class TopologyWorkerRuntime {
     }
 
     @Nullable
-    private BaseClusterTopology[] beginSuperBuild(SuperCacheKey key,
-                                                  SuperEntry expected,
-                                                  long attempt) {
+    private SuperBuildInput beginSuperBuild(SuperCacheKey key,
+                                           SuperEntry expected,
+                                           long attempt) {
         SuperEntry entry = superClusters.get(key);
         if (closed || entry != expected || entry.attempt != attempt
                 || entry.buildTask == null || entry.waiters.isEmpty()) {
@@ -1558,8 +1556,7 @@ final class TopologyWorkerRuntime {
         }
         BaseClusterTopology[] inputs = currentChildTopologies(key);
         List<ViewEntry> owners = inputs == null ? null : pinBaseInputs(key.dimension(), inputs);
-        List<SectionStamp> stamps = owners == null ? null
-                : mergeBaseStamps(key.dimension(), inputs);
+        Map<ClusterKey, SectionStamp> stamps = owners == null ? null : mergeBaseStamps(owners);
         if (owners == null || stamps == null) {
             if (owners != null) releaseBaseInputs(owners, inputs);
             entry.buildTask = null;
@@ -1570,8 +1567,150 @@ final class TopologyWorkerRuntime {
         entry.buildInputs = inputs;
         entry.buildInputAttempt = attempt;
         entry.buildInputOwners = owners;
-        entry.buildStamps = stamps;
-        return inputs;
+        entry.buildStamps = stamps.values().stream()
+                .sorted(Comparator.comparingLong(stamp -> stamp.key().section().asLong()))
+                .toList();
+        return new SuperBuildInput(inputs, captureParentBoundaries(key.geometry(), inputs, owners, stamps));
+    }
+
+    private record SuperBuildInput(BaseClusterTopology[] children,
+                                   Map<Integer, BoundaryEdgeInputs> boundaries) {}
+
+    private static final int PARENT_BOUNDARY_SLOTS = 14;
+    private static final int[][] PARENT_BOUNDARY_TARGETS = parentBoundaryTargets();
+    private static final Direction[] PARENT_BOUNDARY_FACES = {
+            Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST
+    };
+
+    private static int parentBoundaryChild(SectionPos section) {
+        return (section.x() & 1) | ((section.z() & 1) << 1) | ((section.y() & 1) << 2);
+    }
+
+    private static int[][] parentBoundaryTargets() {
+        List<SectionPos> children = SuperClusterTopology.childSections(SectionPos.of(0, 0, 0));
+        int[][] targets = new int[children.size()][PARENT_BOUNDARY_SLOTS];
+        for (SectionPos from : children) {
+            int[] slots = targets[parentBoundaryChild(from)];
+            Arrays.fill(slots, -1);
+            for (SectionPos to : children) {
+                int dx = to.x() - from.x(), dy = to.y() - from.y(), dz = to.z() - from.z();
+                Direction face = Math.abs(dx) + Math.abs(dz) == 1
+                        ? (dx != 0 ? (dx > 0 ? Direction.EAST : Direction.WEST)
+                                   : (dz > 0 ? Direction.SOUTH : Direction.NORTH))
+                        : dx == 0 && dz == 0 && dy != 0 ? (dy > 0 ? Direction.UP : Direction.DOWN) : null;
+                if (face != null) slots[baseLinkSlot(dy, face)] = parentBoundaryChild(to);
+            }
+        }
+        return targets;
+    }
+
+    private Map<Integer, BoundaryEdgeInputs> captureParentBoundaries(BaseClusterTopology.GeometryKey geometry,
+                                                                     BaseClusterTopology[] children,
+                                                                     List<ViewEntry> owners,
+                                                                     Map<ClusterKey, SectionStamp> stamps) {
+        requireRuntimeLock();
+        if (!graphReuse.enabled() || !GraphReuse.supported(geometry)) return Map.of();
+        Map<Integer, BoundaryEdgeInputs> captured = null;
+        for (int child = 0; child < children.length; child++) {
+            BaseClusterTopology from = children[child];
+            if (from.componentCount() == 0) continue;
+            ViewEntry owner = owners.get(child);
+            int[] targets = PARENT_BOUNDARY_TARGETS[child];
+            int ownSlots = 0;
+            for (int slot = 0; slot < targets.length; slot++) {
+                int target = targets[slot];
+                if (target < 0 || children[target].componentCount() == 0) continue;
+                var links = publishedBoundary(owner, slot, children[target], parentBoundaryFace(slot));
+                if (links == null) continue;
+                if (captured == null) captured = new HashMap<>();
+                captured.put(child * PARENT_BOUNDARY_SLOTS + slot, new BoundaryEdgeInputs(links, List.of()));
+                ownSlots |= 1 << slot;
+            }
+            if (owner.owner.views.size() == 1) continue;
+            // Only published slots for the captured children are considered, once per source view.
+            for (ViewEntry view : owner.owner.views.values()) {
+                if (view == owner || !GraphReuse.boundaryCompatible(view.geometry, geometry)) continue;
+                BaseClusterTopology donorFrom = null;
+                for (int slot = 0; slot < targets.length; slot++) {
+                    int target = targets[slot];
+                    if (target < 0 || (ownSlots & (1 << slot)) != 0 || view.links[slot] == null) continue;
+                    BaseClusterTopology to = children[target];
+                    if (to.componentCount() == 0) continue;
+                    ViewEntry donorTarget = owners.get(target).owner.views.get(view.geometry);
+                    if (donorTarget == null || donorTarget.topology == null) continue;
+                    BaseClusterTopology donorTo = donorTarget.topology;
+                    var links = publishedBoundary(view, slot, donorTo, parentBoundaryFace(slot));
+                    if (links == null || !links.hasEdges()) continue;
+                    if (donorFrom == null) {
+                        donorFrom = coveredParentDonor(view, from, stamps);
+                        if (donorFrom == null) break;
+                    }
+                    if (coveredParentDonor(donorTarget, to, stamps) == null) continue;
+                    if (captured == null) captured = new HashMap<>();
+                    int index = child * PARENT_BOUNDARY_SLOTS + slot;
+                    BoundaryEdgeInputs saved = captured.get(index);
+                    if (saved == null) {
+                        saved = new BoundaryEdgeInputs(null, new ArrayList<>());
+                        captured.put(index, saved);
+                    }
+                    saved.donors().add(new GraphReuse.BoundaryDonor(donorFrom, donorTo, links));
+                }
+            }
+        }
+        if (captured == null) return Map.of();
+        captured.replaceAll((index, inputs) -> inputs.own() == null
+                ? new BoundaryEdgeInputs(null, List.copyOf(inputs.donors())) : inputs);
+        return Map.copyOf(captured);
+    }
+
+    private static Direction parentBoundaryFace(int slot) {
+        return slot < 12 ? PARENT_BOUNDARY_FACES[slot / 3] : slot == 12 ? Direction.DOWN : Direction.UP;
+    }
+
+    @Nullable
+    private BaseClusterTopology coveredParentDonor(ViewEntry view, BaseClusterTopology target,
+                                                    Map<ClusterKey, SectionStamp> stamps) {
+        BaseClusterTopology donor = view.topology;
+        if (donor == null || donor.revision() != target.revision() || !view.owner.current()
+                || view.topologyValidity != view.validity || view.topologyStamps.isEmpty()) return null;
+        for (SectionStamp stamp : view.topologyStamps) {
+            SectionStamp covered = stamps.get(stamp.key());
+            // Exact fact identity (or absence of the same section), not merely equal revision numbers.
+            if (covered == null || covered.expected != stamp.expected) return null;
+        }
+        return donor;
+    }
+
+    private SuperClusterTopology.BoundaryLinks resolveParentBoundary(ResourceKey<Level> dimension,
+            Map<Integer, BoundaryEdgeInputs> captured, BaseClusterTopology from, BaseClusterTopology to,
+            Direction face) {
+        if (!graphReuse.enabled() || !GraphReuse.supported(from.geometry())
+                || from.componentCount() == 0 || to.componentCount() == 0)
+            return SuperClusterTopology.boundaryLinks(from, to, face);
+        int index = parentBoundaryChild(from.section()) * PARENT_BOUNDARY_SLOTS
+                + baseLinkSlot(from.section(), to.section(), face);
+        BoundaryEdgeInputs saved = captured.get(index);
+        List<GraphReuse.BoundaryDonor> donors = List.of();
+        if (saved != null) {
+            if (saved.own() != null) {
+                graphReuse.mark("boundary.parentInternal.ownGraph", 1);
+                return saved.own();
+            }
+            List<GraphReuse.BoundaryDonor> compatible = new ArrayList<>(saved.donors().size());
+            for (var donor : saved.donors()) {
+                if (from.boundaryFacts().preservesBoundaryFacts(donor.from().boundaryFacts())
+                        && to.boundaryFacts().preservesBoundaryFacts(donor.to().boundaryFacts())) {
+                    compatible.add(donor);
+                }
+            }
+            if (compatible.size() > 1) {
+                var order = GraphReuse.nearest(from.geometry(), false);
+                compatible.sort((a, b) -> order.compare(a.from().geometry(), b.from().geometry()));
+            }
+            donors = compatible;
+        }
+        var work = graphReuse.boundaryWork("boundary.parentInternal", dimension, from, to, face);
+        return SuperClusterTopology.boundaryLinks(from, to, face, donors, work);
     }
 
     private void publishSuperCluster(SuperCacheKey key,
@@ -1730,7 +1869,7 @@ final class TopologyWorkerRuntime {
         try {
             boolean captured = runtimeTransition(() -> beginBaseBoundaryBuild(key, expected));
             if (!captured) return;
-            SuperClusterTopology.BoundaryLinks links = SuperClusterTopology.boundaryLinks(
+            SuperClusterTopology.BoundaryLinks links = reuseBoundary(key.dimension(),"boundary.base",
                     key.source(),
                     key.target(),
                     key.face()
@@ -1956,8 +2095,10 @@ final class TopologyWorkerRuntime {
             SuperBoundaryBuildInput input = runtimeTransition(
                     () -> beginSuperBoundaryBuild(key, expected));
             if (input == null) return;
-            SuperClusterTopology.CrossingIndex links = key.source().crossingIndex(
-                    key.face(), key.target(), input.sourceChildren(), input.targetChildren());
+            SuperClusterTopology.CrossingIndex links = input.publishedSlots() == null
+                    ? key.source().crossingIndex(key.face(), key.target(), input.sourceChildren(), input.targetChildren())
+                    : key.source().crossingIndex(key.face(), key.target(), input.sourceChildren(), input.targetChildren(),
+                            (a,b,face) -> resolveSuperPrimitive(key, input, a, b, face));
             runRuntimeTransition(() -> publishSuperBoundaryLinks(key, expected, links));
         } catch (VirtualMachineError | ThreadDeath fatal) {
             throw fatal;
@@ -2001,7 +2142,66 @@ final class TopologyWorkerRuntime {
                     new StaleTopologyException("parent boundary children changed"));
             return null;
         }
-        return new SuperBoundaryBuildInput(source, target);
+        return new SuperBoundaryBuildInput(source, target,
+                capturePublishedSuperSlots(key, source, expected.baseInputOwners));
+    }
+
+    @Nullable
+    private int[] capturePublishedSuperSlots(SuperBoundaryCacheKey key, BaseClusterTopology[] source,
+                                              List<ViewEntry> inputOwners) {
+        requireRuntimeLock();
+        if (!graphReuse.enabled() || !GraphReuse.supported(key.source().geometry())) return null;
+        Direction face = key.face();
+        int relevant = 1 << baseLinkSlot(0, face);
+        if (face.getAxis().isVertical()) {
+            // Stacked parents can also meet at a horizontal primitive with a unit Y shift.
+            int dy = face.getStepY();
+            relevant |= 1 << baseLinkSlot(dy, Direction.NORTH) | 1 << baseLinkSlot(dy, Direction.EAST)
+                    | 1 << baseLinkSlot(dy, Direction.SOUTH) | 1 << baseLinkSlot(dy, Direction.WEST);
+        } else {
+            relevant |= relevant << 1 | relevant >>> 1;
+        }
+        SectionPos origin = key.source().origin();
+        int edge = face.getAxisDirection() == Direction.AxisDirection.POSITIVE
+                ? SuperClusterTopology.CHILDREN_PER_AXIS - 1 : 0;
+        int[] result = null;
+        for (int i = 0; i < source.length; i++) {
+            SectionPos section = source[i].section();
+            if (source[i].componentCount() == 0 || face.getAxis().choose(
+                    section.x() - origin.x(), section.y() - origin.y(), section.z() - origin.z()) != edge) continue;
+            ViewEntry own = inputOwners.get(i);
+            int pending = relevant;
+            for (ViewEntry view : own.owner.views.values()) {
+                for (int bits = pending; bits != 0; bits &= bits - 1) {
+                    int slot = Integer.numberOfTrailingZeros(bits);
+                    var link = view.links[slot];
+                    if (link != null && !link.retired && link.value != null
+                            && (view == own || link.value.hasEdges())) {
+                        pending &= ~(1 << slot);
+                    }
+                }
+                if (pending == 0) break;
+            }
+            if (pending != relevant) {
+                if (result == null) result = new int[source.length];
+                result[i] = relevant & ~pending;
+            }
+        }
+        return result;
+    }
+
+    private SuperClusterTopology.BoundaryLinks resolveSuperPrimitive(
+            SuperBoundaryCacheKey key, SuperBoundaryBuildInput input,
+            BaseClusterTopology from, BaseClusterTopology to, Direction face) {
+        SectionPos origin = key.source().origin(), section = from.section();
+        int size = SuperClusterTopology.CHILDREN_PER_AXIS;
+        int child = section.x() - origin.x() + size * (section.z() - origin.z() + size * (section.y() - origin.y()));
+        int slot = baseLinkSlot(section, to.section(), face);
+        if ((input.publishedSlots()[child] & (1 << slot)) == 0) {
+            // A later publication may help a later build. Absence never decides reachability.
+            return SuperClusterTopology.boundaryLinks(from, to, face);
+        }
+        return reuseBoundary(key.dimension(), "boundary.superExternal", from, to, face);
     }
 
     private void publishSuperBoundaryLinks(
@@ -2085,6 +2285,10 @@ final class TopologyWorkerRuntime {
     }
 
     private static int baseLinkSlot(SectionPos source, SectionPos target, Direction face) {
+        return baseLinkSlot(target.y() - source.y(), face);
+    }
+
+    private static int baseLinkSlot(int yShift, Direction face) {
         if (face.getAxis().isVertical()) return face == Direction.DOWN ? 12 : 13;
         int direction = switch (face) {
             case NORTH -> 0;
@@ -2093,7 +2297,6 @@ final class TopologyWorkerRuntime {
             case WEST -> 3;
             default -> throw new IllegalArgumentException("horizontal face required");
         };
-        int yShift = target.y() - source.y();
         if (yShift < -1 || yShift > 1) {
             throw new IllegalArgumentException("horizontal boundary Y shift is outside -1..1");
         }
@@ -2715,20 +2918,15 @@ final class TopologyWorkerRuntime {
     }
 
     @Nullable
-    private List<SectionStamp> mergeBaseStamps(ResourceKey<Level> dimension,
-                                                BaseClusterTopology[] topologies) {
+    private Map<ClusterKey, SectionStamp> mergeBaseStamps(List<ViewEntry> owners) {
         Map<ClusterKey, SectionStamp> merged = new HashMap<>();
-        for (BaseClusterTopology topology : topologies) {
-            ViewEntry owner = baseView(dimension, topology);
-            if (owner == null || owner.topologyStamps.isEmpty()
-                    || !isCurrent(owner.topologyStamps)) return null;
+        for (ViewEntry owner : owners) {
+            if (owner.topologyStamps.isEmpty() || !isCurrent(owner.topologyStamps)) return null;
             for (SectionStamp stamp : owner.topologyStamps) {
                 merged.put(stamp.key(), stamp);
             }
         }
-        return merged.values().stream()
-                .sorted(Comparator.comparingLong(stamp -> stamp.key().section().asLong()))
-                .toList();
+        return merged;
     }
 
     /** Captures a built base view and the exact live facts identities that produced it. */
@@ -2931,7 +3129,6 @@ final class TopologyWorkerRuntime {
         synchronized (runtimeLock) {
             if (closed || stopRequested) return;
             stopRequested = true;
-            shared.ownerOpen.set(false);
             stopEventPending = true;
             recordPendingEvent();
             schedule = !eventTaskOutstanding;
@@ -2944,7 +3141,10 @@ final class TopologyWorkerRuntime {
         beginStopping();
         finishFactClosing();
         boolean stopped = taskExecutor.awaitTermination(timeout, unit);
-        if (stopped) buildScratch.clearCachedRows();
+        if (stopped) {
+            buildScratch.clearCachedRows();
+            graphReuse.clear();
+        }
         return stopped;
     }
 
@@ -2954,7 +3154,7 @@ final class TopologyWorkerRuntime {
             return;
         }
         closed = true;
-        shared.close();
+        graphReuse.clear();
         stopEventPending = false;
         IllegalStateException stopped = new IllegalStateException("topology service stopped");
         for (MacroRequest request : List.copyOf(macroRequests)) {
@@ -3008,17 +3208,158 @@ final class TopologyWorkerRuntime {
         superRetainedBytes = 0L;
     }
 
+    private final GraphReuse graphReuse = new GraphReuse(!Boolean.getBoolean("an.reuse.exactColdControl"));
+    Map<String,Long> graphReuseCounts() { return graphReuse.counts(); }
+    List<GraphReuse.Choice> drainGraphReuseChoices() { return graphReuse.drainChoices(); }
+
+    @Nullable
+    private BaseClusterTopology tryShareBase(ClusterEntry entry, ViewEntry target) {
+        requireRuntimeLock();
+        if (!entry.current() || entry.views.size() <= 1) return null;
+        var geometry = target.geometry;
+        String dimension = entry.key.dimension().location().toString();
+        var ordered = entry.views.keySet().stream()
+                .filter(g -> !g.equals(geometry) && GraphReuse.supported(g)
+                        && GraphReuse.preferredRows(g, geometry))
+                .sorted(GraphReuse.nearest(geometry, true)).toList();
+        for (var key : ordered) {
+            var donor = entry.topology(key);
+            if (donor == null || donor.revision() != entry.revision) continue;
+            var owner = entry.views.get(key);
+            if (!isCurrent(owner.topologyStamps) || !haloCurrent(entry.key, donor)) continue;
+            String gap = donor.topologySharingGap(geometry);
+            if (gap != null) {
+                graphReuse.baseChoice("SHARE_GAP_" + gap, dimension, entry.key.section(), entry.revision,
+                        geometry, donor.reusableRows);
+                return null; // Let the worker repair the nearest eligible graph.
+            }
+            // Same required halo domain for these one-cell ground views. The
+            // donor owns immutable, stamped facts even if the fact cache evicts.
+            var shared = donor.sharedTopology(geometry);
+            installBase(target, shared, owner.topologyStamps);
+            graphReuse.mark("base.topologyShared", 1);
+            graphReuse.baseChoice("SHARED_TOPOLOGY", dimension, entry.key.section(), entry.revision,
+                    geometry, donor.reusableRows);
+            return shared;
+        }
+        return null;
+    }
+
+    private GraphReuse.Rows rowDonor(TopologyDemand demand, BaseClusterTopology.BuildInput input) {
+        var entry=clusters.get(demand.key);
+        if(entry==null || !entry.current() || entry.revision!=demand.generation || !GraphReuse.supported(demand.geometry))
+            return null;
+        long start=graphReuse.diagnostics()?System.nanoTime():0;
+        var ordered=entry.views.keySet().stream().sorted(GraphReuse.nearest(demand.geometry,true)).toList();
+        if(start!=0) graphReuse.mark("base.donorOrderNanos",System.nanoTime()-start);
+        GraphReuse.Rows dataOnly = null;
+        for(var geometry:ordered) {
+            if(geometry.equals(demand.geometry)) continue;
+            var topology=entry.topology(geometry);
+            if(topology!=null && input.acceptsRowDonor(topology.reusableRows,demand.generation,demand.geometry)) {
+                if (dataOnly == null) dataOnly = topology.reusableRows;
+                if (!GraphReuse.preferredRows(geometry, demand.geometry)) break;
+                if (topology.matchesLocalRepairFacts(input, demand.geometry)) {
+                    demand.localDonor = topology;
+                    return topology.reusableRows;
+                }
+            }
+        }
+        return dataOnly;
+    }
+
+    private SuperClusterTopology.BoundaryLinks reuseBoundary(ResourceKey<Level> dimension, String consumer,
+            BaseClusterTopology from,BaseClusterTopology to,Direction face) {
+        if(!graphReuse.enabled() || !GraphReuse.supported(from.geometry())
+                || from.componentCount()==0 || to.componentCount()==0)
+            return SuperClusterTopology.boundaryLinks(from,to,face);
+        var inputs = runtimeTransition(() -> captureBoundaryEdges(dimension, from, to, face));
+        if (inputs.own() != null) {
+            graphReuse.mark(consumer + ".ownGraph", 1);
+            return inputs.own();
+        }
+        var work = graphReuse.boundaryWork(consumer, dimension, from, to, face);
+        return SuperClusterTopology.boundaryLinks(from, to, face, inputs.donors(), work);
+    }
+
+    private record BoundaryEdgeInputs(SuperClusterTopology.BoundaryLinks own,
+                                      List<GraphReuse.BoundaryDonor> donors) {
+        private static final BoundaryEdgeInputs NONE = new BoundaryEdgeInputs(null, List.of());
+    }
+
+    private BoundaryEdgeInputs captureBoundaryEdges(ResourceKey<Level> dimension, BaseClusterTopology from,
+                                                     BaseClusterTopology to, Direction face) {
+        requireRuntimeLock();
+        var left = clusters.get(new ClusterKey(dimension, from.section()));
+        var right = clusters.get(new ClusterKey(dimension, to.section()));
+        var targetGeometry = from.geometry();
+        if (left == null || right == null || left.topology(targetGeometry) != from
+                || right.topology(targetGeometry) != to) return BoundaryEdgeInputs.NONE;
+        int slot = baseLinkSlot(from.section(), to.section(), face);
+        var own = publishedBoundary(left.views.get(targetGeometry), slot, to, face);
+        if (own != null) return new BoundaryEdgeInputs(own, List.of());
+        if (left.views.size() <= 1 || right.views.size() <= 1) return BoundaryEdgeInputs.NONE;
+        List<GraphReuse.BoundaryDonor> donors = null;
+        for (var candidate : left.views.values()) {
+            var geometry = candidate.geometry;
+            if (geometry.equals(targetGeometry) || !GraphReuse.boundaryCompatible(geometry, targetGeometry)
+                    || candidate.links[slot] == null) continue;
+            var donorTo = right.topology(geometry);
+            if (donorTo == null || donorTo.revision() != to.revision()) continue;
+            var links = publishedBoundary(candidate, slot, donorTo, face);
+            if (links == null || !links.hasEdges()) continue;
+            var donorFrom = left.topology(geometry);
+            if (donorFrom == null || donorFrom.revision() != from.revision()
+                    || !from.boundaryFacts().preservesBoundaryFacts(donorFrom.boundaryFacts())
+                    || !to.boundaryFacts().preservesBoundaryFacts(donorTo.boundaryFacts())) continue;
+            if (donors == null) donors = new ArrayList<>();
+            donors.add(new GraphReuse.BoundaryDonor(donorFrom, donorTo, links));
+        }
+        if (donors == null) return BoundaryEdgeInputs.NONE;
+        if (donors.size() > 1) {
+            var order = GraphReuse.nearest(targetGeometry, false);
+            donors.sort((a, b) -> order.compare(a.from().geometry(), b.from().geometry()));
+        }
+        return new BoundaryEdgeInputs(null, donors);
+    }
+
+    @Nullable
+    private static SuperClusterTopology.BoundaryLinks publishedBoundary(ViewEntry owner, int slot,
+                                                                         BaseClusterTopology target,
+                                                                         Direction face) {
+        var entry = owner.links[slot];
+        return entry == null || entry.retired || entry.targetSignature != target.signature()
+                || entry.value == null || entry.value.face() != face ? null : entry.value;
+    }
+
     private void build(TopologyDemand demand) {
         try {
             BaseClusterTopology.BuildInput input = runtimeTransition(() -> beginBuild(demand));
             if (input == null) return;
+            if (demand.localDonor != null) {
+                var topology = demand.localDonor.repairLocal(input, demand.geometry, buildScratch,
+                        graphReuse, demand.key.dimension().location().toString());
+                runRuntimeTransition(() -> publish(demand, topology));
+                return;
+            }
             BaseClusterTopology topology = BaseClusterTopology.build(
                     demand.key.section(),
                     demand.generation,
                     input,
                     demand.geometry,
-                    buildScratch
+                    buildScratch,
+                    demand.rowDonor,
+                    graphReuse
             );
+            if(graphReuse.enabled()) {
+                var donor=demand.rowDonor;
+                String kind=donor==null?"EXACT_BUILD"
+                        :GraphReuse.preferredRows(donor.geometry,demand.geometry)?"EQUAL_ROWS_PREFERRED":"EQUAL_ROWS_FALLBACK";
+                graphReuse.mark(donor==null?"base.cold":"base.donor",1);
+                graphReuse.mark("base."+kind,1);
+                graphReuse.baseChoice(kind,demand.key.dimension().location().toString(),demand.key.section(),
+                        demand.generation,demand.geometry,donor);
+            }
             runRuntimeTransition(() -> publish(demand, topology));
         } catch (VirtualMachineError | ThreadDeath fatal) {
             throw fatal;
@@ -3070,6 +3411,8 @@ final class TopologyWorkerRuntime {
             }
         }
         demand.buildStamps = List.copyOf(stamps);
+        demand.localDonor = null;
+        demand.rowDonor = graphReuse.enabled() ? rowDonor(demand,input) : null;
         return input;
     }
 
@@ -3105,19 +3448,23 @@ final class TopologyWorkerRuntime {
             retireBaseTopology(view);
             view.topology = null;
         }
-        view.topology = topology;
-        changeTopologyFactReferences(topology, 0, 1);
+        installBase(view, topology, topologyStamps);
         releaseHeldFacts(demand);
-        view.topologyStamps = topologyStamps;
-        view.topologyValidity = view.validity;
-        view.handoffUntilTick = topologyTick + 1L;
-        baseHandoffs.add(view);
         if (replaced != null) {
             invalidateSuperParents(key, false,
                     parent -> parent.geometry().equals(demand.geometry));
         }
         completeDemand(entry, demand, topology);
         evictBaseCache();
+    }
+
+    private void installBase(ViewEntry view, BaseClusterTopology topology, List<SectionStamp> stamps) {
+        view.topology = topology;
+        changeTopologyFactReferences(topology, 0, 1);
+        view.topologyStamps = stamps;
+        view.topologyValidity = view.validity;
+        view.handoffUntilTick = topologyTick + 1L;
+        baseHandoffs.add(view);
     }
 
     private void failBuild(TopologyDemand demand, Throwable exception) {
@@ -3743,7 +4090,9 @@ final class TopologyWorkerRuntime {
 
     private void retireBaseTopology(ViewEntry view) {
         removeIdleBase(view);
-        if (view.topology != null) changeTopologyFactReferences(view.topology, 0, -1);
+        if (view.topology != null) {
+            changeTopologyFactReferences(view.topology, 0, -1);
+        }
         baseHandoffs.remove(view);
         view.topologyStamps = List.of();
     }
@@ -4056,6 +4405,8 @@ final class TopologyWorkerRuntime {
         private NavigationScheduler.Priority priority = NavigationScheduler.Priority.BACKGROUND;
         private TopologyTaskExecutor.TaskHandle buildTask = UNTRACKED_TASK;
         private long fingerprint;
+        private GraphReuse.Rows rowDonor;
+        private BaseClusterTopology localDonor;
         private boolean prewarmSlot;
 
         private TopologyDemand(ClusterKey key,
@@ -4220,7 +4571,8 @@ final class TopologyWorkerRuntime {
     }
 
     private record SuperBoundaryBuildInput(BaseClusterTopology[] sourceChildren,
-                                           BaseClusterTopology[] targetChildren) {
+                                           BaseClusterTopology[] targetChildren,
+                                           @Nullable int[] publishedSlots) {
     }
 
     private final class LinkEntry<T> {
@@ -4273,7 +4625,8 @@ final class TopologyWorkerRuntime {
     private void joinResolved(MacroRequest request,
                               CandidateResolution starts,
                               CandidateResolution goals, List<SectionStamp> stamps) {
-        if (starts.candidates.isEmpty() || goals.candidates.isEmpty()) {
+        if (starts.candidates.isEmpty() || goals.candidates.isEmpty()
+                && goals.unavailable != null && goals.unavailableFailure != MacroSearch.Failure.UNAVAILABLE_CHUNK) {
             CandidateResolution missing = starts.candidates.isEmpty() ? starts : goals;
             MacroSearch.Failure failure = missing.unavailable == null
                     ? MacroSearch.Failure.NO_STRUCTURAL_ROUTE
@@ -4284,7 +4637,8 @@ final class TopologyWorkerRuntime {
             request.finish(null, failure, blocked, stamps);
             return;
         }
-        boolean hierarchical = !request.forceBaseSearch
+        request.resolvedStamps = List.copyOf(stamps);
+        boolean hierarchical = !goals.candidates.isEmpty() && !request.forceBaseSearch
                 && shouldUseSuperGraph(starts.candidates, goals.candidates)
                 && endpointParentsAvailable(request.dimension, starts.candidates)
                 && endpointParentsAvailable(request.dimension, goals.candidates);
@@ -4297,12 +4651,13 @@ final class TopologyWorkerRuntime {
                                boolean hierarchical) {
         MacroQueryKey key = new MacroQueryKey(request.dimension, request.channel,
                 request.profile, hierarchical, Float.floatToRawIntBits(request.weight),
-                starts, goals);
+                starts, goals, request.goalPosition);
         joinCanonical(request, key);
     }
 
     private void joinCanonical(MacroRequest request, MacroQueryKey key) {
-        CachedCorridor cached = completedCorridors.get(key);
+        MacroQueryKey cacheKey = key.corridorKey();
+        CachedCorridor cached = completedCorridors.get(cacheKey);
         if (cached != null) {
             replayCompletedCorridor(request, key, cached);
             return;
@@ -4340,7 +4695,7 @@ final class TopologyWorkerRuntime {
             runRuntimeTransition(() -> {
                 if (!request.active) return;
                 if (!current) {
-                    if (completedCorridors.remove(key, cached)) {
+                    if (completedCorridors.remove(key.corridorKey(), cached)) {
                         completedCorridorBytes -= cached.retainedBytes;
                     }
                     joinCanonical(request, key);
@@ -4388,8 +4743,12 @@ final class TopologyWorkerRuntime {
     }
 
     private void retryStaleRequest(MacroRequest request) {
+        retryStaleRequest(request, false);
+    }
+
+    private void retryStaleRequest(MacroRequest request, boolean preExpansionStale) {
         try {
-            request.retryStale();
+            request.retryStale(preExpansionStale);
         } catch (VirtualMachineError | ThreadDeath fatal) {
             throw fatal;
         } catch (Throwable failure) {
@@ -4406,6 +4765,7 @@ final class TopologyWorkerRuntime {
         private List<SectionStamp> failedInputs = List.of();
         private Map<SectionPos, Long> requestedLoads = Map.of();
         private TopologyTaskExecutor.TaskHandle task = UNTRACKED_TASK;
+        private long taskGeneration;
         private NavigationScheduler.Priority priority = NavigationScheduler.Priority.BACKGROUND;
         private boolean fallbackStart;
         private boolean fallbackGoal;
@@ -4485,18 +4845,24 @@ final class TopologyWorkerRuntime {
                 pinBase(owner, topology);
                 captured.add(new EndpointTopology(topology, owner, owner.validity));
             }
-            held = List.copyOf(captured);
+            List<EndpointTopology> input = List.copyOf(captured);
+            held = input;
             failedInputs = List.copyOf(failures);
+            // A completed attempt can submit fallback before its handle is registered.
+            long generation = ++taskGeneration;
             task = SUBMITTING_TASK;
             submitOutsideRuntimeLock(
                     () -> taskExecutor.submitSearch(priority,
                             TopologyTaskExecutor.WorkKind.QUICK_SEARCH,
-                            () -> resolveOnWorker(held, Map.copyOf(factFailures))),
+                            () -> resolveOnWorker(generation, input, Map.copyOf(factFailures))),
                     submitted -> {
-                        if (task != SUBMITTING_TASK || resolveFlights.get(key) != this
+                        if (generation != taskGeneration || task != SUBMITTING_TASK
+                                || resolveFlights.get(key) != this
                                 || waiters.isEmpty()) {
                             afterRuntimeLock(() -> submitted.cancelWhenQueued(cancelled -> {
-                                if (cancelled) runRuntimeTransition(this::releaseHeld);
+                                if (cancelled) runRuntimeTransition(() -> {
+                                    if (generation == taskGeneration) releaseHeld();
+                                });
                             }));
                             return;
                         }
@@ -4504,6 +4870,7 @@ final class TopologyWorkerRuntime {
                         afterRuntimeLock(() -> submitted.reprioritize(priority));
                     },
                     rejected -> {
+                        if (generation != taskGeneration) return;
                         if (task != SUBMITTING_TASK) {
                             if (waiters.isEmpty()) releaseHeld();
                             return;
@@ -4514,7 +4881,7 @@ final class TopologyWorkerRuntime {
                     });
         }
 
-        private void resolveOnWorker(List<EndpointTopology> input,
+        private void resolveOnWorker(long generation, List<EndpointTopology> input,
                                      Map<SectionPos, MacroSearch.Unavailability> factFailures) {
             try {
                 Map<Long, BaseClusterTopology> topologies = new HashMap<>(input.size());
@@ -4524,15 +4891,16 @@ final class TopologyWorkerRuntime {
                         key.channel, topologies, factFailures);
                 CandidateResolution goals = resolveEndpoint(key.goal, fallbackGoal,
                         key.channel, topologies, factFailures);
-                runRuntimeTransition(() -> resolved(starts, goals));
+                runRuntimeTransition(() -> resolved(generation, starts, goals));
             } catch (VirtualMachineError | ThreadDeath fatal) {
                 throw fatal;
             } catch (Throwable failure) {
-                runRuntimeTransition(() -> resolutionFailed(failure));
+                runRuntimeTransition(() -> resolutionFailed(generation, failure));
             }
         }
 
-        private void resolutionFailed(Throwable failure) {
+        private void resolutionFailed(long generation, Throwable failure) {
+            if (generation != taskGeneration) return;
             task = UNTRACKED_TASK;
             releaseHeld();
             if (resolveFlights.get(key) == this && !waiters.isEmpty()) {
@@ -4540,7 +4908,8 @@ final class TopologyWorkerRuntime {
             }
         }
 
-        private void resolved(CandidateResolution starts, CandidateResolution goals) {
+        private void resolved(long generation, CandidateResolution starts, CandidateResolution goals) {
+            if (generation != taskGeneration) return;
             task = UNTRACKED_TASK;
             List<SectionStamp> stamps = new ArrayList<>(failedInputs);
             held.forEach(input -> stamps.addAll(input.owner.topologyStamps));
@@ -4703,11 +5072,13 @@ final class TopologyWorkerRuntime {
         private final NavigationScheduler.Priority priority;
         private final float weight;
         private CompletableFuture<WorkerResult> future = new CompletableFuture<>();
+        private List<SectionStamp> resolvedStamps = List.of();
 
         private boolean active = true;
         private boolean cancelPublished;
         private boolean completedFromCache;
         private boolean forceBaseSearch;
+        private int preExpansionReprepares;
         private int staleRetries;
         private long attempt = 1L;
         private ResolveFlight resolver;
@@ -4802,7 +5173,7 @@ final class TopologyWorkerRuntime {
             RequestProgress currentProgress = progress;
             MacroSearch.Failure outcome = resultFailure == null
                     ? result == null ? currentProgress.current.value.failure()
-                    : MacroSearch.Failure.NONE
+                    : result.partialFailure()
                     : resultFailure;
             currentProgress.current.value = currentProgress.current.value.withOutcome(
                     result == null ? Status.FAILED : Status.SUCCEEDED,
@@ -4843,23 +5214,27 @@ final class TopologyWorkerRuntime {
             afterRuntimeLock(() -> future.cancel(false));
         }
 
-        private void retryStale() {
+        private void retryStale(boolean preExpansionStale) {
             if (!active) return;
             workerStaleResults++;
             RequestProgress previous = progress;
             MacroSearch.Progress stale = previous.current.value.withOutcome(Status.FAILED,
                     MacroSearch.Failure.STALE_WORLD,
                     previous.current.value.blockedSection());
-            if (staleRetries == 0) {
-                staleRetries = 1;
-                automaticStaleRetries++;
+            if (preExpansionStale ? preExpansionReprepares < MAX_PRE_EXPANSION_REPREPARES : staleRetries == 0) {
+                if (preExpansionStale) {
+                    preExpansionReprepares++;
+                } else {
+                    staleRetries = 1;
+                    automaticStaleRetries++;
+                }
                 progress = new RequestProgress(stale.after(previous.completed),
                         new ProgressHolder());
                 completedFromCache = false;
                 attempt++;
                 joinResolve(this);
             } else {
-                staleRetryExhaustions++;
+                if (!preExpansionStale) staleRetryExhaustions++;
                 previous.current.value = stale;
                 finish(null, MacroSearch.Failure.STALE_WORLD,
                         stale.blockedSection(), List.of());
@@ -4903,6 +5278,7 @@ final class TopologyWorkerRuntime {
                     key,
                     this::requestResume
             );
+            representative.resolvedStamps.forEach(stamp -> query.usedSections.put(stamp.key(), stamp));
             resume();
         }
 
@@ -4968,32 +5344,84 @@ final class TopologyWorkerRuntime {
                     },
                     failure -> {
                         if (generation != taskGeneration || searchTask != SUBMITTING_TASK) return;
-                        completeWorker(generation, null, failure);
+                        completeWorker(generation, null, failure, 0, false);
                     });
         }
 
         private void runWorkerTask(long generation, int budget) {
-            ResumableSearch.Status status = null;
-            Throwable failure = null;
-            try {
-                status = query.runWorkerSlice(budget);
-                progress.value = query.progress();
-                if (status == ResumableSearch.Status.RUNNING
-                        && requeueWorkerContinuation(generation, budget)) {
+            int remaining = budget;
+            for (;;) {
+                ResumableSearch.Status status = null;
+                Throwable failure = null;
+                try {
+                    status = query.runWorkerSlice(remaining);
+                    progress.value = query.progress();
+                    if (status == ResumableSearch.Status.RUNNING) {
+                        if (requeueWorkerContinuation(generation, remaining)) return;
+                        remaining -= query.lastWorkerExpanded;
+                    }
+                    if (status == ResumableSearch.Status.SUCCEEDED) {
+                        query.prepareWorkerResult();
+                    }
+                } catch (VirtualMachineError | ThreadDeath fatal) {
+                    throw fatal;
+                } catch (Throwable exception) {
+                    failure = exception;
+                }
+                ResumableSearch.Status resultStatus = status;
+                Throwable resultFailure = failure;
+                int unusedBudget = remaining;
+                boolean ready = runtimeTransition(() -> completeWorker(
+                        generation, resultStatus, resultFailure, unusedBudget, true));
+                if (!ready) return;
+                // The runtime transition has released its lock before consulting the executor.
+                if (!taskExecutor.canContinueReadySearch()) {
+                    runRuntimeTransition(() -> yieldReadyContinuation(generation, unusedBudget));
                     return;
                 }
-                if (status == ResumableSearch.Status.SUCCEEDED) {
-                    query.prepareWorkerResult();
+            }
+        }
+
+        private void yieldReadyContinuation(long generation, int remainingBudget) {
+            requireRuntimeLock();
+            // The accepted callback may replace SUBMITTING_TASK without advancing this generation.
+            if (generation != taskGeneration) return;
+            if (query == null) {
+                searchTask = UNTRACKED_TASK;
+                return;
+            }
+            if (macroFlights.get(key) != this || waiters.isEmpty() || query.cancelRequested) {
+                searchTask = UNTRACKED_TASK;
+                query.requestCancel();
+                query.finishOnOwner();
+                return;
+            }
+            try {
+                query.drainDeferredGraphs();
+                if (query.recoveryPreparationPending) {
+                    searchTask = UNTRACKED_TASK;
+                    query.preparePendingRecovery();
+                    resume();
+                    return;
                 }
+                if (query.needsDependencyResolution()) {
+                    query.requestPendingSections();
+                    if (query.waitingForBuild()) {
+                        searchTask = UNTRACKED_TASK;
+                        return;
+                    }
+                }
+                if (remainingBudget <= 0 && !query.needsDependencyResolution()) {
+                    query.longContinuation = true;
+                }
+                searchTask = UNTRACKED_TASK;
+                resume();
             } catch (VirtualMachineError | ThreadDeath fatal) {
                 throw fatal;
-            } catch (Throwable exception) {
-                failure = exception;
+            } catch (Throwable failure) {
+                searchTask = UNTRACKED_TASK;
+                failSearch(failure);
             }
-            ResumableSearch.Status resultStatus = status;
-            Throwable resultFailure = failure;
-            runRuntimeTransition(() -> completeWorker(
-                    generation, resultStatus, resultFailure));
         }
 
         private boolean requeueWorkerContinuation(long generation, int completedBudget) {
@@ -5022,55 +5450,63 @@ final class TopologyWorkerRuntime {
             runRuntimeTransition(() -> completeWorker(
                     nextGeneration,
                     null,
-                    new RejectedExecutionException("topology worker continuation rejected")
+                    new RejectedExecutionException("topology worker continuation rejected"),
+                    0,
+                    false
             ));
             return true;
         }
 
-        private void completeWorker(long generation,
-                                    @Nullable ResumableSearch.Status status,
-                                    @Nullable Throwable searchFailure) {
+        private boolean completeWorker(long generation,
+                                       @Nullable ResumableSearch.Status status,
+                                       @Nullable Throwable searchFailure,
+                                       int remainingBudget,
+                                       boolean allowInline) {
             requireRuntimeLock();
             if (generation != taskGeneration) {
-                return;
+                return false;
             }
+            TopologyTaskExecutor.TaskHandle runningTask = searchTask;
             searchTask = UNTRACKED_TASK;
             if (macroFlights.get(key) != this || waiters.isEmpty()) {
                 query.requestCancel();
                 query.finishOnOwner();
-                return;
+                return false;
             }
             try {
                 query.drainDeferredGraphs();
                 if (searchFailure != null) {
                     failSearch(searchFailure);
-                    return;
+                    return false;
                 }
                 if (status == null) {
                     IllegalStateException failure =
                             new IllegalStateException("worker returned no search status");
                     query.failFromWorker(failure);
                     complete(null, failure);
-                    return;
+                    return false;
                 }
                 if (status == ResumableSearch.Status.RUNNING) {
                     if (query.recoveryPreparationPending) {
                         query.preparePendingRecovery();
                         resume();
-                        return;
+                        return false;
                     }
                     if (query.needsDependencyResolution()) {
                         query.requestPendingSections();
-                        if (query.waitingForBuild()) return;
+                        if (query.waitingForBuild()) return false;
+                        if (allowInline && remainingBudget > 0 && runningTask != UNTRACKED_TASK
+                                && searchTask == UNTRACKED_TASK && generation == taskGeneration
+                                && query.readyForInlineContinuation()) {
+                            searchTask = runningTask;
+                            return true;
+                        }
                     }
-                    int completedBudget = query.longContinuation
-                            ? MAX_LONG_SEARCH_NODES : MAX_FAST_SEARCH_NODES;
-                    if (query.lastWorkerExpanded >= completedBudget
-                            && !query.needsDependencyResolution()) {
+                    if (remainingBudget <= 0 && !query.needsDependencyResolution()) {
                         query.longContinuation = true;
                     }
                     resume();
-                    return;
+                    return false;
                 }
                 query.finishOnOwner();
                 complete(
@@ -5086,6 +5522,7 @@ final class TopologyWorkerRuntime {
                 }
                 failSearch(failure);
             }
+            return false;
         }
 
         private void failSearch(Throwable searchFailure) {
@@ -5191,15 +5628,18 @@ final class TopologyWorkerRuntime {
             waiters.clear();
             completing.forEach(waiter -> waiter.flight = null);
             List<SectionStamp> stamps;
+            boolean preExpansionStale;
             try {
                 query.finishMeasurement();
                 progress.value = query.progress();
                 stamps = corridor == null ? List.copyOf(query.usedSections.values()) : query.resultStamps();
+                preExpansionStale = corridor == null && query.preExpansionStale
+                        && query.failure == MacroSearch.Failure.STALE_WORLD;
                 if (searchFailure == null && query.failure != MacroSearch.Failure.CANCELLED
                         && (!isCurrent(stamps) || corridor != null && !query.resultCurrentAtWorkerCompletion())) {
                     progress.value = progress.value.withOutcome(Status.FAILED,
                             MacroSearch.Failure.STALE_WORLD, progress.value.blockedSection());
-                    completing.forEach(TopologyWorkerRuntime.this::retryStaleRequest);
+                    completing.forEach(waiter -> retryStaleRequest(waiter, preExpansionStale));
                     return;
                 }
                 if (searchFailure == null && corridor != null) {
@@ -5217,7 +5657,7 @@ final class TopologyWorkerRuntime {
                     waiter.finishExceptionally(searchFailure);
                 } else if (corridor == null) {
                     if (query.failure == MacroSearch.Failure.STALE_WORLD) {
-                        retryStaleRequest(waiter);
+                        retryStaleRequest(waiter, preExpansionStale);
                     }
                     else {
                         waiter.finish(null, query.failure, query.blockedSection(), stamps);
@@ -5234,9 +5674,10 @@ final class TopologyWorkerRuntime {
                                         MacroSearch.Corridor corridor,
                                         List<SectionStamp> stamps,
                                         long bytes) {
-        if (bytes > MAX_COMPLETED_CORRIDOR_BYTES) {
+        if (corridor.partial() || bytes > MAX_COMPLETED_CORRIDOR_BYTES) {
             return;
         }
+        key = key.corridorKey();
         CachedCorridor previous = completedCorridors.put(
                 key,
                 new CachedCorridor(corridor, List.copyOf(stamps), bytes)
@@ -5260,7 +5701,7 @@ final class TopologyWorkerRuntime {
     }
 
     private static long estimateCorridorBytes(MacroSearch.Corridor corridor) {
-        long bytes = 96L + corridor.endpoints().size() * 56L
+        long bytes = 104L + corridor.endpoints().size() * 56L
                 + corridor.connections().size() * 72L + corridor.components().size() * 640L;
         for (MacroSearch.Connection connection : corridor.connections()) {
             if (connection.transition() instanceof MacroSearch.BoundaryTransition boundary) {
@@ -5295,7 +5736,7 @@ final class TopologyWorkerRuntime {
         ));
         endpoints.set(endpoints.size() - 1, new MacroSearch.ExactEndpoint(
                 oldGoal.id(),
-                goalPosition,
+                corridor.partial() ? oldGoal.anchor() : goalPosition,
                 oldGoal.revision()
         ));
         List<MacroSearch.Connection> connections = new ArrayList<>(corridor.connections());
@@ -5311,7 +5752,8 @@ final class TopologyWorkerRuntime {
                     connection.transition()
             ));
         }
-        return new MacroSearch.Corridor(endpoints, connections, corridor.cost(), corridor.components());
+        return new MacroSearch.Corridor(endpoints, connections, corridor.cost(), corridor.components(),
+                corridor.partialFailure());
     }
 
     private static int directComponent(
@@ -5520,7 +5962,8 @@ final class TopologyWorkerRuntime {
                                  boolean hierarchical,
                                  int weightBits,
                                  List<MacroComponentKey> starts,
-                                 List<MacroComponentKey> goals) {
+                                 List<MacroComponentKey> goals,
+                                 @Nullable BlockPos partialGoal) {
         private MacroQueryKey {
             starts = List.copyOf(starts);
             goals = List.copyOf(goals);
@@ -5532,9 +5975,15 @@ final class TopologyWorkerRuntime {
                               boolean hierarchical,
                               int weightBits,
                               List<MacroComponentKey> starts,
-                              List<MacroComponentKey> goals) {
+                              List<MacroComponentKey> goals,
+                              BlockPos partialGoal) {
             this(dimension, profile.geometry(channel), profile.movement(channel), hierarchical,
-                    weightBits, List.copyOf(starts), List.copyOf(goals));
+                    weightBits, List.copyOf(starts), List.copyOf(goals), partialGoal.immutable());
+        }
+
+        private MacroQueryKey corridorKey() {
+            return partialGoal == null ? this : new MacroQueryKey(dimension, geometry, movement,
+                    hierarchical, weightBits, starts, goals, null);
         }
     }
 
@@ -5636,6 +6085,7 @@ final class TopologyWorkerRuntime {
         private final List<TopologyGraph> deferredBaseGraphs = new ArrayList<>();
         private final List<SuperTopologyGraph> deferredSuperGraphs = new ArrayList<>();
         private final Map<ClusterKey, SectionStamp> usedSections = new HashMap<>();
+        private boolean preExpansionStale;
         private List<SectionStamp> preparedResultStamps = List.of();
         private boolean preparedResultCurrent;
         private long preparedResultRetainedBytes;
@@ -5728,17 +6178,21 @@ final class TopologyWorkerRuntime {
         private void createSearchOnWorker() {
             if (refining) {
                 baseGraph.initializeBindings();
-                search = new MacroSearch(new AggregateTopologyGraph(baseGraph, superGraph,
+                search = createSearch(new AggregateTopologyGraph(baseGraph, superGraph,
                         recoveryAggregateOrigin, recoveryAggregate), weight,
                         MAX_LOCAL_WITNESS_NODES);
             } else if (hierarchical) {
                 superGraph.initializeBindings();
-                search = new MacroSearch(superGraph, weight, MAX_QUERY_VISITED_NODES);
+                search = createSearch(superGraph, weight, MAX_QUERY_VISITED_NODES);
             } else {
                 baseGraph.initializeBindings();
-                search = new MacroSearch(baseGraph.reverseGraph(), weight,
+                search = createSearch(baseGraph.enhancedGraph(false), weight,
                         MAX_QUERY_VISITED_NODES);
             }
+        }
+
+        private MacroSearch createSearch(MacroSearch.Graph graph, float weight, int limit) {
+            return new MacroSearch(graph, weight, limit);
         }
 
         private Status runWorkerSlice(int expansionBudget) {
@@ -5764,7 +6218,11 @@ final class TopologyWorkerRuntime {
             try {
                 if (search == null) createSearchOnWorker();
                 applyResolvedDependencies(resolutions);
-                if (usedSections.values().stream().anyMatch(stamp -> !stamp.current())) restartStaleSearch();
+                if (usedSections.values().stream().anyMatch(stamp -> !stamp.current())) {
+                    // The total includes prior slices and recovery work, not just this slice.
+                    preExpansionStale = expandedBefore == 0L;
+                    restartStaleSearch();
+                }
                 Status resultStatus = stepSearch(expansionBudget, expandedBefore);
                 if (usedSections.values().stream().anyMatch(stamp -> !stamp.current())) {
                     restartStaleSearch();
@@ -5821,7 +6279,7 @@ final class TopologyWorkerRuntime {
                             return stepWitnessRecovery(expansionBudget, expandedBefore);
                         }
                     } else if (candidate != null) {
-                        result = restoreForwardCorridor(candidate);
+                        result = candidate;
                         captureComponents(result);
                         status = Status.SUCCEEDED;
                         clearRequests();
@@ -5832,6 +6290,24 @@ final class TopologyWorkerRuntime {
                 } else if (searchStatus == Status.FAILED) {
                     if (search.failure() == MacroSearch.Failure.STALE_WORLD) {
                         restartStaleSearch();
+                    } else if (search.result() != null && hierarchical) {
+                        if (superGraph == null || !superGraph.revisionsValid()) {
+                            restartStaleSearch();
+                        } else {
+                            MacroSearch.Corridor candidate = search.result();
+                            superSearch = search;
+                            search = null;
+                            beginWitnessRecovery(candidate);
+                            refining = true;
+                            return stepWitnessRecovery(expansionBudget, expandedBefore);
+                        }
+                    } else if (search.result() != null) {
+                        result = search.result();
+                        failure = result.partialFailure();
+                        captureComponents(result);
+                        status = Status.SUCCEEDED;
+                        clearRequests();
+                        releaseGraphs();
                     } else {
                         failure = search.failure();
                         status = Status.FAILED;
@@ -5906,8 +6382,11 @@ final class TopologyWorkerRuntime {
                     result = new MacroSearch.Corridor(
                             recoveredEndpoints,
                             recoveredConnections,
-                            recoveredCost
+                            recoveredCost,
+                            Map.of(),
+                            aggregateCorridor.partialFailure()
                     );
+                    failure = result.partialFailure();
                     status = Status.SUCCEEDED;
                     clearRequests();
                     releaseGraphs();
@@ -5998,9 +6477,14 @@ final class TopologyWorkerRuntime {
                     ? List.of(new MacroComponentKey(component.section(), component.componentId(),
                     component.revision()))
                     : startCandidates;
-            List<MacroComponentKey> goals = finalGoal ? goalCandidates
+            boolean partialGoal = finalGoal && aggregateCorridor.partial();
+            List<MacroComponentKey> goals = partialGoal
+                    ? List.of(Objects.requireNonNull(superGraph.closestComponent))
+                    : finalGoal ? goalCandidates
                     : List.of(Objects.requireNonNull(target));
-            BlockPos goalAnchor = finalGoal ? goalPosition : componentAnchorFor(target);
+            BlockPos goalAnchor = partialGoal
+                    ? aggregateCorridor.endpoints().get(aggregateCorridor.endpoints().size() - 1).anchor()
+                    : finalGoal ? goalPosition : componentAnchorFor(target);
             MacroSearch.Endpoint goalEndpoint = finalGoal
                     ? new MacroSearch.ExactEndpoint(1L, goalAnchor, candidateSignature(goals))
                     : new MacroSearch.ComponentEndpoint(
@@ -6177,7 +6661,7 @@ final class TopologyWorkerRuntime {
                     throw new IllegalStateException("completed corridor snapshot incomplete");
             }
             result = new MacroSearch.Corridor(result.endpoints(), result.connections(),
-                    result.cost(), completedComponents);
+                    result.cost(), completedComponents, result.partialFailure());
             preparedResultStamps = usedSections.values().stream()
                     .sorted(Comparator.comparingLong(stamp -> stamp.key().section().asLong()))
                     .toList();
@@ -6570,6 +7054,12 @@ final class TopologyWorkerRuntime {
                     && buildFailure == null && !parentFallbackPending;
         }
 
+        private boolean readyForInlineContinuation() {
+            return status == Status.RUNNING && search != null && !cancelRequested
+                    && buildFailure == null && !parentFallbackPending
+                    && pendingDependencies.isEmpty() && requests.isEmpty() && !resolvedDependencies.isEmpty();
+        }
+
         private long expansionWorkUnits() {
             long expanded = completedSearchMetrics == null
                     ? 0L : completedSearchMetrics.expansionWorkUnits();
@@ -6799,6 +7289,7 @@ final class TopologyWorkerRuntime {
         private final Long2ObjectOpenHashMap<AggregateBinding> bindingsByEndpoint =
                 new Long2ObjectOpenHashMap<>();
         private final Map<Long, AggregateWitness> witnesses = new HashMap<>();
+        private MacroComponentKey closestComponent;
         private List<MacroComponentKey> startCandidates;
         private List<MacroComponentKey> goalCandidates;
         private List<AggregateBinding> startBindings;
@@ -6853,6 +7344,22 @@ final class TopologyWorkerRuntime {
         @Override
         public MacroSearch.Endpoint goal() {
             return goal;
+        }
+
+        @Override
+        public BlockPos partialTarget(MacroSearch.Endpoint endpoint, double maximumDistanceSquared) {
+            AggregateBinding binding = bindingsByEndpoint.get(endpoint.id());
+            if (binding == null) return null;
+            SuperClusterTopology topology = requireTopology(binding.cluster()).topology;
+            long nearest = topology.closestCell(binding.aggregateId(), goal.anchor(), maximumDistanceSquared);
+            if (nearest < 0) return null;
+            int node = (int) (nearest >>> 32), cell = (int) nearest;
+            SectionPos section = topology.nodeSection(node);
+            closestComponent = new MacroComponentKey(section, topology.nodeComponent(node),
+                    topology.nodeSignature(node));
+            return new BlockPos(section.minBlockX() + BaseClusterTopology.x(cell),
+                    section.minBlockY() + BaseClusterTopology.y(cell),
+                    section.minBlockZ() + BaseClusterTopology.z(cell));
         }
 
         @Override
@@ -7392,6 +7899,70 @@ final class TopologyWorkerRuntime {
             };
         }
 
+        private MacroSearch.Graph enhancedGraph(boolean backwards) {
+            MacroSearch.Graph delegate = backwards ? reverseGraph() : this;
+            return new MacroSearch.Graph() {
+                @Override public MacroSearch.Endpoint start() { return delegate.start(); }
+                @Override public MacroSearch.Endpoint goal() { return delegate.goal(); }
+                @Override public void expandInto(MacroSearch.Endpoint from,
+                                                 MacroSearch.ExpansionBuffer output) {
+                    delegate.expandInto(from, output);
+                }
+                @Override public boolean revisionsValid() { return delegate.revisionsValid(); }
+                @Override public float prefetchSlack() { return delegate.prefetchSlack(); }
+                @Override public BlockPos partialTarget(MacroSearch.Endpoint endpoint, double maximumDistanceSquared) {
+                    return backwards ? null : TopologyGraph.this.partialTarget(endpoint, maximumDistanceSquared);
+                }
+                @Override public float heuristic(MacroSearch.Endpoint endpoint) {
+                    if (channel != BaseClusterTopology.Channel.GROUND) return delegate.heuristic(endpoint);
+                    if (endpoint.id() == delegate.goal().id()) return 0.0F;
+                    List<ComponentBinding> targets = backwards ? startBindings : goalBindings;
+                    if (targets.isEmpty()) return coordinateHeuristic(endpoint, delegate.goal());
+                    if (endpoint.id() != delegate.start().id()) {
+                        return componentLowerBound(endpoint, targets);
+                    }
+                    int best = Integer.MAX_VALUE;
+                    for (ComponentBinding source : backwards ? goalBindings : startBindings) {
+                        best = Math.min(best, componentLowerBound(source.endpoint(), targets));
+                    }
+                    return best;
+                }
+            };
+        }
+
+        private int componentLowerBound(MacroSearch.Endpoint from, List<ComponentBinding> targets) {
+            SectionPos section = ((MacroSearch.ComponentEndpoint) from).section();
+            int best = Integer.MAX_VALUE;
+            for (ComponentBinding target : targets) {
+                SectionPos destination = target.cluster().section();
+                int horizontal = Math.abs(section.x() - destination.x())
+                        + Math.abs(section.z() - destination.z());
+                int vertical = Math.abs(from.anchor().getY() - target.endpoint().anchor().getY());
+                best = Math.min(best, Math.max(horizontal, vertical));
+            }
+            return best;
+        }
+
+        private float coordinateHeuristic(MacroSearch.Endpoint endpoint, MacroSearch.Endpoint destination) {
+            SectionPos source = SectionPos.of(endpoint.anchor()), target = SectionPos.of(destination.anchor());
+            return Math.max(Math.abs(source.x() - target.x()),
+                    Math.max(Math.abs(source.y() - target.y()), Math.abs(source.z() - target.z())));
+        }
+
+        @Override
+        public BlockPos partialTarget(MacroSearch.Endpoint endpoint, double maximumDistanceSquared) {
+            if (!(endpoint instanceof MacroSearch.ComponentEndpoint component)) return null;
+            BaseClusterTopology topology = requireTopology(
+                    bindingsByEndpoint.get(endpoint.id()).cluster()).topology;
+            SectionPos section = component.section();
+            BlockPos destination = goal.anchor();
+            int cell = topology.closestCell(component.componentId(),
+                    destination.getX() - section.minBlockX(), destination.getY() - section.minBlockY(),
+                    destination.getZ() - section.minBlockZ(), maximumDistanceSquared);
+            return cell < 0 ? null : new BlockPos(section.minBlockX() + BaseClusterTopology.x(cell),
+                    section.minBlockY() + BaseClusterTopology.y(cell), section.minBlockZ() + BaseClusterTopology.z(cell));
+        }
+
         private void expandReverse(MacroSearch.Endpoint from, MacroSearch.ExpansionBuffer output) {
             if (from.id() == start.id()) return;
             if (from.id() == goal.id()) {
@@ -7612,6 +8183,7 @@ final class TopologyWorkerRuntime {
         private float sectionHeuristic(MacroSearch.Endpoint endpoint,
                                        MacroSearch.Endpoint destination,
                                        List<ComponentBinding> candidates) {
+            if (candidates.isEmpty()) return coordinateHeuristic(endpoint, destination);
             if (endpoint.id() == destination.id()) {
                 return 0.0F;
             }

@@ -18,7 +18,8 @@ public final class Agent {
     static {
         target("scheduler/NavigationScheduler", "beginTick", "endTick", "drain", "drainReady", "requestReadyDispatch", "finishTickEnvelope");
         target("navigation/SegmentedNavigationService", "prepare", "move", "adopt", "capacity", "queue", "initialize",
-                "macroCandidate", "existingMacroCandidate", "prepareWindow", "queueReady", "nextSegment", "findSegment",
+                "macroCandidate", "prepareWindow", "queueReady", "nextSegment", "findSegment",
+                "verifyPartialEndpoint", "findPartialEndpoint",
                 "nativeDecision", "searchNative", "awaitNative", "publish", "observe", "settle", "physical",
                 "recordDestinationEntry", "settleTail", "recover", "refresh", "replan", "finish", "nativeStopped", "lambda$");
         target("navigation/NativeNavigationSearch", "find", "normalize", "legacy");
@@ -41,7 +42,6 @@ public final class Agent {
         target("topology/SuperClusterTopology", "build", "boundaryLinks");
         target("topology/GroundSegmentWindow", "capture", "enumerate", "lambda$");
         target("topology/MacroSearch", "step");
-        target("topology/SharedSectionCandidate", "supports");
         target("topology/MacroSearch$ComponentSnapshot", "<init>");
         TARGETS.put("net/minecraft/world/level/pathfinder/PathFinder", Set.of("m_77427_"));
         TARGETS.put(BASE+"topology/TopologyTaskExecutor", Set.of());

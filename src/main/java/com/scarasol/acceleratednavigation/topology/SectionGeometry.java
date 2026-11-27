@@ -121,10 +121,12 @@ final class SectionGeometry {
                 throw new IllegalArgumentException("invalid geometry box count");
             }
             short[] coordinates = new short[boxCount * 6];
-            for (int coordinate = 0; coordinate < coordinates.length; coordinate++) {
-                int value = input.readUnsignedByte();
-                if (value > 16) throw new IllegalArgumentException("invalid geometry coordinate");
-                coordinates[coordinate] = (short) value;
+            for (int offset = 0; offset < coordinates.length; offset += 6) {
+                for (int coordinate = offset; coordinate < offset + 6; coordinate++) {
+                    coordinates[coordinate] = (short) input.readUnsignedByte();
+                }
+                Box.validate(coordinates[offset], coordinates[offset + 1], coordinates[offset + 2],
+                        coordinates[offset + 3], coordinates[offset + 4], coordinates[offset + 5]);
             }
             palette[index] = new Shape(kind, coordinates);
         }
@@ -309,6 +311,11 @@ final class SectionGeometry {
     record Box(short minX, short minY, short minZ,
                short maxX, short maxY, short maxZ) {
         Box {
+            validate(minX, minY, minZ, maxX, maxY, maxZ);
+        }
+
+        private static void validate(short minX, short minY, short minZ,
+                                     short maxX, short maxY, short maxZ) {
             if (minX < 0 || minY < 0 || minZ < 0
                     || maxX > 16 || maxY > 16 || maxZ > 16
                     || minX >= maxX || minY >= maxY || minZ >= maxZ) {

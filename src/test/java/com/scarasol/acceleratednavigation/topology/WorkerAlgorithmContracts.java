@@ -6,6 +6,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -21,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
@@ -46,6 +48,15 @@ public final class WorkerAlgorithmContracts {
         CoreContracts.main(new String[]{"macro-commit"});
         CoreContracts.main(new String[]{"door"});
         System.out.println("Worker algorithm contracts: 7 groups passed");
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            require(latch.await(10,TimeUnit.SECONDS),"host build control was not released");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("host build control was interrupted",interrupted);
+        }
     }
 
     private static void require(boolean condition, String message) {
@@ -395,36 +406,67 @@ public final class WorkerAlgorithmContracts {
                     "strict tangency or exterior degenerate point became blocked");
     }
 
+    private static final class RuntimeCallbacks {
+        private final TopologyWorkerRuntime runtime;
+        private final Method transition, after;
+        private final Object lock;
+
+        RuntimeCallbacks(TopologyWorkerRuntime runtime) throws Exception {
+            this.runtime = runtime;
+            var type = TopologyWorkerRuntime.class;
+            transition = method(type, "runtimeTransition", boolean.class, Supplier.class);
+            after = method(type, "afterRuntimeLock", Runnable.class);
+            lock = field(type, "runtimeLock").get(runtime);
+        }
+
+        void transition(Supplier<?> command) { invoke(transition, false, command); }
+        void after(Runnable callback) { invoke(after, callback); }
+        boolean lockHeld() { return Thread.holdsLock(lock); }
+
+        private void invoke(Method method, Object... args) {
+            try {
+                method.invoke(runtime, args);
+            } catch (InvocationTargetException failure) {
+                if (failure.getCause() instanceof RuntimeException exception) throw exception;
+                if (failure.getCause() instanceof Error error) throw error;
+                throw new AssertionError(failure.getCause());
+            } catch (ReflectiveOperationException failure) {
+                throw new AssertionError(failure);
+            }
+        }
+    }
+
     private static void callbacksPreserveOwnershipAndReentrancy() throws Exception {
         var runtime = new TopologyWorkerRuntime((key, load, delta) -> {}, ignored -> {});
         try {
             var order = new ArrayList<Integer>();
-            runtime.sharedTransition(() -> {
-                require(runtime.sharedLockHeld(), "command outside runtime monitor");
-                runtime.sharedAfter(() -> {
-                    require(!runtime.sharedLockHeld(), "callback retained runtime monitor");
+            var callbacks = new RuntimeCallbacks(runtime);
+            callbacks.transition(() -> {
+                require(callbacks.lockHeld(), "command outside runtime monitor");
+                callbacks.after(() -> {
+                    require(!callbacks.lockHeld(), "callback retained runtime monitor");
                     order.add(1);
-                    runtime.sharedTransition(() -> { runtime.sharedAfter(() -> order.add(2)); return null; });
+                    callbacks.transition(() -> { callbacks.after(() -> order.add(2)); return null; });
                 });
-                runtime.sharedTransition(() -> { runtime.sharedAfter(() -> order.add(3)); return null; });
-                runtime.sharedAfter(() -> order.add(4));
+                callbacks.transition(() -> { callbacks.after(() -> order.add(3)); return null; });
+                callbacks.after(() -> order.add(4));
                 require(order.isEmpty(), "nested callback ran before transition committed");
                 return null;
             });
             require(order.equals(List.of(1, 2, 3, 4)), "nested/reentrant callback ordering changed");
             var repeated = new AtomicInteger();
             Runnable sameAction = repeated::incrementAndGet;
-            runtime.sharedTransition(() -> {
-                runtime.sharedAfter(sameAction);
-                runtime.sharedAfter(sameAction);
+            callbacks.transition(() -> {
+                callbacks.after(sameAction);
+                callbacks.after(sameAction);
                 return null;
             });
             require(repeated.get() == 2, "original callback List semantics unexpectedly deduplicated an action");
             for (Throwable failure : List.of(new IllegalStateException("command"), new AssertionError("command"))) {
                 int before = order.size();
                 try {
-                    runtime.sharedTransition(() -> {
-                        runtime.sharedAfter(() -> order.add(5));
+                    callbacks.transition(() -> {
+                        callbacks.after(() -> order.add(5));
                         if (failure instanceof RuntimeException exception) throw exception;
                         throw (Error) failure;
                     });
@@ -435,16 +477,16 @@ public final class WorkerAlgorithmContracts {
             }
             var callbackFailure = new IllegalArgumentException("callback");
             try {
-                runtime.sharedTransition(() -> {
-                    runtime.sharedAfter(() -> { throw callbackFailure; });
-                    runtime.sharedAfter(() -> order.add(99));
+                callbacks.transition(() -> {
+                    callbacks.after(() -> { throw callbackFailure; });
+                    callbacks.after(() -> order.add(99));
                     return null;
                 });
                 throw new AssertionError("callback exception swallowed");
             } catch (IllegalArgumentException actual) {
                 require(actual == callbackFailure && !order.contains(99), "callback failure behavior changed");
             }
-            runtime.sharedTransition(() -> { runtime.sharedAfter(() -> order.add(6)); return null; });
+            callbacks.transition(() -> { callbacks.after(() -> order.add(6)); return null; });
             require(order.get(order.size() - 1) == 6, "failed callback contaminated later transition");
             var completed = new AtomicInteger();
             var failure = new AtomicReference<Throwable>();
@@ -456,12 +498,12 @@ public final class WorkerAlgorithmContracts {
                         require(start.await(5, TimeUnit.SECONDS), "callback start timeout");
                         for (int i = 0; i < 500; i++) {
                             var future = new CompletableFuture<Integer>();
-                            var dependent = future.thenRun(() -> runtime.sharedTransition(() -> {
-                                runtime.sharedAfter(completed::incrementAndGet); return null;
+                            var dependent = future.thenRun(() -> callbacks.transition(() -> {
+                                callbacks.after(completed::incrementAndGet); return null;
                             }));
-                            runtime.sharedTransition(() -> {
-                                runtime.sharedAfter(() -> {
-                                    require(!runtime.sharedLockHeld(), "concurrent callback under monitor");
+                            callbacks.transition(() -> {
+                                callbacks.after(() -> {
+                                    require(!callbacks.lockHeld(), "concurrent callback under monitor");
                                     future.complete(1);
                                 });
                                 return null;

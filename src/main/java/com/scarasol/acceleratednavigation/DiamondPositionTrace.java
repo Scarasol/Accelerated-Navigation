@@ -13,18 +13,19 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 
-/** Temporary route recording: hold a diamond to write two position samples per second. */
+/** Route diagnostics enabled explicitly with {@code -Dan.diagnostics.diamondPositionTrace=true}. */
 @Mod.EventBusSubscriber(modid = AcceleratedNavigation.MOD_ID)
 public final class DiamondPositionTrace {
     private static final long INTERVAL_NANOS = 500_000_000L;
     // All handlers run on the server thread; keep entries only for players recording a route.
-    private static final Map<UUID, Long> LAST_SAMPLE = new HashMap<>();
+    private static final Map<UUID, Long> LAST_SAMPLE =
+            Boolean.getBoolean("an.diagnostics.diamondPositionTrace") ? new HashMap<>() : null;
 
     private DiamondPositionTrace() {}
 
     @SubscribeEvent
     public static void tick(TickEvent.PlayerTickEvent event) {
-        if (event.phase != TickEvent.Phase.END
+        if (LAST_SAMPLE == null || event.phase != TickEvent.Phase.END
                 || !(event.player instanceof ServerPlayer player)) return;
         UUID owner = player.getUUID();
         if (!player.getMainHandItem().is(Items.DIAMOND)
@@ -48,13 +49,13 @@ public final class DiamondPositionTrace {
 
     @SubscribeEvent
     public static void logout(PlayerEvent.PlayerLoggedOutEvent event) {
-        if (event.getEntity() instanceof ServerPlayer player) {
+        if (LAST_SAMPLE != null && event.getEntity() instanceof ServerPlayer player) {
             LAST_SAMPLE.remove(player.getUUID());
         }
     }
 
     @SubscribeEvent
     public static void stopped(ServerStoppedEvent event) {
-        LAST_SAMPLE.clear();
+        if (LAST_SAMPLE != null) LAST_SAMPLE.clear();
     }
 }

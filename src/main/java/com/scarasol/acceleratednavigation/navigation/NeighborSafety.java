@@ -1,8 +1,11 @@
 package com.scarasol.acceleratednavigation.navigation;
 
 import com.scarasol.acceleratednavigation.AcceleratedNavigation;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.world.entity.Mob;
@@ -30,7 +33,8 @@ import net.minecraftforge.fml.common.Mod;
 public final class NeighborSafety {
     public static final Predicate<BlockState> POTENTIAL = NeighborSafety::potential;
     private static volatile long epoch = 1;
-    private static long eligibleQueries;
+    private static final Map<MinecraftServer, Long> EXPERIMENT_QUERIES =
+            System.getProperty("an.production.output") == null ? null : new IdentityHashMap<>();
     private static final ClassValue<Boolean> DEFAULT_ADJACENT = new ClassValue<>() {
         @Override protected Boolean computeValue(Class<?> type) {
             return declaredBy(type, "getAdjacentBlockPathType", IForgeBlock.class,
@@ -51,7 +55,13 @@ public final class NeighborSafety {
 
     @SubscribeEvent
     public static void stopped(ServerStoppedEvent event) {
-        AcceleratedNavigation.LOGGER.info("AN_NEIGHBOR_EXPERIMENT variant=NS eligibleQueries={}", eligibleQueries);
+        if (EXPERIMENT_QUERIES == null) return;
+        Long eligibleQueries;
+        synchronized (EXPERIMENT_QUERIES) {
+            eligibleQueries = EXPERIMENT_QUERIES.remove(event.getServer());
+        }
+        AcceleratedNavigation.LOGGER.info("AN_NEIGHBOR_EXPERIMENT variant=NS eligibleQueries={}",
+                eligibleQueries == null ? 0L : eligibleQueries);
     }
 
     public static void bind(PathNavigationRegion region, ServerLevel level, NodeEvaluator evaluator) {
@@ -59,7 +69,11 @@ public final class NeighborSafety {
                 && evaluator.getClass() == WalkNodeEvaluator.class
                 && level.getServer().isSameThread() && !level.isDebug();
         ((NeighborSafetyRegion) region).acceleratedNavigation$neighborLevel(eligible ? level : null);
-        if (eligible) eligibleQueries++;
+        if (eligible && EXPERIMENT_QUERIES != null) {
+            synchronized (EXPERIMENT_QUERIES) {
+                EXPERIMENT_QUERIES.merge(level.getServer(), 1L, Long::sum);
+            }
+        }
     }
 
     public static void close(PathNavigationRegion region) {

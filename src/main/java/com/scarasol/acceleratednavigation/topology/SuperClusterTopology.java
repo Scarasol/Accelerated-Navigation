@@ -11,7 +11,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
-/** Immutable 2x2x2 SCC condensation. Published state contains stamps and primitive arrays only. */
+/** Immutable 2x2x2 SCC condensation with shared immutable component geometry. */
 final class SuperClusterTopology {
 
     public static final int CHILDREN_PER_AXIS = 2;
@@ -34,6 +34,9 @@ final class SuperClusterTopology {
     private final int[] childComponentOffsets;
     private final int[] aggregateByChildComponent;
     private final int[] aggregateMetadata;
+    private final BaseClusterTopology.ComponentGeometry[] childGeometry;
+    private final int[] aggregateNodeOffsets;
+    private final int[] aggregateNodes;
     private final int[] outgoingOffsets;
     private final int[] outgoingTargets;
     private final float[] outgoingCosts;
@@ -48,6 +51,7 @@ final class SuperClusterTopology {
                                  int[] childComponentOffsets,
                                  int[] aggregateByChildComponent,
                                  int[] aggregateMetadata,
+                                 BaseClusterTopology.ComponentGeometry[] childGeometry,
                                  int[] outgoingOffsets,
                                  int[] outgoingTargets,
                                  float[] outgoingCosts,
@@ -60,15 +64,25 @@ final class SuperClusterTopology {
         this.childComponentOffsets = childComponentOffsets;
         this.aggregateByChildComponent = aggregateByChildComponent;
         this.aggregateMetadata = aggregateMetadata;
+        this.childGeometry = childGeometry;
+        this.aggregateNodeOffsets = new int[aggregateMetadata.length + 1];
+        for (int aggregate : aggregateByChildComponent) aggregateNodeOffsets[aggregate + 1]++;
+        for (int i = 1; i < aggregateNodeOffsets.length; i++)
+            aggregateNodeOffsets[i] += aggregateNodeOffsets[i - 1];
+        this.aggregateNodes = new int[aggregateByChildComponent.length];
+        int[] cursor = aggregateNodeOffsets.clone();
+        for (int node = 0; node < aggregateByChildComponent.length; node++)
+            aggregateNodes[cursor[aggregateByChildComponent[node]]++] = node;
         this.outgoingOffsets = outgoingOffsets;
         this.outgoingTargets = outgoingTargets;
         this.outgoingCosts = outgoingCosts;
         this.outgoingWitnesses = outgoingWitnesses;
         this.signature = signature;
-        this.retainedBytes = 160
+        this.retainedBytes = 192 + childGeometry.length * Long.BYTES
+                + Arrays.stream(childGeometry).mapToInt(BaseClusterTopology.ComponentGeometry::retainedBytes).sum()
                 + childSignatures.length * Long.BYTES
                 + (childComponentOffsets.length + aggregateByChildComponent.length
-                + aggregateMetadata.length
+                + aggregateMetadata.length + aggregateNodeOffsets.length + aggregateNodes.length
                 + outgoingOffsets.length + outgoingTargets.length) * Integer.BYTES
                 + outgoingCosts.length * Float.BYTES
                 + outgoingWitnesses.length * Long.BYTES;
@@ -80,6 +94,16 @@ final class SuperClusterTopology {
                                              BaseClusterTopology.GeometryKey geometry,
                                              BaseClusterTopology.MovementKey movement,
                                              BaseClusterTopology.BuildScratch scratch) {
+        return build(origin,children,geometry,movement,scratch,SuperClusterTopology::boundaryLinks);
+    }
+
+    interface PrimitiveBoundary {
+        BoundaryLinks build(BaseClusterTopology source, BaseClusterTopology target, Direction face);
+    }
+
+    static SuperClusterTopology build(SectionPos origin, BaseClusterTopology[] children,
+            BaseClusterTopology.GeometryKey geometry, BaseClusterTopology.MovementKey movement,
+            BaseClusterTopology.BuildScratch scratch, PrimitiveBoundary boundary) {
         Objects.requireNonNull(origin, "origin");
         Objects.requireNonNull(children, "children");
         Objects.requireNonNull(geometry, "geometry");
@@ -98,7 +122,7 @@ final class SuperClusterTopology {
 
         EdgeBuffer edges = new EdgeBuffer(Math.max(16, childOffsets[CHILD_COUNT]));
         addLocalEdges(children, childOffsets, movement, edges);
-        addInternalBoundaryEdges(origin, children, childOffsets, movement, edges);
+        addInternalBoundaryEdges(origin, children, childOffsets, movement, edges,boundary);
         PrimitiveGraph graph = edges.freeze(childOffsets[CHILD_COUNT]);
         int[] aggregateByNode = stronglyConnectedComponents(graph, scratch);
         int aggregateCount = Arrays.stream(aggregateByNode).max().orElse(-1) + 1;
@@ -106,6 +130,9 @@ final class SuperClusterTopology {
                 aggregateByNode, aggregateCount, movement);
         PrimitiveGraph condensed = condense(graph, aggregateByNode, aggregateCount);
         long signature = signature(origin, geometry, movement, signatures);
+        var childGeometry = new BaseClusterTopology.ComponentGeometry[CHILD_COUNT];
+        for (int child = 0; child < CHILD_COUNT; child++)
+            childGeometry[child] = children[child].componentGeometry();
         return new SuperClusterTopology(
                 origin,
                 geometry,
@@ -114,6 +141,7 @@ final class SuperClusterTopology {
                 childOffsets,
                 aggregateByNode,
                 aggregateMetadata,
+                childGeometry,
                 condensed.offsets,
                 condensed.targets,
                 condensed.costs,
@@ -194,6 +222,27 @@ final class SuperClusterTopology {
 
     long nodeSignature(int node) { return childSignatures[childForNode(node)]; }
 
+    // Node and cell identify the precise base member needed by the existing witness recovery.
+    long closestCell(int aggregate, BlockPos target, double maximumDistanceSquared) {
+        checkAggregate(aggregate);
+        long best = -1L;
+        for (int i = aggregateNodeOffsets[aggregate]; i < aggregateNodeOffsets[aggregate + 1]; i++) {
+            int node = aggregateNodes[i], child = childForNode(node);
+            SectionPos section = childSection(origin, child);
+            int x = target.getX() - section.minBlockX(), y = target.getY() - section.minBlockY(),
+                    z = target.getZ() - section.minBlockZ();
+            int cell = childGeometry[child].closestCell(node - childComponentOffsets[child],
+                    x, y, z, maximumDistanceSquared);
+            if (cell < 0) continue;
+            double dx = (double) BaseClusterTopology.x(cell) - x,
+                    dy = (double) BaseClusterTopology.y(cell) - y,
+                    dz = (double) BaseClusterTopology.z(cell) - z;
+            maximumDistanceSquared = dx * dx + dy * dy + dz * dz;
+            best = ((long) node << 32) | cell;
+        }
+        return best;
+    }
+
     private int childForNode(int node) {
         if (node < 0 || node >= childComponentOffsets[CHILD_COUNT])
             throw new IndexOutOfBoundsException("unknown parent node " + node);
@@ -206,6 +255,11 @@ final class SuperClusterTopology {
                                 SuperClusterTopology neighbor,
                                 BaseClusterTopology[] sourceChildren,
                                 BaseClusterTopology[] targetChildren) {
+        return crossingIndex(face,neighbor,sourceChildren,targetChildren,SuperClusterTopology::boundaryLinks);
+    }
+
+    CrossingIndex crossingIndex(Direction face,SuperClusterTopology neighbor,BaseClusterTopology[] sourceChildren,
+                                BaseClusterTopology[] targetChildren,PrimitiveBoundary boundary) {
         Objects.requireNonNull(face, "face");
         Objects.requireNonNull(neighbor, "neighbor");
         if (!compatibleNeighbor(face, neighbor)) {
@@ -220,7 +274,7 @@ final class SuperClusterTopology {
             for (BaseClusterTopology target : targetChildren) {
                 Direction primitiveFace = primitiveFace(source.section(), target.section());
                 if (primitiveFace == null) continue;
-                BoundaryLinks links = boundaryLinks(source, target, primitiveFace);
+                BoundaryLinks links = boundary.build(source, target, primitiveFace);
                 for (int component = 0; component < source.componentCount(); component++) {
                     int sourceAggregate = aggregateId(source.section(), component);
                     for (int edge = links.edgeStart(component); edge < links.edgeEnd(component); edge++) {
@@ -278,9 +332,12 @@ final class SuperClusterTopology {
         return List.copyOf(result);
     }
 
-    static BoundaryLinks boundaryLinks(BaseClusterTopology source,
-                                       BaseClusterTopology target,
-                                       Direction face) {
+    static BoundaryLinks boundaryLinks(BaseClusterTopology source, BaseClusterTopology target, Direction face) {
+        return boundaryLinks(source, target, face, List.of(), null);
+    }
+
+    static BoundaryLinks boundaryLinks(BaseClusterTopology source, BaseClusterTopology target, Direction face,
+                                       List<GraphReuse.BoundaryDonor> donors, GraphReuse.BoundaryWork work) {
         Objects.requireNonNull(source, "source");
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(face, "face");
@@ -296,6 +353,10 @@ final class SuperClusterTopology {
         Long2ObjectOpenHashMap<long[]> masks = new Long2ObjectOpenHashMap<>();
         BoundaryGeometry collision = new BoundaryGeometry(source, target);
         int sectionYDelta = (target.section().y() - source.section().y()) * BaseClusterTopology.SIDE;
+        for (var donor : donors) {
+            addInheritedBoundaries(masks, collision, source, target, face, sectionYDelta, donor, work);
+        }
+        boolean inherited = !masks.isEmpty();
         boolean vertical = face.getAxis().isVertical();
         boolean volume = source.geometry().channel() == BaseClusterTopology.Channel.VOLUME;
         int depth = volume ? 1 : vertical
@@ -320,14 +381,54 @@ final class SuperClusterTopology {
                                 int component = source.componentAt(BaseClusterTopology.x(cell),
                                         BaseClusterTopology.y(cell), BaseClusterTopology.z(cell));
                                 addBoundaryMask(masks, collision, source, component, target, face, cell,
-                                        faceIndex(u, v), inset, direction, distance, dy, sectionYDelta);
+                                        faceIndex(u, v), inset, direction, distance, dy, sectionYDelta, inherited, work);
                             }
                         }
                     }
                 }
             }
         }
+        if (work != null) work.finish(donors.size());
         return BoundaryLinks.from(face, source.componentCount(), target.componentCount(), masks);
+    }
+
+    private static void addInheritedBoundaries(Long2ObjectOpenHashMap<long[]> masks, BoundaryGeometry collision,
+                                               BaseClusterTopology source, BaseClusterTopology target, Direction face,
+                                               int sectionYDelta, GraphReuse.BoundaryDonor donor,
+                                               GraphReuse.BoundaryWork work) {
+        var links = donor.links();
+        boolean doorCheck = donor.from().geometry().canOpenDoors() && !source.geometry().canOpenDoors();
+        long inherited = 0, doorFallback = 0;
+        for (int band = 0; band < links.descriptors.length; band++) {
+            int descriptor = links.descriptor(band);
+            int inset = bandInset(descriptor), distance = bandDistance(descriptor), dy = bandShift(descriptor);
+            Direction direction = bandDirection(descriptor);
+            for (int word = 0; word < 4; word++) {
+                long bits = links.maskWord(band, word);
+                while (bits != 0) {
+                    int bit = word * 64 + Long.numberOfTrailingZeros(bits);
+                    bits &= bits - 1;
+                    int u = bit & 15, v = bit >>> 4;
+                    if ((source.portBits().candidates(target.portBits(), face, inset, v, direction,
+                            distance, dy, sectionYDelta) & (1 << u)) == 0) continue;
+                    int cell = faceCell(face, u, v, inset);
+                    int x = BaseClusterTopology.x(cell), y = BaseClusterTopology.y(cell), z = BaseClusterTopology.z(cell);
+                    int fromComponent = source.componentAt(x, y, z);
+                    int toComponent = targetComponent(target, face, x, y, z, direction, distance, dy, sectionYDelta);
+                    if (fromComponent < 0 || toComponent < 0) continue;
+                    long key = boundaryKey(fromComponent, toComponent, descriptor);
+                    if (hasBit(masks.get(key), bit)) continue;
+                    if (doorCheck && collision.needsDoorCheck(source.geometry(), source.section().minBlockX() + x,
+                            source.section().minBlockY() + y, source.section().minBlockZ() + z, direction, distance, dy)) {
+                        doorFallback++;
+                        continue;
+                    }
+                    masks.computeIfAbsent(key, ignored -> new long[4])[word] |= 1L << bit;
+                    inherited++;
+                }
+            }
+        }
+        if (work != null) work.donor(donor, inherited, doorFallback);
     }
 
     private static BoundaryLinks scalarBoundaryLinks(BaseClusterTopology source,
@@ -365,7 +466,7 @@ final class SuperClusterTopology {
                         for (int distance = firstDistance; distance <= maximumDistance; distance++) {
                             for (int dy = minimumDy; dy <= maximumDy; dy++) {
                                 addBoundaryMask(masks, collision, source, component, target, face, cell, faceIndex(u, v),
-                                        inset, direction, distance, dy, sectionYDelta);
+                                        inset, direction, distance, dy, sectionYDelta, false, null);
                             }
                         }
                     }
@@ -387,24 +488,36 @@ final class SuperClusterTopology {
                                          Direction direction,
                                          int distance,
                                          int dy,
-                                         int sectionYDelta) {
-        int targetComponent = target.componentAt(
-                BaseClusterTopology.x(sourceCell) + direction.getStepX() * distance - face.getStepX() * 16,
-                BaseClusterTopology.y(sourceCell) + dy - sectionYDelta,
-                BaseClusterTopology.z(sourceCell) + direction.getStepZ() * distance - face.getStepZ() * 16
-        );
-        if (targetComponent < 0) return;
-        if (!collision.open(source.geometry(),
-                source.section().minBlockX() + BaseClusterTopology.x(sourceCell),
-                source.section().minBlockY() + BaseClusterTopology.y(sourceCell),
-                source.section().minBlockZ() + BaseClusterTopology.z(sourceCell),
-                direction, distance, dy)) return;
+                                         int sectionYDelta, boolean inherited, GraphReuse.BoundaryWork work) {
+        int x = BaseClusterTopology.x(sourceCell), y = BaseClusterTopology.y(sourceCell),
+                z = BaseClusterTopology.z(sourceCell);
+        int targetComponent = targetComponent(target, face, x, y, z, direction, distance, dy, sectionYDelta);
+        if (targetComponent < 0 || sourceComponent < 0) return;
         int directionBits = distance == 0 ? 0 : direction.get2DDataValue();
         // Bits: inset 0..1, horizontal direction 2..3, distance 4..5, dy + 4 in 6..8.
         int descriptor = sourceInset | directionBits << 2 | distance << 4 | (dy + 4) << 6;
-        long key = ((long) sourceComponent << 32) | ((long) targetComponent << 16) | descriptor;
+        long key = boundaryKey(sourceComponent, targetComponent, descriptor);
+        if (inherited && hasBit(masks.get(key), bit)) return;
+        if (work != null) work.exact++;
+        if (!collision.open(source.geometry(), source.section().minBlockX() + x,
+                source.section().minBlockY() + y, source.section().minBlockZ() + z,
+                direction, distance, dy)) return;
         long[] mask = masks.computeIfAbsent(key, ignored -> new long[4]);
         mask[bit >>> 6] |= 1L << bit;
+    }
+
+    private static int targetComponent(BaseClusterTopology target, Direction face, int x, int y, int z,
+                                       Direction direction, int distance, int dy, int sectionYDelta) {
+        return target.componentAt(x + direction.getStepX() * distance - face.getStepX() * 16,
+                y + dy - sectionYDelta, z + direction.getStepZ() * distance - face.getStepZ() * 16);
+    }
+
+    private static long boundaryKey(int source, int target, int descriptor) {
+        return ((long) source << 32) | ((long) target << 16) | descriptor;
+    }
+
+    private static boolean hasBit(long[] mask, int bit) {
+        return mask != null && (mask[bit >>> 6] & (1L << bit)) != 0;
     }
 
     private static int boundarySource(long key) {
@@ -458,13 +571,13 @@ final class SuperClusterTopology {
                                                  BaseClusterTopology[] children,
                                                  int[] childOffsets,
                                                  BaseClusterTopology.MovementKey movement,
-                                                 EdgeBuffer output) {
+                                                 EdgeBuffer output, PrimitiveBoundary boundary) {
         for (int sourceChild = 0; sourceChild < CHILD_COUNT; sourceChild++) {
             SectionPos sourceSection = childSection(origin, sourceChild);
             for (Direction face : INTERNAL_DIRECTIONS) {
                 if (face.getAxis().isVertical()) {
                     addInternalDirection(origin, children, childOffsets, sourceChild,
-                            offset(sourceSection, face, 1), face, movement, output);
+                            offset(sourceSection, face, 1), face, movement, output,boundary);
                     continue;
                 }
                 SectionPos horizontal = offset(sourceSection, face, 1);
@@ -472,7 +585,7 @@ final class SuperClusterTopology {
                     SectionPos target = SectionPos.of(horizontal.x(), horizontal.y() + yShift,
                             horizontal.z());
                     addInternalDirection(origin, children, childOffsets, sourceChild,
-                            target, face, movement, output);
+                            target, face, movement, output,boundary);
                 }
             }
         }
@@ -485,13 +598,13 @@ final class SuperClusterTopology {
                                              SectionPos targetSection,
                                              Direction face,
                                              BaseClusterTopology.MovementKey movement,
-                                             EdgeBuffer output) {
+                                             EdgeBuffer output, PrimitiveBoundary boundary) {
         if (!contains(origin, targetSection)) return;
         int targetChild = childIndex(origin, targetSection);
         addDirectedBoundary(children[sourceChild], children[targetChild], childOffsets[sourceChild],
-                childOffsets[targetChild], face, movement, output);
+                childOffsets[targetChild], face, movement, output,boundary);
         addDirectedBoundary(children[targetChild], children[sourceChild], childOffsets[targetChild],
-                childOffsets[sourceChild], face.getOpposite(), movement, output);
+                childOffsets[sourceChild], face.getOpposite(), movement, output,boundary);
     }
 
     private static void addDirectedBoundary(BaseClusterTopology source,
@@ -500,8 +613,8 @@ final class SuperClusterTopology {
                                             int targetBase,
                                             Direction face,
                                             BaseClusterTopology.MovementKey movement,
-                                            EdgeBuffer output) {
-        BoundaryLinks links = boundaryLinks(source, target, face);
+                                            EdgeBuffer output, PrimitiveBoundary boundary) {
+        BoundaryLinks links = boundary.build(source, target, face);
         for (int component = 0; component < source.componentCount(); component++) {
             for (int edge = links.edgeStart(component); edge < links.edgeEnd(component); edge++) {
                 if (links.supports(edge, movement)) {
@@ -570,7 +683,7 @@ final class SuperClusterTopology {
         return yShift < -1 || yShift > 1 ? -1 : direction * 3 + yShift + 1;
     }
 
-    private static Direction primitiveFace(SectionPos source, SectionPos target) {
+    static Direction primitiveFace(SectionPos source, SectionPos target) {
         int dx = target.x() - source.x();
         int dy = target.y() - source.y();
         int dz = target.z() - source.z();
@@ -983,6 +1096,7 @@ final class SuperClusterTopology {
         }
 
         Direction face() { return face; }
+        boolean hasEdges() { return targets.length != 0; }
         int edgeStart(int source) { return offsets[source]; }
         int edgeEnd(int source) {
             return source + 1 < offsets.length ? offsets[source + 1] : offsets[source];

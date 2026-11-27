@@ -21,7 +21,7 @@ public final class Trace {
         Buffer buffer = new Buffer(); BUFFERS.add(buffer); return buffer;
     });
     public static final List<String> PHASES = new ArrayList<>(List.of("workerRun", "workerEnqueue", "workerSelected",
-            "serverEnqueue", "actorBind", "searchParameters", "sharedParameters"));
+            "serverEnqueue", "actorBind", "searchParameters"));
     private static final ClassValue<Map<String, Field>> FIELDS = new ClassValue<>() {
         protected Map<String, Field> computeValue(Class<?> type) {
             Map<String, Field> result = new HashMap<>();

@@ -49,7 +49,7 @@ public final class ShortNativeScenarioProbe {
     private JsonArray searches,actions;
     private BlockPos originalStart,originalGoal,start,goal;
     private long started,ready,submitted,submitEnd,arrival,terminal,searchWall,searchCpu,searchBytes;
-    private int index=-1,tick,preparedTick,submitTick,terminalTick,macros,windows,shared;
+    private int index=-1,tick,preparedTick,submitTick,terminalTick,macros,windows;
     private boolean closing,done,accepted,acted,injected,shutdownScene;
     private String failure="";
 
@@ -77,7 +77,6 @@ public final class ShortNativeScenarioProbe {
         }
     }
     public static void macro() { if(instance!=null&&instance.submitted!=0&&!instance.closing)instance.macros++; }
-    public static void shared() { if(instance!=null&&instance.submitted!=0&&!instance.closing)instance.shared++; }
     public static void window() { if(instance!=null&&instance.submitted!=0&&!instance.closing)instance.windows++; }
     public static void nativeStopped(net.minecraft.world.entity.ai.navigation.PathNavigation navigation) {
         if(instance==null||instance.mob==null||instance.mob.getNavigation()!=navigation||instance.submitted==0)return;
@@ -124,7 +123,7 @@ public final class ShortNativeScenarioProbe {
         row.add("start",gson.toJsonTree(point(mob.blockPosition())));
         row.add("targets",gson.toJsonTree(targets.stream().map(ShortNativeScenarioProbe::point).toList()));
         row.add("avoided",gson.toJsonTree(avoided.stream().map(ShortNativeScenarioProbe::point).toList()));
-        row.addProperty("macroCallsBefore",macros);row.addProperty("sharedCallsBefore",shared);row.addProperty("windowCallsBefore",windows);
+        row.addProperty("macroCallsBefore",macros);row.addProperty("windowCallsBefore",windows);
         row.addProperty("actualUnavailable",actual.unavailable());
         row.addProperty("actualNull",actual.path()==null);
         row.addProperty("actualCanReach",actual.path()!=null&&actual.path().canReach());
@@ -170,7 +169,7 @@ public final class ShortNativeScenarioProbe {
         index++;
         if(index==scenes.size()) { done=true;stop();return; }
         requests.clear();changes.clear();query=null;target=null;
-        searches=new JsonArray();actions=new JsonArray();macros=windows=shared=0;acted=injected=shutdownScene=false;
+        searches=new JsonArray();actions=new JsonArray();macros=windows=0;acted=injected=shutdownScene=false;
         searchWall=searchCpu=searchBytes=0;
         ready=submitted=submitEnd=arrival=terminal=0;terminalTick=0;
         int distance=switch(scene()) {case "radius16"->16;case "radius17"->17;case "middle28"->28;case "super304"->304;default->8;};
@@ -294,7 +293,7 @@ public final class ShortNativeScenarioProbe {
         row.addProperty("terminalNanos",terminal);row.addProperty("arrivalNanos",arrival);
         row.addProperty("accepted",accepted);row.addProperty("arrived",arrival!=0);
         row.addProperty("actualShutdown",shutdownScene);
-        row.addProperty("macroCalls",macros);row.addProperty("sharedCalls",shared);row.addProperty("windowCalls",windows);
+        row.addProperty("macroCalls",macros);row.addProperty("windowCalls",windows);
         row.addProperty("pathFinderCalls",stats.calls);
         row.addProperty("firstPathNanos",publication.firstReadyNanos);
         row.add("originalStart",gson.toJsonTree(point(originalStart)));row.add("originalGoal",gson.toJsonTree(point(originalGoal)));
